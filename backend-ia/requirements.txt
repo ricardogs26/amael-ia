@@ -1,0 +1,16 @@
+# Core
+fastapi
+uvicorn[standard]
+requests
+python-multipart
+
+# LangChain Core
+langchain
+langchain-community
+
+# Integraciones específicas y actualizadas
+langchain-ollama
+langchain-chroma
+
+# Dependencias para procesamiento de documentos
+pypdf

@@ -1,0 +1,44 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: amael-ia-ingress
+  annotations:
+    # --- Anotaciones de cert-manager ---
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    
+    # --- Anotaciones de nginx-ingress para Streamlit ---
+    # Habilita el soporte para WebSockets (¡CRUCIAL para Streamlit!)
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # Usamos un tamaño de buffer grande para los WebSockets
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "8k"
+
+spec:
+  # --- Bloque TLS para el certificado ---
+  tls:
+  - hosts:
+    - amael-ia.richardx.dev
+    secretName: amael-ia-tls-secret
+  rules:
+  # --- Regla para el Backend API ---
+  - host: "amael-ia.richardx.dev"
+    http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: backend-service
+            port:
+              number: 8000
+  # --- Regla para el Frontend Streamlit ---
+  - host: "amael-ia.richardx.dev"
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: frontend-service
+            port:
+              number: 8501
