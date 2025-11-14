@@ -5,7 +5,7 @@ metadata:
   annotations:
     # --- Anotaciones de cert-manager ---
     cert-manager.io/cluster-issuer: "letsencrypt-prod"
-    
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
     # --- Anotaciones de nginx-ingress para Streamlit ---
     # Habilita el soporte para WebSockets (¡CRUCIAL para Streamlit!)
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
@@ -20,10 +20,18 @@ spec:
     - amael-ia.richardx.dev
     secretName: amael-ia-tls-secret
   rules:
-  # --- Regla para el Backend API ---
   - host: "amael-ia.richardx.dev"
     http:
       paths:
+      # --- NUEVA REGLA PARA EL CALLBACK DE OAUTH ---
+      - path: /auth
+        pathType: Prefix
+        backend:
+          service:
+            name: backend-service
+            port:
+              number: 8000
+      # --- REGLA PARA LA API ---
       - path: /api
         pathType: Prefix
         backend:
@@ -31,10 +39,7 @@ spec:
             name: backend-service
             port:
               number: 8000
-  # --- Regla para el Frontend Streamlit ---
-  - host: "amael-ia.richardx.dev"
-    http:
-      paths:
+      # --- REGLA PARA EL FRONTEND ---
       - path: /
         pathType: Prefix
         backend:

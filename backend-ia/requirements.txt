@@ -14,3 +14,8 @@ langchain-chroma
 
 # Dependencias para procesamiento de documentos
 pypdf
+
+#Dependencias para OAuth
+authlib>=1.3.0
+python-jose[cryptography]>=3.3.0
+itsdangerous
