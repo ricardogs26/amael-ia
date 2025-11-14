@@ -4,25 +4,27 @@ import base64
 from io import BytesIO
 
 # --- CONFIGURACIÓN ---
-BACKEND_URL = "http://amael-ia.richardx.dev/api" # URL pública de tu API
-# Para desarrollo local, podrías usar http://localhost:8000/api con port-forward
+# VOLVEMOS A TU URL ORIGINAL, que funciona en tu entorno
+BACKEND_URL = "http://amael-ia.richardx.dev/api"
 
 # --- ESTADO DE SESIÓN ---
+# Inicializa todo el estado de la sesión aquí, al principio del script
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
+if "headers" not in st.session_state:
+    st.session_state.headers = None
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-# --- FUNCIONES AUXILIARES ---
-def show_login_page():
-    """Muestra la página de login."""
+# --- LÓGICA DE LOGIN ---
+if not st.session_state.logged_in:
     st.title("🔐 Login Agente Personal")
     username = st.text_input("Usuario")
     password = st.text_input("Contraseña", type="password")
     if st.button("Entrar"):
-        # Codificar credenciales para Basic Auth
         credentials = f"{username}:{password}"
         encoded_credentials = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
         
-        # Probar autenticación
         headers = {"Authorization": f"Basic {encoded_credentials}"}
         try:
             response = requests.get(f"{BACKEND_URL}/health", headers=headers, timeout=5)
@@ -36,15 +38,23 @@ def show_login_page():
         except requests.exceptions.RequestException as e:
             st.error(f"No se pudo conectar al backend: {e}")
 
-def show_main_app():
-    """Muestra la aplicación principal después del login."""
-    st.title("💬 Tu Agente de IA Personal")
+# --- LÓGICA DE LA APLICACIÓN PRINCIPAL ---
+else:
+    st.title("💬 Amael IA Personal")
     
+    # Botón para cerrar sesión
+    if st.sidebar.button("Cerrar Sesión"):
+        st.session_state.logged_in = False
+        st.session_state.headers = None
+        st.rerun()
+
     # Sidebar para ingestión de datos
     st.sidebar.title("📚 Aprender de tus Datos")
     uploaded_file = st.sidebar.file_uploader("Sube un archivo (PDF o TXT)", type=["pdf", "txt"])
+    
     if uploaded_file is not None:
-        with st.sidebar.spinner("Procesando archivo..."):
+        # El spinner ahora está en el flujo principal, lo que evita el error
+        with st.spinner("Procesando archivo..."):
             files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
             try:
                 response = requests.post(f"{BACKEND_URL}/ingest", files=files, headers=st.session_state.headers)
@@ -56,9 +66,6 @@ def show_main_app():
                 st.sidebar.error(f"Error de conexión: {e}")
 
     # Lógica del chat
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
@@ -81,9 +88,3 @@ def show_main_app():
                     message_placeholder.error(f"Error del backend: {error_detail}")
             except requests.exceptions.RequestException as e:
                 message_placeholder.error(f"No se pudo contactar al backend: {e}")
-
-# --- FLUJO PRINCIPAL ---
-if not st.session_state.logged_in:
-    show_login_page()
-else:
-    show_main_app()
