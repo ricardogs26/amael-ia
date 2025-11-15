@@ -1,9 +1,14 @@
-from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi import FastAPI, HTTPException, Depends, status, Request, Response
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
-import secrets
+import os
+import uuid
+from authlib.integrations.starlette_client import OAuth
+from starlette.config import Config
+from jose import JWTError, jwt
+from starlette.middleware.sessions import SessionMiddleware 
 
 # --- IMPORTACIONES ACTUALIZADAS ---
 from langchain_ollama import OllamaLLM, OllamaEmbeddings
@@ -14,14 +19,12 @@ import os
 import uuid
 
 # --- CONFIGURACIÓN ---
-app = FastAPI(title="API Agente Personal", version="1.0")
+app = FastAPI(title="API Agente Personal", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # En producción, restringe esto a tu dominio
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    SessionMiddleware, 
+    secret_key=os.environ.get("SESSION_SECRET_KEY")
 )
 
 OLLAMA_BASE_URL = "http://ollama-service:11434"
@@ -37,14 +40,49 @@ vectorstore = Chroma(
     persist_directory=CHROMA_PERSIST_DIR
 )
 
-# --- AUTENTICACIÓN ---
-security = HTTPBasic()
-USUARIOS = {"admin": "password123"} # ¡CAMBIA ESTO!
+# --- CONFIGURACIÓN DE OAUTH Y JWT ---
+# Lee las credenciales desde las variables de entorno (las proveeremos con Kubernetes Secrets)
+config = Config(environ=os.environ)
+oauth = OAuth(config)
 
-def get_current_user(credentials: HTTPBasicCredentials = Depends(security)):
-    if credentials.username in USUARIOS and USUARIOS[credentials.username] == credentials.password:
-        return credentials.username
-    raise HTTPException(status_code=401, detail="Credenciales incorrectas")
+oauth.register(
+    name='google',
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={
+        'scope': 'openid email profile'
+    }
+)
+
+# --- LISTA BLANCA DE USUARIOS (desde ConfigMap) ---
+# Lee la lista de correos desde la variable de entorno inyectada por Kubernetes
+allowed_emails_csv = os.environ.get("ALLOWED_EMAILS_CSV")
+if not allowed_emails_csv:
+    raise ValueError("La variable de entorno ALLOWED_EMAILS_CSV no está configurada. La aplicación no puede iniciar.")
+
+# Convierte la cadena de texto separada por comas en una lista de Python
+ALLOWED_EMAILS = [email.strip() for email in allowed_emails_csv.split(',') if email.strip()]
+
+# --- FUNCIONES DE AUTENTICACIÓN JWT ---
+SECRET_KEY = os.environ.get("JWT_SECRET_KEY")
+ALGORITHM = "HS256"
+
+security = HTTPBearer()
+
+def create_jwt_token(email: str):
+    to_encode = {"sub": email}
+    expire = None # O añade expiración si quieres
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None or email not in ALLOWED_EMAILS:
+            raise HTTPException(status_code=403, detail="Usuario no autorizado")
+        return email
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token inválido o expirado")
 
 # --- MODELOS DE DATOS ---
 class ChatRequest(BaseModel):
@@ -53,9 +91,33 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
 
-# --- ENDPOINTS ---
-@app.post("/api/ingest", dependencies=[Depends(get_current_user)])
-async def ingest_data(file: UploadFile = File(...)):
+# --- ENDPOINTS DE AUTENTICACIÓN ---
+@app.get('/api/auth/login')
+async def login(request: Request):
+    redirect_uri = request.url_for('auth_callback')
+    return await oauth.google.authorize_redirect(request, redirect_uri)
+
+@app.get('/api/auth/callback')
+async def auth_callback(request: Request):
+    try:
+        token = await oauth.google.authorize_access_token(request)
+        user_info = token.get('userinfo')
+        if user_info and user_info['email'] in ALLOWED_EMAILS:
+            # Usuario autorizado, creamos el JWT
+            jwt_token = create_jwt_token(user_info['email'])
+            
+            # Redirigimos al frontend con el token como parámetro de consulta
+            frontend_url = "https://amael-ia.richardx.dev"
+            return Response(status_code=302, headers={"location": f"{frontend_url}?token={jwt_token}"})
+        else:
+            # Usuario no autorizado
+            return Response(status_code=302, headers={"location": f"https://amael-ia.richardx.dev?error=unauthorized"})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en la autenticación con Google: {e}")
+
+# --- ENDPOINTS DE LA APLICACIÓN (ahora protegidos por JWT) ---
+@app.post("/api/ingest")
+async def ingest_data(file, user: str = Depends(get_current_user)):
     """Endpoint para subir y procesar documentos (PDF, TXT)."""
     temp_file_path = f"/tmp/{uuid.uuid4()}-{file.filename}"
     try:
@@ -75,7 +137,7 @@ async def ingest_data(file: UploadFile = File(...)):
         texts = text_splitter.split_documents(documents)
 
         vectorstore.add_documents(texts)
-        return {"message": f"Se han ingerido {len(texts)} fragmentos del archivo {file.filename}."}
+        return {"message": f"Usuario {user} ha ingerido el archivo correctamente."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error procesando el archivo: {e}")
     finally:
@@ -83,8 +145,8 @@ async def ingest_data(file: UploadFile = File(...)):
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
-@app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(get_current_user)])
-async def chat_endpoint(request: ChatRequest):
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_user)):
     """Endpoint para chatear usando RAG."""
     retriever = vectorstore.as_retriever()
     relevant_docs = retriever.get_relevant_documents(request.prompt)
