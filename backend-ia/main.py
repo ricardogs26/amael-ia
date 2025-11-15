@@ -146,25 +146,52 @@ async def ingest_data(file: UploadFile = File(...), user: str = Depends(get_curr
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
-@app.post("/api/chat", response_model=ChatResponse)
+@app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(get_current_user)])
 async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_user)):
-    """Endpoint para chatear usando RAG."""
+    """Endpoint para chatear usando RAG con un rol de especialista."""
+    
+    # 1. Recuperar documentos relevantes usando el MÉTODO ACTUALIZADO
     retriever = vectorstore.as_retriever()
-    relevant_docs = retriever.get_relevant_documents(request.prompt)
+    relevant_docs = retriever.invoke(request.prompt) # <-- CAMBIO 1: Usar .invoke()
     context = "\n".join([doc.page_content for doc in relevant_docs])
 
-    enriched_prompt = f"""
-    Usa el siguiente contexto para responder a la pregunta al final.
-    Si no sabes la respuesta basándote en el contexto, di que no lo sabes, pero intenta ser útil con tu conocimiento general.
-    Contexto:
-    {context}
+    # 2. Crear un prompt de especialista altamente estructurado
+    system_prompt = """
+### PERSONAJE
+Eres Amael-IA, un asistente experto especializado en tecnología, con un profundo conocimiento en:
+- **Kubernetes:** Orquestación de contenedores, gestión de clústeres, networking, seguridad (RBAC, Policies), storage y CI/CD.
+- **Infraestructura como Código (IaC):** Herramientas como Terraform, CloudFormation y Ansible.
+- **Servicios de AWS:** Compute (EC2, Lambda, EKS), Storage (S3, EBS), Networking (VPC, CloudFront), Bases de Datos (RDS, DynamoDB) y Serverless.
+- **DevOps y SRE:** Prácticas de integración continua, despliegue continuo, monitorización y confiabilidad.
 
-    Pregunta:
-    {request.prompt}
-    """
+Tu objetivo es actuar como un asistente de confianza, proporcionando respuestas claras, precisas y accionables para ayudar al usuario en sus actividades diarias de trabajo y proyectos personales.
+
+### REGLAS ESTRICTAS
+1.  **Prioriza el Contexto:** Tu fuente principal de verdad debe ser el CONTEXTO proporcionado por el usuario. Si la respuesta está en los documentos, úsala y explícala claramente.
+2.  **Sé Transparente:** Si el CONTEXTO no contiene la información, pero tu conocimiento general te permite responder, indícalo explícitamente. Por ejemplo: "Aunque no lo encuentro en tus documentos, basándome en mi experiencia, te diría que...".
+3.  **No Inventes Datos Específicos:** Nunca inventes métricas, nombres de archivos, o detalles específicos del usuario que no estén en el CONTEXTO.
+4.  **Sé Proactivo:** Si la pregunta es ambigua, puedes ofrecer una aclaración o proponer diferentes enfoques basados en tu experiencia.
+
+### CONTEXTO
+A continuación se presenta información proporcionada por el usuario. Esta es tu principal fuente de conocimiento.
+---
+{context}
+---
+
+### TAREA
+Responde a la siguiente pregunta del usuario siguiendo las reglas y el personaje descritos.
+
+**Pregunta del Usuario:**
+{user_question}
+
+**Respuesta de Amael-IA:**
+"""
+    
+    # 3. Formatear el prompt con las claves CORRECTAS
+    final_prompt = system_prompt.format(context=context, user_question=request.prompt) # <-- CAMBIO 2: Corregir la clave
 
     try:
-        response = llm.invoke(enriched_prompt)
+        response = llm.invoke(final_prompt)
         return ChatResponse(response=response)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al contactar al modelo de IA: {e}")
