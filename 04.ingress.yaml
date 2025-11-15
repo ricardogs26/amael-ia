@@ -23,14 +23,6 @@ spec:
   - host: "amael-ia.richardx.dev"
     http:
       paths:
-      # --- NUEVA REGLA PARA EL CALLBACK DE OAUTH ---
-      - path: /auth
-        pathType: Prefix
-        backend:
-          service:
-            name: backend-service
-            port:
-              number: 8000
       # --- REGLA PARA LA API ---
       - path: /api
         pathType: Prefix

@@ -1,6 +1,8 @@
-from fastapi import FastAPI, HTTPException, Depends, status, Request, Response
+from fastapi import FastAPI, HTTPException, Depends, status, Request, Response, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware import Middleware
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel
 import requests
 import os
@@ -8,40 +10,14 @@ import uuid
 from authlib.integrations.starlette_client import OAuth
 from starlette.config import Config
 from jose import JWTError, jwt
-from starlette.middleware.sessions import SessionMiddleware 
 
-# --- IMPORTACIONES ACTUALIZADAS ---
+# --- IMPORTACIONES DE LANGCHAIN ---
 from langchain_ollama import OllamaLLM, OllamaEmbeddings
 from langchain_chroma import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
-import os
-import uuid
-
-# --- CONFIGURACIÓN ---
-app = FastAPI(title="API Agente Personal", version="2.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    SessionMiddleware, 
-    secret_key=os.environ.get("SESSION_SECRET_KEY")
-)
-
-OLLAMA_BASE_URL = "http://ollama-service:11434"
-MODEL_NAME = "llama3:8b"
-CHROMA_PERSIST_DIR = "/chroma_data"
-
-# --- INICIALIZACIÓN CON CLASES ACTUALIZADAS ---
-llm = OllamaLLM(model=MODEL_NAME, base_url=OLLAMA_BASE_URL)
-embeddings = OllamaEmbeddings(model=MODEL_NAME, base_url=OLLAMA_BASE_URL)
-
-vectorstore = Chroma(
-    embedding_function=embeddings,
-    persist_directory=CHROMA_PERSIST_DIR
-)
 
 # --- CONFIGURACIÓN DE OAUTH Y JWT ---
-# Lee las credenciales desde las variables de entorno (las proveeremos con Kubernetes Secrets)
 config = Config(environ=os.environ)
 oauth = OAuth(config)
 
@@ -53,13 +29,10 @@ oauth.register(
     }
 )
 
-# --- LISTA BLANCA DE USUARIOS (desde ConfigMap) ---
-# Lee la lista de correos desde la variable de entorno inyectada por Kubernetes
+#--- LISTA BLANCA DE USUARIOS (desde ConfigMap) ---
 allowed_emails_csv = os.environ.get("ALLOWED_EMAILS_CSV")
 if not allowed_emails_csv:
-    raise ValueError("La variable de entorno ALLOWED_EMAILS_CSV no está configurada. La aplicación no puede iniciar.")
-
-# Convierte la cadena de texto separada por comas en una lista de Python
+    raise ValueError("La variable de entorno ALLOWED_EMAILS_CSV no está configurada.")
 ALLOWED_EMAILS = [email.strip() for email in allowed_emails_csv.split(',') if email.strip()]
 
 # --- FUNCIONES DE AUTENTICACIÓN JWT ---
@@ -70,7 +43,6 @@ security = HTTPBearer()
 
 def create_jwt_token(email: str):
     to_encode = {"sub": email}
-    expire = None # O añade expiración si quieres
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
@@ -84,6 +56,20 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
     except JWTError:
         raise HTTPException(status_code=401, detail="Token inválido o expirado")
 
+# --- CONFIGURACIÓN E INICIALIZACIÓN DE IA ---
+OLLAMA_BASE_URL = "http://ollama-service:11434"
+MODEL_NAME = "llama3:8b"
+CHROMA_PERSIST_DIR = "/chroma_data"
+
+# --- INICIALIZACIÓN CON CLASES ACTUALIZADAS ---
+llm = OllamaLLM(model=MODEL_NAME, base_url=OLLAMA_BASE_URL)
+embeddings = OllamaEmbeddings(model=MODEL_NAME, base_url=OLLAMA_BASE_URL)
+
+vectorstore = Chroma(
+    embedding_function=embeddings,
+    persist_directory=CHROMA_PERSIST_DIR
+)
+
 # --- MODELOS DE DATOS ---
 class ChatRequest(BaseModel):
     prompt: str
@@ -91,10 +77,28 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
 
+# --- CREACIÓN DE LA APLICACIÓN FASTAPI CON MIDDLEWARE ---
+app = FastAPI(
+    title="API Agente Personal",
+    version="2.1",
+    middleware=[
+        # Middleware 1: Sesiones (para OAuth)
+        Middleware(SessionMiddleware, secret_key=os.environ.get("SESSION_SECRET_KEY")),
+        # Middleware 2: CORS (para permitir peticiones del frontend)
+        Middleware(
+            CORSMiddleware,
+            allow_origins=["*"], # En producción, restringe esto a tu dominio
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        ),
+    ]
+)
 # --- ENDPOINTS DE AUTENTICACIÓN ---
 @app.get('/api/auth/login')
 async def login(request: Request):
-    redirect_uri = request.url_for('auth_callback')
+    # CAMBIO CLAVE: Especificamos la URL pública de forma manual
+    redirect_uri = "https://amael-ia.richardx.dev/api/auth/callback"
     return await oauth.google.authorize_redirect(request, redirect_uri)
 
 @app.get('/api/auth/callback')
@@ -103,21 +107,18 @@ async def auth_callback(request: Request):
         token = await oauth.google.authorize_access_token(request)
         user_info = token.get('userinfo')
         if user_info and user_info['email'] in ALLOWED_EMAILS:
-            # Usuario autorizado, creamos el JWT
             jwt_token = create_jwt_token(user_info['email'])
-            
-            # Redirigimos al frontend con el token como parámetro de consulta
             frontend_url = "https://amael-ia.richardx.dev"
             return Response(status_code=302, headers={"location": f"{frontend_url}?token={jwt_token}"})
         else:
-            # Usuario no autorizado
             return Response(status_code=302, headers={"location": f"https://amael-ia.richardx.dev?error=unauthorized"})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en la autenticación con Google: {e}")
 
+
 # --- ENDPOINTS DE LA APLICACIÓN (ahora protegidos por JWT) ---
 @app.post("/api/ingest")
-async def ingest_data(file, user: str = Depends(get_current_user)):
+async def ingest_data(file: UploadFile = File(...), user: str = Depends(get_current_user)):
     """Endpoint para subir y procesar documentos (PDF, TXT)."""
     temp_file_path = f"/tmp/{uuid.uuid4()}-{file.filename}"
     try:
@@ -145,25 +146,52 @@ async def ingest_data(file, user: str = Depends(get_current_user)):
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
-@app.post("/api/chat", response_model=ChatResponse)
+@app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(get_current_user)])
 async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_user)):
-    """Endpoint para chatear usando RAG."""
+    """Endpoint para chatear usando RAG con un rol de especialista."""
+    
+    # 1. Recuperar documentos relevantes usando el MÉTODO ACTUALIZADO
     retriever = vectorstore.as_retriever()
-    relevant_docs = retriever.get_relevant_documents(request.prompt)
+    relevant_docs = retriever.invoke(request.prompt) # <-- CAMBIO 1: Usar .invoke()
     context = "\n".join([doc.page_content for doc in relevant_docs])
 
-    enriched_prompt = f"""
-    Usa el siguiente contexto para responder a la pregunta al final.
-    Si no sabes la respuesta basándote en el contexto, di que no lo sabes, pero intenta ser útil con tu conocimiento general.
-    Contexto:
-    {context}
+    # 2. Crear un prompt de especialista altamente estructurado
+    system_prompt = """
+### PERSONAJE
+Eres Amael-IA, un asistente experto especializado en tecnología, con un profundo conocimiento en:
+- **Kubernetes:** Orquestación de contenedores, gestión de clústeres, networking, seguridad (RBAC, Policies), storage y CI/CD.
+- **Infraestructura como Código (IaC):** Herramientas como Terraform, CloudFormation y Ansible.
+- **Servicios de AWS:** Compute (EC2, Lambda, EKS), Storage (S3, EBS), Networking (VPC, CloudFront), Bases de Datos (RDS, DynamoDB) y Serverless.
+- **DevOps y SRE:** Prácticas de integración continua, despliegue continuo, monitorización y confiabilidad.
 
-    Pregunta:
-    {request.prompt}
-    """
+Tu objetivo es actuar como un asistente de confianza, proporcionando respuestas claras, precisas y accionables para ayudar al usuario en sus actividades diarias de trabajo y proyectos personales.
+
+### REGLAS ESTRICTAS
+1.  **Prioriza el Contexto:** Tu fuente principal de verdad debe ser el CONTEXTO proporcionado por el usuario. Si la respuesta está en los documentos, úsala y explícala claramente.
+2.  **Sé Transparente:** Si el CONTEXTO no contiene la información, pero tu conocimiento general te permite responder, indícalo explícitamente. Por ejemplo: "Aunque no lo encuentro en tus documentos, basándome en mi experiencia, te diría que...".
+3.  **No Inventes Datos Específicos:** Nunca inventes métricas, nombres de archivos, o detalles específicos del usuario que no estén en el CONTEXTO.
+4.  **Sé Proactivo:** Si la pregunta es ambigua, puedes ofrecer una aclaración o proponer diferentes enfoques basados en tu experiencia.
+
+### CONTEXTO
+A continuación se presenta información proporcionada por el usuario. Esta es tu principal fuente de conocimiento.
+---
+{context}
+---
+
+### TAREA
+Responde a la siguiente pregunta del usuario siguiendo las reglas y el personaje descritos.
+
+**Pregunta del Usuario:**
+{user_question}
+
+**Respuesta de Amael-IA:**
+"""
+    
+    # 3. Formatear el prompt con las claves CORRECTAS
+    final_prompt = system_prompt.format(context=context, user_question=request.prompt) # <-- CAMBIO 2: Corregir la clave
 
     try:
-        response = llm.invoke(enriched_prompt)
+        response = llm.invoke(final_prompt)
         return ChatResponse(response=response)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al contactar al modelo de IA: {e}")
