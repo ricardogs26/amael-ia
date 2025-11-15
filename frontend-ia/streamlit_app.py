@@ -44,7 +44,7 @@ if uploaded_file is not None:
     with st.spinner("Procesando archivo..."):
         files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
         try:
-            response = requests.post(f"{BACKEND_URL}/api/ingest", files=files, headers=headers)
+            response = requests.post(f"{BACKEND_URL}/ingest", files=files, headers=headers)
             if response.status_code == 200:
                 st.sidebar.success(response.json().get("message"))
             else:
@@ -65,7 +65,7 @@ if prompt := st.chat_input("¿En qué puedo ayudarte?"):
     with st.chat_message("assistant"):
         message_placeholder = st.empty()
         try:
-            response = requests.post(f"{BACKEND_URL}/api/chat", json={"prompt": prompt}, headers=headers)
+            response = requests.post(f"{BACKEND_URL}/chat", json={"prompt": prompt}, headers=headers)
             if response.status_code == 200:
                 full_response = response.json().get("response", "No pude generar una respuesta.")
                 message_placeholder.markdown(full_response)
