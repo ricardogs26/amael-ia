@@ -1,3 +1,5 @@
+# main.py
+
 from fastapi import FastAPI, HTTPException, Depends, status, Request, Response, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware import Middleware
@@ -7,6 +9,7 @@ from pydantic import BaseModel
 import requests
 import os
 import uuid
+import json # <-- AÑADIDO: Para manejar el historial en formato JSON
 from authlib.integrations.starlette_client import OAuth
 from starlette.config import Config
 from jose import JWTError, jwt
@@ -16,6 +19,12 @@ from langchain_ollama import OllamaLLM, OllamaEmbeddings
 from langchain_chroma import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
+
+# ... IMPORTACIONDES DE TENSOFLOW2
+import base64
+from PIL import Image
+import numpy as np
+import io
 
 # --- CONFIGURACIÓN DE OAUTH Y JWT ---
 config = Config(environ=os.environ)
@@ -58,21 +67,38 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 
 # --- CONFIGURACIÓN E INICIALIZACIÓN DE IA ---
 OLLAMA_BASE_URL = "http://ollama-service:11434"
-MODEL_NAME = "llama3:8b"
-CHROMA_PERSIST_DIR = "/chroma_data"
-
-# --- INICIALIZACIÓN CON CLASES ACTUALIZADAS ---
+MODEL_NAME = "glm4"
 llm = OllamaLLM(model=MODEL_NAME, base_url=OLLAMA_BASE_URL)
-embeddings = OllamaEmbeddings(model=MODEL_NAME, base_url=OLLAMA_BASE_URL)
+# <-- CAMBIO IMPORTANTE: Usamos un directorio base, pero la inicialización de Chroma será por usuario.
+CHROMA_BASE_DIR = "/chroma_data"
+CHAT_HISTORIES_DIR = "/chat_histories" # <-- NUEVO: Directorio para los historiales
 
-vectorstore = Chroma(
-    embedding_function=embeddings,
-    persist_directory=CHROMA_PERSIST_DIR
-)
+# --- FUNCIONES AUXILIARES MULTIUSUARIO ---
+
+def sanitize_email(email: str) -> str:
+    """Crea un nombre de directorio seguro a partir de un email."""
+    return email.replace("@", "_at_").replace(".", "_dot_")
+
+def get_user_vectorstore(user_email: str):
+    """Carga o crea la base de datos vectorial para un usuario específico."""
+    user_dir = os.path.join(CHROMA_BASE_DIR, sanitize_email(user_email))
+    os.makedirs(user_dir, exist_ok=True)
+    
+    embeddings = OllamaEmbeddings(model=MODEL_NAME, base_url=OLLAMA_BASE_URL)
+    vectorstore = Chroma(
+        embedding_function=embeddings,
+        persist_directory=user_dir
+    )
+    return vectorstore
+
+def get_user_history_path(user_email: str) -> str:
+    """Obtiene la ruta al archivo de historial de un usuario."""
+    return os.path.join(CHAT_HISTORIES_DIR, f"{sanitize_email(user_email)}.json")
 
 # --- MODELOS DE DATOS ---
 class ChatRequest(BaseModel):
     prompt: str
+    history: list[dict] = [] # Para recibir el historial del frontend
 
 class ChatResponse(BaseModel):
     response: str
@@ -82,9 +108,7 @@ app = FastAPI(
     title="API Agente Personal",
     version="2.1",
     middleware=[
-        # Middleware 1: Sesiones (para OAuth)
         Middleware(SessionMiddleware, secret_key=os.environ.get("SESSION_SECRET_KEY")),
-        # Middleware 2: CORS (para permitir peticiones del frontend)
         Middleware(
             CORSMiddleware,
             allow_origins=["*"], # En producción, restringe esto a tu dominio
@@ -94,10 +118,10 @@ app = FastAPI(
         ),
     ]
 )
-# --- ENDPOINTS DE AUTENTICACIÓN ---
+
+# --- ENDPOINTS DE AUTENTICACIÓN (Sin cambios) ---
 @app.get('/api/auth/login')
 async def login(request: Request):
-    # CAMBIO CLAVE: Especificamos la URL pública de forma manual
     redirect_uri = "https://amael-ia.richardx.dev/api/auth/callback"
     return await oauth.google.authorize_redirect(request, redirect_uri)
 
@@ -115,19 +139,16 @@ async def auth_callback(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en la autenticación con Google: {e}")
 
-
-# --- ENDPOINTS DE LA APLICACIÓN (ahora protegidos por JWT) ---
+# --- ENDPOINTS DE LA APLICACIÓN (ahora protegidos y multiusuario) ---
 @app.post("/api/ingest")
 async def ingest_data(file: UploadFile = File(...), user: str = Depends(get_current_user)):
-    """Endpoint para subir y procesar documentos (PDF, TXT)."""
+    """Endpoint para subir y procesar documentos (PDF, TXT) para un usuario específico."""
     temp_file_path = f"/tmp/{uuid.uuid4()}-{file.filename}"
     try:
-        # El bloque 'with' maneja la apertura y cierre del archivo automáticamente
         with open(temp_file_path, "wb") as buffer:
             content = await file.read()
             buffer.write(content)
 
-        # El resto del código se ejecuta DESPUÉS de que el archivo se ha cerrado
         if file.filename.endswith(".pdf"):
             loader = PyPDFLoader(temp_file_path)
         else:
@@ -137,26 +158,39 @@ async def ingest_data(file: UploadFile = File(...), user: str = Depends(get_curr
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         texts = text_splitter.split_documents(documents)
 
-        vectorstore.add_documents(texts)
-        return {"message": f"Usuario {user} ha ingerido el archivo correctamente."}
+        # <-- CAMBIO IMPORTANTE: Obtener el vectorstore del usuario y añadir documentos allí.
+        user_vectorstore = get_user_vectorstore(user)
+        user_vectorstore.add_documents(texts)
+        
+        return {"message": f"Usuario {user} ha ingerido el archivo correctamente en su perfil."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error procesando el archivo: {e}")
     finally:
-        # El bloque 'finally' se ejecuta siempre, haya habido un error o no
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
 @app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(get_current_user)])
 async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_user)):
-    """Endpoint para chatear usando RAG con un rol de especialista."""
+    """Endpoint para chatear usando RAG con un rol de especialista, con historial y datos por usuario."""
     
-    # 1. Recuperar documentos relevantes usando el MÉTODO ACTUALIZADO
-    retriever = vectorstore.as_retriever()
-    relevant_docs = retriever.invoke(request.prompt) # <-- CAMBIO 1: Usar .invoke()
+    # <-- CAMBIO IMPORTANTE: Asegurarse de que el directorio de historiales exista.
+    os.makedirs(CHAT_HISTORIES_DIR, exist_ok=True)
+
+    # 1. Recuperar documentos relevantes DEL USUARIO
+    # <-- CAMBIO IMPORTANTE: Obtener el vectorstore del usuario.
+    user_vectorstore = get_user_vectorstore(user)
+    retriever = user_vectorstore.as_retriever()
+    relevant_docs = retriever.invoke(request.prompt)
     context = "\n".join([doc.page_content for doc in relevant_docs])
 
-    # 2. Crear un prompt de especialista altamente estructurado
-    system_prompt = """
+    # 2. Construir el historial de conversación (el que viene del frontend es suficiente para el contexto)
+    conversation_history = ""
+    if request.history:
+        history_lines = [f"Human: {msg['content']}" if msg['role'] == 'user' else f"Assistant: {msg['content']}" for msg in request.history]
+        conversation_history = "\n".join(history_lines)
+
+    # 3. Crear el prompt del especialista (sin cambios en la plantilla)
+    system_prompt_template = """
 ### PERSONAJE
 Eres Amael-IA, un asistente experto especializado en tecnología, con un profundo conocimiento en:
 - **Kubernetes:** Orquestación de contenedores, gestión de clústeres, networking, seguridad (RBAC, Policies), storage y CI/CD.
@@ -167,34 +201,79 @@ Eres Amael-IA, un asistente experto especializado en tecnología, con un profund
 Tu objetivo es actuar como un asistente de confianza, proporcionando respuestas claras, precisas y accionables para ayudar al usuario en sus actividades diarias de trabajo y proyectos personales.
 
 ### REGLAS ESTRICTAS
-1.  **Prioriza el Contexto:** Tu fuente principal de verdad debe ser el CONTEXTO proporcionado por el usuario. Si la respuesta está en los documentos, úsala y explícala claramente.
-2.  **Sé Transparente:** Si el CONTEXTO no contiene la información, pero tu conocimiento general te permite responder, indícalo explícitamente. Por ejemplo: "Aunque no lo encuentro en tus documentos, basándome en mi experiencia, te diría que...".
-3.  **No Inventes Datos Específicos:** Nunca inventes métricas, nombres de archivos, o detalles específicos del usuario que no estén en el CONTEXTO.
-4.  **Sé Proactivo:** Si la pregunta es ambigua, puedes ofrecer una aclaración o proponer diferentes enfoques basados en tu experiencia.
+1.  **Usa el Historial:** Primero, usa el HISTORIAL DE LA CONVERSACIÓN para entender el contexto.
+2.  **Usa el Contexto:** Luego, usa el CONTEXTO DE DOCUMENTOS para responder la pregunta del usuario.
+3.  **Sé Transparente:** Si el CONTEXTO no contiene la información, pero tu conocimiento general te permite responder, indícalo explícitamente. Por ejemplo: "Aunque no lo encuentro en tus documentos, basándome en mi experiencia, te diría que...".
+4.  **No Inventes Datos Específicos:** Nunca inventes métricas, nombres de archivos, o detalles específicos del usuario que no estén en el CONTEXTO o el HISTORIAL.
 
-### CONTEXTO
-A continuación se presenta información proporcionada por el usuario. Esta es tu principal fuente de conocimiento.
+### HISTORIAL DE LA CONVERSACIÓN
 ---
-{context}
+{conversation_history}
 ---
+
+### CONTEXTO DE DOCUMENTOS
+---
+<<<CONTEXT>>>
 
 ### TAREA
-Responde a la siguiente pregunta del usuario siguiendo las reglas y el personaje descritos.
+Basándote en el HISTORIAL y el CONTEXTO, responde a la siguiente pregunta del usuario.
+Si el CONTEXTO está vacío, DEBES basar tu respuesta únicamente en el HISTORIAL.
 
 **Pregunta del Usuario:**
-{user_question}
+{request_prompt}
 
 **Respuesta de Amael-IA:**
 """
     
-    # 3. Formatear el prompt con las claves CORRECTAS
-    final_prompt = system_prompt.format(context=context, user_question=request.prompt) # <-- CAMBIO 2: Corregir la clave
+    final_prompt = system_prompt_template.format(
+        conversation_history=conversation_history,
+        request_prompt=request.prompt
+    )
+    final_prompt = final_prompt.replace("<<<CONTEXT>>>", context)
 
     try:
         response = llm.invoke(final_prompt)
+        
+        # <-- CAMBIO IMPORTANTE: Guardar el historial actualizado en el archivo del usuario.
+        history_path = get_user_history_path(user)
+        # Añadimos el mensaje del usuario y la respuesta del asistente al historial recibido.
+        updated_history = request.history + [
+            {"role": "user", "content": request.prompt},
+            {"role": "assistant", "content": response}
+        ]
+        with open(history_path, "w") as f:
+            json.dump(updated_history, f)
+
         return ChatResponse(response=response)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al contactar al modelo de IA: {e}")
+
+# ... TensorFlow (sin cambios, ya que no es multiusuario por ahora)
+@app.post("/api/analyze-image", dependencies=[Depends(get_current_user)])
+async def analyze_image(file: UploadFile = File(...), user: str = Depends(get_current_user)):
+    """Endpoint para analizar una imagen con TensorFlow."""
+    try:
+        image_data = await file.read()
+        img = Image.open(io.BytesIO(image_data)).convert('RGB')
+        img = img.resize((224, 224))
+        
+        image_array = np.array(img, dtype=np.float32) / 255.0
+        image_batch = np.expand_dims(image_array, axis=0)
+
+        payload = {
+            "instances": image_batch.tolist()
+        }
+
+        tf_serving_url = os.environ.get("TF_SERVING_URL")
+        response = requests.post(tf_serving_url, json=payload)
+
+        if response.status_code == 200:
+            predictions = response.json()['predictions'][0]
+            return {"analysis_result": predictions}
+        else:
+            raise HTTPException(status_code=500, detail="Error en TensorFlow Serving")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error procesando la imagen: {e}")
 
 @app.get("/api/health")
 async def health_check():
