@@ -19,3 +19,6 @@ pypdf
 authlib>=1.3.0
 python-jose[cryptography]>=3.3.0
 itsdangerous
+
+Pillow
+numpy
