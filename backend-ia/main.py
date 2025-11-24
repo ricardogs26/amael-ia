@@ -1,5 +1,5 @@
 # main.py
-
+from fastapi.responses import HTMLResponse
 from fastapi import FastAPI, HTTPException, Depends, status, Request, Response, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware import Middleware
@@ -133,9 +133,15 @@ async def auth_callback(request: Request):
         if user_info and user_info['email'] in ALLOWED_EMAILS:
             jwt_token = create_jwt_token(user_info['email'])
             frontend_url = "https://amael-ia.richardx.dev"
+            
+            # --- VOLVER A LA REDIRECCIÓN ESTÁNDAR ---
+            # Esto le dice al navegador que vaya a la URL del frontend con el token.
             return Response(status_code=302, headers={"location": f"{frontend_url}?token={jwt_token}"})
         else:
-            return Response(status_code=302, headers={"location": f"https://amael-ia.richardx.dev?error=unauthorized"})
+            # Manejo de error también con redirección
+            frontend_url = "https://amael-ia.richardx.dev"
+            return Response(status_code=302, headers={"location": f"{frontend_url}?error=unauthorized"})
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en la autenticación con Google: {e}")
 

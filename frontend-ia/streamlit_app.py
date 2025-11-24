@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 from urllib.parse import urlparse, parse_qs
+import streamlit.components.v1 as components
 
 # --- CONFIGURACIÓN DE LA PÁGINA DE STREAMLIT ---
 # ESTA LÍNEA DEBE SER LA PRIMERA COMANDO DE STREAMLIT EN EL SCRIPT
@@ -38,11 +39,11 @@ def check_authentication():
 
     return st.session_state.jwt_token is not None
 
-# --- PANTALLA DE LOGIN ---
 def mostrar_pantalla_login():
-    """Muestra la pantalla de login con un diseño personalizado."""
+    """Muestra la pantalla de login con un enlace de redirección simple."""
     st.markdown("""
     <style>
+        /* Estilos existentes sin cambios */
         .main-header {visibility: hidden;}
         .stDeployButton {display:none;}
         .stAppViewContainer { margin-top: -2.5rem; }
@@ -62,16 +63,9 @@ def mostrar_pantalla_login():
             max-width: 400px;
             border: 1px solid #e0e0e0;
         }
-        .login-card h1 {
-            margin-bottom: 10px;
-            color: #1a1a1a;
-            font-size: 28px;
-        }
-        .login-card p {
-            color: #666;
-            margin-bottom: 30px;
-            font-size: 16px;
-        }
+        .login-card h1 { margin-bottom: 10px; color: #1a1a1a; font-size: 28px; }
+        .login-card p { color: #666; margin-bottom: 30px; font-size: 16px; }
+        /* Usamos <a> en lugar de <button>, pero mantenemos la misma clase para el estilo */
         .google-btn {
             display: inline-flex;
             align-items: center;
@@ -85,24 +79,21 @@ def mostrar_pantalla_login():
             font-size: 16px;
             font-weight: 500;
             cursor: pointer;
-            text-decoration: none;
+            text-decoration: none; /* Quitamos el subrayado del enlace */
             transition: background-color 0.3s, box-shadow 0.3s;
         }
-        .google-btn:hover {
-            background-color: #357AE8;
-            box-shadow: 0 4px 12px rgba(66, 133, 244, 0.4);
-        }
-        .google-btn svg {
-            margin-right: 12px;
-        }
+        .google-btn:hover { background-color: #357AE8; box-shadow: 0 4px 12px rgba(66, 133, 244, 0.4); }
+        .google-btn svg { margin-right: 12px; }
     </style>
     """, unsafe_allow_html=True)
 
+    # --- HTML SIMPLE Y SIN JAVASCRIPT ---
     login_html = f"""
     <div class="login-container">
         <div class="login-card">
             <h1>🤖 Bienvenido a Amael-IA</h1>
             <p>Inicia sesión para comenzar a chatear.</p>
+            <!-- Cambiamos el <button> por un <a> simple -->
             <a href="{BACKEND_URL}/auth/login" class="google-btn">
                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="24px" height="24px">
                     <path fill="#FFC107" d="M43.611,20.083H42V20H24v8h11.303c-1.649,4.657-6.083,8-11.303,8c-6.627,0-12-5.373-12-12c0-6.627,5.373-12,12-12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C12.955,4,4,12.955,4,24c0,11.045,8.955,20,20,20c11.045,0,20-8.955,20-20C44,22.659,43.862,21.35,43.611,20.083z"/>
