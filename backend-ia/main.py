@@ -92,14 +92,17 @@ def get_user_vectorstore(user_email: str):
     )
     return vectorstore
 
-def get_user_history_path(user_email: str) -> str:
-    """Obtiene la ruta al archivo de historial de un usuario."""
-    return os.path.join(CHAT_HISTORIES_DIR, f"{sanitize_email(user_email)}.json")
+def get_history_path_for_id(identifier: str) -> str:
+    """Obtiene la ruta al archivo de historial para un identificador único (email o teléfono)."""
+    # Sanitiza el identificador para que sea un nombre de archivo válido
+    sanitized_id = identifier.replace("@", "_at_").replace(".", "_dot_").replace("-", "_dash_")
+    return os.path.join(CHAT_HISTORIES_DIR, f"{sanitized_id}.json")
 
 # --- MODELOS DE DATOS ---
 class ChatRequest(BaseModel):
     prompt: str
     history: list[dict] = [] # Para recibir el historial del frontend
+    user_id: str = None     # <-- NUEVO: Identificador único del usuario (ej. número de teléfono)
 
 class ChatResponse(BaseModel):
     response: str
@@ -192,25 +195,9 @@ async def ingest_data(file: UploadFile = File(...), user: str = Depends(get_curr
 
 @app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(get_current_user)])
 async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_user)):
-    """Endpoint para chatear usando RAG con un rol de especialista, con historial y datos por usuario."""
+    """Endpoint para chatear, ahora con soporte para múltiples usuarios por ID."""
     
-    # <-- CAMBIO IMPORTANTE: Asegurarse de que el directorio de historiales exista.
-    os.makedirs(CHAT_HISTORIES_DIR, exist_ok=True)
-
-    # 1. Recuperar documentos relevantes DEL USUARIO
-    # <-- CAMBIO IMPORTANTE: Obtener el vectorstore del usuario.
-    user_vectorstore = get_user_vectorstore(user)
-    retriever = user_vectorstore.as_retriever()
-    relevant_docs = retriever.invoke(request.prompt)
-    context = "\n".join([doc.page_content for doc in relevant_docs])
-
-    # 2. Construir el historial de conversación (el que viene del frontend es suficiente para el contexto)
-    conversation_history = ""
-    if request.history:
-        history_lines = [f"Human: {msg['content']}" if msg['role'] == 'user' else f"Assistant: {msg['content']}" for msg in request.history]
-        conversation_history = "\n".join(history_lines)
-
-    # 3. Crear el prompt del especialista (sin cambios en la plantilla)
+    # --- DEFINICIÓN DEL PROMPT (AL PRINCIPIO DE LA FUNCIÓN) ---
     system_prompt_template = """
 ### PERSONAJE
 Eres un asistente de IA avanzado, versátil y servicial. Tu objetivo es proporcionar respuestas precisas, claras y útiles. Adapta tu estilo de respuesta a la naturaleza de la pregunta del usuario.
@@ -240,7 +227,34 @@ Eres un asistente de IA avanzado, versátil y servicial. Tu objetivo es proporci
 
 **Respuesta del Asistente:**
 """
+
+    # --- LÓGICA DEL ENDPOINT ---
     
+    os.makedirs(CHAT_HISTORIES_DIR, exist_ok=True)
+
+    # Determinar qué ID usar para el historial (email del usuario o user_id de WhatsApp)
+    history_id = request.user_id if request.user_id else user
+    history_path = get_history_path_for_id(history_id)
+
+    # Cargar el historial del usuario específico desde el archivo
+    history = []
+    if os.path.exists(history_path):
+        with open(history_path, "r") as f:
+            history = json.load(f)
+
+    # 1. Recuperar documentos relevantes del USUARIO AUTENTICADO (el bot)
+    user_vectorstore = get_user_vectorstore(user)
+    retriever = user_vectorstore.as_retriever()
+    relevant_docs = retriever.invoke(request.prompt)
+    context = "\n".join([doc.page_content for doc in relevant_docs])
+
+    # 2. Construir el historial de conversación (usando el historial cargado del archivo)
+    conversation_history = ""
+    if history:
+        history_lines = [f"Human: {msg['content']}" if msg['role'] == 'user' else f"Assistant: {msg['content']}" for msg in history]
+        conversation_history = "\n".join(history_lines)
+
+    # 3. Crear el prompt final
     final_prompt = system_prompt_template.format(
         conversation_history=conversation_history,
         request_prompt=request.prompt
@@ -250,10 +264,8 @@ Eres un asistente de IA avanzado, versátil y servicial. Tu objetivo es proporci
     try:
         response = llm.invoke(final_prompt)
         
-        # <-- CAMBIO IMPORTANTE: Guardar el historial actualizado en el archivo del usuario.
-        history_path = get_user_history_path(user)
-        # Añadimos el mensaje del usuario y la respuesta del asistente al historial recibido.
-        updated_history = request.history + [
+        # Guardar el historial actualizado en el archivo del usuario correcto
+        updated_history = history + [
             {"role": "user", "content": request.prompt},
             {"role": "assistant", "content": response}
         ]

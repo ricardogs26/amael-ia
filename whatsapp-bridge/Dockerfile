@@ -32,4 +32,4 @@ COPY . .
 EXPOSE 3000
 
 # Comando para ejecutar la aplicación
-CMD [ "node", "index.js" ]
+CMD [ "sh", "-c", "rm -f .wwebjs_auth/session/SingletonLock || true && node index.js" ]

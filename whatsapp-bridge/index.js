@@ -7,12 +7,6 @@ const qrcode = require('qrcode-terminal');
 const app = express();
 app.use(express.json());
 
-// --- CÓDIGO TEMPORAL PARA DEPURACIÓN ---
-console.log("--- Variables de entorno inyectadas ---");
-console.log(JSON.stringify(process.env, null, 2));
-console.log("----------------------------------------");
-// --- FIN DEL CÓDIGO DE DEPURACIÓN ---
-
 // --- CONFIGURACIÓN ---
 // URL de tu API de amael-ia DENTRO del clúster de Kubernetes
 const AMAEL_API_URL = process.env.AMAEL_API_URL || 'http://backend-service:8000/api/chat';
@@ -28,11 +22,20 @@ if (!AMAEL_JWT_TOKEN) {
 let qrCodeData = null;
 
 // Configuración del cliente de WhatsApp para que guarde la sesión
+// --- CONFIGURACIÓN ROBUSTA PARA PUPPETEER EN KUBERNETES ---
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: { 
         headless: true,
-        args: ['--no-sandbox'] // Importante para correr en contenedores
+        // --- RUTA CORRECTA PARA LA IMAGEN DEBIAN/SLIM ---
+        executablePath: '/usr/bin/chromium',
+        // --- ARGUMENTOS CLAVE PARA CONTENEDORES ---
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu'
+        ]
     }
 });
 
@@ -58,13 +61,18 @@ client.on('message', async message => {
         return;
     }
 
-    console.log(`Mensaje recibido de ${message.from}: ${message.body}`);
+    // --- CAMBIO CLAVE: Extraer el número de teléfono del remitente ---
+    // El formato de 'message.from' es 'phoneNumber@c.us'
+    const phoneNumber = message.from.split('@')[0];
+
+    console.log(`Mensaje recibido de ${message.from} (Número: ${phoneNumber}): ${message.body}`);
     
     try {
         // Llama a tu API de amael-ia
         const response = await axios.post(AMAEL_API_URL, {
             prompt: message.body,
-            history: [] // En una versión más avanzada, podrías manejar el historial por usuario
+            // --- CAMBIO CLAVE: Enviar el phoneNumber como user_id ---
+            user_id: phoneNumber 
         }, {
             headers: {
                 'Authorization': `Bearer ${AMAEL_JWT_TOKEN}`
@@ -99,7 +107,8 @@ app.get('/qr', (req, res) => {
     }
 });
 
-// Inicializa el cliente de WhatsApp
+// Inicializa el cliente de WhatsApp (solo una vez)
+console.log("Intentando inicializar el cliente de WhatsApp...");
 client.initialize();
 
 const PORT = process.env.PORT || 3000;
