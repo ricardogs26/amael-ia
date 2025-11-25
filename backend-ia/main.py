@@ -13,6 +13,7 @@ import json # <-- AÑADIDO: Para manejar el historial en formato JSON
 from authlib.integrations.starlette_client import OAuth
 from starlette.config import Config
 from jose import JWTError, jwt
+from urllib.parse import urlencode, quote_plus 
 
 # --- IMPORTACIONES DE LANGCHAIN ---
 from langchain_ollama import OllamaLLM, OllamaEmbeddings
@@ -134,9 +135,23 @@ async def auth_callback(request: Request):
             jwt_token = create_jwt_token(user_info['email'])
             frontend_url = "https://amael-ia.richardx.dev"
             
-            # --- VOLVER A LA REDIRECCIÓN ESTÁNDAR ---
-            # Esto le dice al navegador que vaya a la URL del frontend con el token.
-            return Response(status_code=302, headers={"location": f"{frontend_url}?token={jwt_token}"})
+            # --- CAMBIO IMPORTANTE AQUÍ ---
+            # Extraemos la información del perfil
+            user_name = user_info.get('name', 'Usuario')
+            user_picture = user_info.get('picture')
+
+            # Creamos un diccionario con los parámetros
+            params = {
+                "token": jwt_token,
+                "name": user_name,
+                "picture": user_picture
+            }
+            
+            # Codificamos los parámetros para la URL
+            redirect_url = f"{frontend_url}?{urlencode(params)}"
+            
+            # Redirigimos con el token y la información del perfil
+            return Response(status_code=302, headers={"location": redirect_url})
         else:
             # Manejo de error también con redirección
             frontend_url = "https://amael-ia.richardx.dev"
