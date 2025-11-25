@@ -21,6 +21,11 @@ def initialize_session_state():
         st.session_state.jwt_token = None
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    # --- AÑADE ESTAS NUEVAS VARIABLES DE SESIÓN Imagen de perfil---
+    if "user_name" not in st.session_state:
+        st.session_state.user_name = None
+    if "user_picture" not in st.session_state:
+        st.session_state.user_picture = None
 
 # --- LÓGICA DE AUTENTICACIÓN ---
 def check_authentication():
@@ -28,8 +33,19 @@ def check_authentication():
     jwt_token = st.query_params.get("token")
     error = st.query_params.get("error")
 
+    # --- CAMBIO IMPORTANTE AQUÍ ---
+    # Obtener información del perfil de los parámetros de la URL
+    user_name = st.query_params.get("name")
+    user_picture = st.query_params.get("picture")
+
     if jwt_token:
         st.session_state.jwt_token = jwt_token
+        # Guardar la información del perfil en el estado de la sesión
+        if user_name:
+            st.session_state.user_name = user_name
+        if user_picture:
+            st.session_state.user_picture = user_picture
+            
         st.query_params.clear()
         st.rerun() # Recarga la app para que los cambios de sesión surtan efecto
 
@@ -122,7 +138,7 @@ def mostrar_app_principal():
                 """
     st.markdown(hide_st_style, unsafe_allow_html=True)
 
-    # CSS para estilizar el chat
+    # CSS para estilizar el chat y el perfil
     st.markdown("""
     <style>
         .stChatMessage {
@@ -136,11 +152,48 @@ def mostrar_app_principal():
         .stChatMessage[data-testid="chat-message-container-assistant"] {
             background-color: #F1F3F4; /* Gris claro para el asistente */
         }
+        /* --- AÑADE ESTOS NUEVOS ESTILOS --- */
+        .profile-header-container {
+            display: flex;
+            justify-content: flex-end;
+            padding: 0 10px 10px 0;
+        }
+        .profile-header {
+            display: flex;
+            align-items: center;
+            background-color: #ffffff;
+            padding: 5px 15px;
+            border-radius: 20px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .profile-header img {
+            width: 35px;
+            height: 35px;
+            border-radius: 50%;
+            margin-left: 10px;
+            border: 2px solid #e0e0e0;
+        }
+        .profile-header span {
+            font-size: 16px;
+            font-weight: 500;
+            color: #333;
+        }
     </style>
     """, unsafe_allow_html=True)
 
-    st.title("💬 Amael-IA")
+    # --- NUEVA SECCIÓN PARA MOSTRAR EL PERFIL ---
+    if st.session_state.user_picture and st.session_state.user_name:
+        st.markdown(f"""
+        <div class="profile-header-container">
+            <div class="profile-header">
+                <span>{st.session_state.user_name}</span>
+                <img src="{st.session_state.user_picture}" alt="Foto de perfil">
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
+    st.title("💬 Amael-IA")
+    
     # --- Barra Lateral ---
     with st.sidebar:
         st.title("⚙️ Configuración")

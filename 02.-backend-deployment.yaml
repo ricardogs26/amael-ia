@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: backend-deployment
-  namespace: amael-ia
+  namespace: amael-ia  # <-- CORREGIDO
 spec:
   replicas: 1
   selector:
@@ -16,7 +16,7 @@ spec:
       imagePullSecrets: []
       containers:
       - name: backend-container
-        image: localhost:32000/backend-ia:0.2.7.1 #<-- Asegúrate que esta es tu última versión
+        image: localhost:32000/backend-ia:0.2.7.2 #<-- Asegúrate que esta es tu última versión
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8000
@@ -79,6 +79,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: chroma-pvc
+  namespace: amael-ia  # <-- CORREGIDO
 spec:
   accessModes:
     - ReadWriteOnce

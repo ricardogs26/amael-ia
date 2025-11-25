@@ -2,6 +2,7 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: amael-ia-ingress
+  namespace: amael-ia  # <-- CORREGIDO
   annotations:
     # --- Anotaciones de cert-manager ---
     cert-manager.io/cluster-issuer: "letsencrypt-prod"
