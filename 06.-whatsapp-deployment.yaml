@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whatsapp-bridge-deployment
+  namespace: amael-ia  # <-- CORREGIDO
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: whatsapp-bridge
+  template:
+    metadata:
+      labels:
+        app: whatsapp-bridge
+    spec:
+      containers:
+      - name: whatsapp-bridge
+        image: localhost:32000/whatsapp-bridge:0.0.9
+        ports:
+        - containerPort: 3000
+        env:
+        - name: AMAEL_API_URL
+          value: "http://backend-service:8000/api/chat" # <-- AJUSTA ESTO si es necesario
+        - name: AMAEL_JWT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: amael-secrets # <-- Asumes que tienes un secret para esto
+              key: jwt-token
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: whatsapp-bridge-service
+  namespace: amael-ia  # <-- CORREGIDO
+spec:
+  type: NodePort # NodePort para acceder desde fuera del clúster
+  selector:
+    app: whatsapp-bridge
+  ports:
+    - protocol: TCP
+      port: 3000       # Puerto del servicio
+      targetPort: 3000  # Puerto del contenedor
+      nodePort: 30007   # Puerto en tu máquina local (puedes cambiarlo)
