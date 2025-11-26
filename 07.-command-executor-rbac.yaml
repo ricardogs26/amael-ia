@@ -1,0 +1,34 @@
+# command-executor-rbac.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: command-executor-sa
+  namespace: amael-ia
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: command-executor-role
+  namespace: amael-ia
+rules:
+# Solo permite leer (get, list) pods, services y deployments
+- apiGroups: [""]
+  resources: ["pods", "services"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: command-executor-rolebinding
+  namespace: amael-ia
+subjects:
+- kind: ServiceAccount
+  name: command-executor-sa
+  namespace: amael-ia
+roleRef:
+  kind: Role
+  name: command-executor-role
+  apiGroup: rbac.authorization.k8s.io

@@ -16,7 +16,7 @@ spec:
       imagePullSecrets: []
       containers:
       - name: backend-container
-        image: localhost:32000/backend-ia:0.2.10 #<-- Asegúrate que esta es tu última versión
+        image: localhost:32000/backend-ia:0.2.12 #<-- Asegúrate que esta es tu última versión
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8000
