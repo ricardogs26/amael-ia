@@ -15,7 +15,9 @@ from starlette.config import Config
 from jose import JWTError, jwt
 from urllib.parse import urlencode, quote_plus 
 
-import httpx 
+import httpx
+import magic # libreria para determinar el tipo de formato en un archivo a ingestar
+
 
 # --- IMPORTACIONES DE LANGCHAIN ---
 from langchain_ollama import OllamaLLM, OllamaEmbeddings
@@ -240,27 +242,53 @@ async def ingest_data(file: UploadFile = File(...), user: str = Depends(get_curr
     """Endpoint para subir y procesar documentos (PDF, TXT) para un usuario específico."""
     temp_file_path = f"/tmp/{uuid.uuid4()}-{file.filename}"
     try:
+        # 1. Leer el contenido del archivo en memoria primero
+        content = await file.read()
+        
+        # 2. Determinar el tipo de archivo (MIME type) desde su contenido
+        #    Esto es mucho más seguro que fiarse de la extensión.
+        try:
+            # Usamos la librería 'python-magic' para inspeccionar los bytes
+            mime = magic.from_buffer(content, mime=True)
+        except Exception as e:
+            # Si magic falla, lanzamos un error genérico de tipo de archivo
+            raise HTTPException(status_code=400, detail="No se pudo determinar el tipo de archivo. Asegúrate de que no esté corrupto.")
+
+        # 3. Guardar el archivo temporalmente
         with open(temp_file_path, "wb") as buffer:
-            content = await file.read()
             buffer.write(content)
 
-        if file.filename.endswith(".pdf"):
+        # 4. Seleccionar el loader correcto basado en el MIME type detectado
+        if mime == "application/pdf":
             loader = PyPDFLoader(temp_file_path)
-        else:
+        elif mime == "text/plain":
             loader = TextLoader(temp_file_path)
+        else:
+            # Si no es PDF ni TXT, devolvemos un error claro.
+            # Por ejemplo, si es una imagen (mime == 'image/jpeg'), caerá aquí.
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Tipo de archivo no soportado: '{mime}'. Solo se permiten archivos PDF y TXT."
+            )
         
+        # 5. Procesar el documento como antes
         documents = loader.load()
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         texts = text_splitter.split_documents(documents)
 
-        # <-- CAMBIO IMPORTANTE: Obtener el vectorstore del usuario y añadir documentos allí.
         user_vectorstore = get_user_vectorstore(user)
         user_vectorstore.add_documents(texts)
         
         return {"message": f"Usuario {user} ha ingerido el archivo correctamente en su perfil."}
+
+    except HTTPException as http_e:
+        # Si ya es un HTTPException, simplemente la volvemos a lanzar
+        raise http_e
     except Exception as e:
+        # Para cualquier otro error inesperado
         raise HTTPException(status_code=500, detail=f"Error procesando el archivo: {e}")
     finally:
+        # 6. Limpiar el archivo temporal
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
 
