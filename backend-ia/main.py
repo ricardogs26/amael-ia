@@ -15,6 +15,8 @@ from starlette.config import Config
 from jose import JWTError, jwt
 from urllib.parse import urlencode, quote_plus 
 
+import httpx 
+
 # --- IMPORTACIONES DE LANGCHAIN ---
 from langchain_ollama import OllamaLLM, OllamaEmbeddings
 from langchain_chroma import Chroma
@@ -26,6 +28,21 @@ import base64
 from PIL import Image
 import numpy as np
 import io
+
+# URL del nuevo servicio ejecutor dentro del clúster
+COMMAND_EXECUTOR_URL = "http://command-executor-service:8001/execute"
+
+async def run_kubectl_command(command_key: str, namespace: str = "amael-ia"):
+    """Llama al servicio ejecutor de comandos de forma segura."""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(COMMAND_EXECUTOR_URL, json={"command_key": command_key, "namespace": namespace})
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as e:
+        return {"error": f"Error calling executor service: {e.response.status_code}", "detail": e.response.json()}
+    except Exception as e:
+        return {"error": f"An unexpected error occurred: {e}"}
 
 # --- CONFIGURACIÓN DE OAUTH Y JWT ---
 config = Config(environ=os.environ)
@@ -74,6 +91,60 @@ llm = OllamaLLM(model=MODEL_NAME, base_url=OLLAMA_BASE_URL)
 CHROMA_BASE_DIR = "/chroma_data"
 CHAT_HISTORIES_DIR = "/chat_histories" # <-- NUEVO: Directorio para los historiales
 
+# --- DEFINICIÓN DEL PROMPT (MOVIDO AQUÍ - ANTES DE LAS FUNCIONES QUE LO USAN) ---
+system_prompt_template = """
+### PERSONAJE
+Eres un asistente de IA avanzado con nombre de Amael, versátil y servicial. Tu objetivo es proporcionar respuestas precisas, claras y útiles. Adapta tu estilo de respuesta a la naturaleza de la pregunta del usuario, adaptate a su lenguaje.
+
+### REGLAS DE INTERACCIÓN
+    Usa el Historial y el Contexto: Analiza primero el HISTORIAL DE LA CONVERSACIÓN y luego el CONTEXTO DE DOCUMENTOS. 
+    Sé Natural: Para preguntas simples, responde de forma natural. 
+    Usa Herramientas cuando sea Necesario: Si el usuario te pide información sobre el estado del clúster (ej. "muéstrame los pods"), usa la herramienta run_kubectl_command. No inventes la respuesta. 
+    Procesa la Salida de la Herramienta: Después de llamar a la herramienta, recibirás una respuesta. Usa esa respuesta para formatear una respuesta clara y útil para el usuario. Muestra la salida del comando en un bloque de código. 
+    Sé Transparente: Si el CONTEXTO no contiene la información, pero tu conocimiento general te permite responder, indícalo explícitamente. 
+    No Inventes Datos Específicos: Nunca inventes métricas, nombres de archivos o detalles que no estén en el CONTEXTO o el HISTORIAL. 
+### HERRAMIENTAS DISPONIBLES
+Tienes acceso a una herramienta para ejecutar comandos de Kubernetes en el namespace 'amael-ia'.
+Para usarla, responde con un bloque de código JSON en el siguiente formato:
+```json
+{{
+  "tool_call": {{
+    "name": "run_kubectl_command",
+    "arguments": {{
+      "command_key": "get pods"
+    }}
+  }}
+}}
+```
+    - Los `command_key` permitidos son: "get pods", "get services", "get deployments".
+
+### INSTRUCCIONES
+1.  **Analiza la Petición del Usuario:** Entiende la pregunta o solicitud del usuario.
+2.  **Usa el Contexto Disponible:**
+    - Primero, revisa el `HISTORIAL DE LA CONVERSACIÓN` para entender el contexto.
+    - Luego, utiliza el `CONTEXTO DE DOCUMENTOS` para fundamentar tu respuesta con datos específicos.
+3.  **Decide Cómo Responder:**
+    - **¿El usuario pide información del clúster?** (ej: "muéstrame los pods"). Usa la herramienta `run_kubectl_command`. No inventes la respuesta.
+    - **¿Es una pregunta general o conversacional?** (ej: "hola", "¿cómo estás?"). Responde de forma natural y directa.
+    - **¿Es una pregunta compleja?** Estructura tu respuesta con Markdown (títulos, listas, negrita) para que sea clara y fácil de leer.
+4.  **Sé Preciso y Transparente:** Basa tus respuestas en la información proporcionada. Si el contexto es insuficiente, admítelo. Si usas tu conocimiento general, indícalo.
+5.  **No Inventes Datos Específicos:** Nunca inventes métricas, nombres de archivo o detalles que no estén en el `CONTEXTO` o el `HISTORIAL`.
+
+### HISTORIAL DE LA CONVERSACIÓN
+---
+{conversation_history}
+---
+
+### CONTEXTO DE DOCUMENTOS
+---
+<<<CONTEXT>>>
+
+**Pregunta del Usuario:**
+{request_prompt}
+
+**Respuesta del Asistente:**
+"""
+
 # --- FUNCIONES AUXILIARES MULTIUSUARIO ---
 
 def sanitize_email(email: str) -> str:
@@ -92,14 +163,17 @@ def get_user_vectorstore(user_email: str):
     )
     return vectorstore
 
-def get_user_history_path(user_email: str) -> str:
-    """Obtiene la ruta al archivo de historial de un usuario."""
-    return os.path.join(CHAT_HISTORIES_DIR, f"{sanitize_email(user_email)}.json")
+def get_history_path_for_id(identifier: str) -> str:
+    """Obtiene la ruta al archivo de historial para un identificador único (email o teléfono)."""
+    # Sanitiza el identificador para que sea un nombre de archivo válido
+    sanitized_id = identifier.replace("@", "_at_").replace(".", "_dot_").replace("-", "_dash_")
+    return os.path.join(CHAT_HISTORIES_DIR, f"{sanitized_id}.json")
 
 # --- MODELOS DE DATOS ---
 class ChatRequest(BaseModel):
     prompt: str
     history: list[dict] = [] # Para recibir el historial del frontend
+    user_id: str = None     # <-- NUEVO: Identificador único del usuario (ej. número de teléfono)
 
 class ChatResponse(BaseModel):
     response: str
@@ -192,55 +266,35 @@ async def ingest_data(file: UploadFile = File(...), user: str = Depends(get_curr
 
 @app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(get_current_user)])
 async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_user)):
-    """Endpoint para chatear usando RAG con un rol de especialista, con historial y datos por usuario."""
+    """Endpoint para chatear, ahora con soporte para múltiples usuarios por ID y ejecución de herramientas."""
     
-    # <-- CAMBIO IMPORTANTE: Asegurarse de que el directorio de historiales exista.
+    # --- LÓGICA DEL ENDPOINT ---
+    
     os.makedirs(CHAT_HISTORIES_DIR, exist_ok=True)
 
-    # 1. Recuperar documentos relevantes DEL USUARIO
-    # <-- CAMBIO IMPORTANTE: Obtener el vectorstore del usuario.
+    # Determinar qué ID usar para el historial (email del usuario o user_id de WhatsApp)
+    history_id = request.user_id if request.user_id else user
+    history_path = get_history_path_for_id(history_id)
+
+    # Cargar el historial del usuario específico desde el archivo
+    history = []
+    if os.path.exists(history_path):
+        with open(history_path, "r") as f:
+            history = json.load(f)
+
+    # 1. Recuperar documentos relevantes del USUARIO AUTENTICADO (el bot)
     user_vectorstore = get_user_vectorstore(user)
     retriever = user_vectorstore.as_retriever()
     relevant_docs = retriever.invoke(request.prompt)
     context = "\n".join([doc.page_content for doc in relevant_docs])
 
-    # 2. Construir el historial de conversación (el que viene del frontend es suficiente para el contexto)
+    # 2. Construir el historial de conversación (usando el historial cargado del archivo)
     conversation_history = ""
-    if request.history:
-        history_lines = [f"Human: {msg['content']}" if msg['role'] == 'user' else f"Assistant: {msg['content']}" for msg in request.history]
+    if history:
+        history_lines = [f"Human: {msg['content']}" if msg['role'] == 'user' else f"Assistant: {msg['content']}" for msg in history]
         conversation_history = "\n".join(history_lines)
 
-    # 3. Crear el prompt del especialista (sin cambios en la plantilla)
-    system_prompt_template = """
-### PERSONAJE
-Eres un asistente de IA avanzado, versátil y servicial. Tu objetivo es proporcionar respuestas precisas, claras y útiles. Adapta tu estilo de respuesta a la naturaleza de la pregunta del usuario.
-
-### REGLAS DE INTERACCIÓN
-1.  **Usa el Historial y el Contexto:** Analiza primero el `HISTORIAL DE LA CONVERSACIÓN` y luego el `CONTEXTO DE DOCUMENTOS` para fundamentar tu respuesta.
-2.  **Sé Natural:** Para preguntas simples, saludos o conversaciones casuales, responde de forma natural y concisa, como lo haría una persona. **No es necesario usar títulos ni listas.**
-3.  **Estructura cuando sea Necesario:** Para respuestas complejas, explicaciones técnicas o listas de pasos, utiliza Markdown para mejorar la claridad:
-    *   Usa **negrita** para resaltar términos clave.
-    *   Usa listas (`*` o `1.`) para presentar opciones o pasos.
-    *   Usa bloques de código para comandos o ejemplos.
-    *   Usa títulos (`##`) solo para dividir respuestas muy largas en secciones claras.
-4.  **Sé Transparente:** Si el `CONTEXTO` no contiene la información, pero tu conocimiento general te permite responder, indícalo explícitamente (ej: "Aunque no lo encuentro en tus documentos, basándome en mi experiencia...").
-5.  **No Inventes Datos Específicos:** Nunca inventes métricas, nombres de archivos o detalles que no estén en el `CONTEXTO` o el `HISTORIAL`.
-
-### HISTORIAL DE LA CONVERSACIÓN
----
-{conversation_history}
----
-
-### CONTEXTO DE DOCUMENTOS
----
-<<<CONTEXT>>>
-
-**Pregunta del Usuario:**
-{request_prompt}
-
-**Respuesta del Asistente:**
-"""
-    
+    # 3. Crear el prompt final
     final_prompt = system_prompt_template.format(
         conversation_history=conversation_history,
         request_prompt=request.prompt
@@ -248,22 +302,49 @@ Eres un asistente de IA avanzado, versátil y servicial. Tu objetivo es proporci
     final_prompt = final_prompt.replace("<<<CONTEXT>>>", context)
 
     try:
+        # 4. Invocar al LLM
         response = llm.invoke(final_prompt)
-        
-        # <-- CAMBIO IMPORTANTE: Guardar el historial actualizado en el archivo del usuario.
-        history_path = get_user_history_path(user)
-        # Añadimos el mensaje del usuario y la respuesta del asistente al historial recibido.
-        updated_history = request.history + [
+
+        # --- LÓGICA PARA MANEJAR LLAMADAS A HERRAMIENTAS ---
+        if "```json" in response and "tool_call" in response:
+            try:
+                # Extraer el JSON de la respuesta
+                start_index = response.find("```json") + 7
+                end_index = response.find("```", start_index)
+                json_str = response[start_index:end_index].strip()
+                tool_call_data = json.loads(json_str)
+
+                if tool_call_data.get("tool_call", {}).get("name") == "run_kubectl_command":
+                    command_key = tool_call_data["tool_call"]["arguments"]["command_key"]
+                    print(f"Agent is requesting to execute command: {command_key}")
+                    
+                    # Llamar a la función que ejecuta el comando
+                    command_result = await run_kubectl_command(command_key)
+                    
+                    # Formatear la respuesta final con el resultado del comando
+                    final_response = f"Aquí está la salida del comando `{command_key}`:\n\n```\n{command_result.get('output', command_result.get('error'))}\n```"
+                else:
+                    final_response = "Lo siento, no reconozco esa herramienta."
+            except (json.JSONDecodeError, KeyError) as e:
+                final_response = f"Error al procesar la solicitud de la herramienta: {e}"
+        else:
+            # Si no hay llamada a herramienta, la respuesta es la del LLM directamente
+            final_response = response
+
+        # --- GUARDAR EL HISTORIAL ACTUALIZADO (AHORA DENTRO DEL TRY) ---
+        updated_history = history + [
             {"role": "user", "content": request.prompt},
-            {"role": "assistant", "content": response}
+            {"role": "assistant", "content": final_response} # <-- Usar la respuesta final
         ]
         with open(history_path, "w") as f:
             json.dump(updated_history, f)
 
-        return ChatResponse(response=response)
+        return ChatResponse(response=final_response)
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al contactar al modelo de IA: {e}")
 
+    
 # ... TensorFlow (sin cambios, ya que no es multiusuario por ahora)
 @app.post("/api/analyze-image", dependencies=[Depends(get_current_user)])
 async def analyze_image(file: UploadFile = File(...), user: str = Depends(get_current_user)):
