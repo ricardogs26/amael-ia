@@ -32,18 +32,6 @@ spec:
             claimName: tf-model-pvc
 ---
 apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: tf-model-pvc
-  namespace: amael-ia
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 2Gi # Suficiente para el modelo
----
-apiVersion: v1
 kind: Service
 metadata:
   name: tf-serving-service
@@ -55,3 +43,4 @@ spec:
     - port: 8501
       targetPort: 8501
   type: ClusterIP
+  

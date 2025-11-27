@@ -34,3 +34,4 @@ spec:
       port: 8501
       targetPort: 8501
   type: ClusterIP
+

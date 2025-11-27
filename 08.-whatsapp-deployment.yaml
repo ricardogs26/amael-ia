@@ -1,16 +1,4 @@
-# whatsapp-pvc.yaml
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: whatsapp-session-pvc
-  namespace: amael-ia # Asegúrate de que esté en el mismo namespace
-spec:
-  accessModes:
-    - ReadWriteOnce # El volumen puede ser montado como lectura-escritura por un solo nodo
-  resources:
-    requests:
-      storage: 100Mi # Solo necesitamos un espacio pequeño para la sesión
----      
+     
 apiVersion: apps/v1
 kind: Deployment
 metadata:

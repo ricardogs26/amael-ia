@@ -35,18 +35,6 @@ spec:
             claimName: ollama-pvc
 ---
 apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: ollama-pvc
-  namespace: amael-ia  # <-- CORREGIDO
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 50Gi
----
-apiVersion: v1
 kind: Service
 metadata:
   name: ollama-service
