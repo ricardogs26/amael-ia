@@ -23,6 +23,13 @@ spec:
         args:
         - --model_name=imagenet_classifier
         - --model_base_path=/models/mobilenet
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
         volumeMounts:
         - name: model-storage
           mountPath: /models/mobilenet
