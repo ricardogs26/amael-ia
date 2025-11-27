@@ -22,3 +22,4 @@ itsdangerous
 
 Pillow
 numpy
+python-magic
