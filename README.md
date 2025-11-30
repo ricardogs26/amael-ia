@@ -55,3 +55,27 @@ graph TD
     F -->|Pull Images| H
     E -->|Pull Images| H
     D -->|Pull Images| H
+🚀 Despliegue Rápido 
+
+El despliegue se gestiona completamente a través de Argo CD. Para desplegar la plataforma en tu clúster, sigue la guía detallada: 
+
+📖 Guía de Despliegue  
+🛠️ Stack Tecnológico 
+
+     Backend: Python, FastAPI, SQLAlchemy
+     Frontend: React, TypeScript, Vite
+     Inteligencia Artificial: PyTorch, Transformers, Scikit-learn
+     Base de Datos: PostgreSQL
+     Contenerización: Docker
+     Orquestación: Kubernetes (MicroK8s)
+     CI/CD / GitOps: Argo CD
+     Ingress & Certificados: NGINX Ingress, Cert-Manager, Cloudflare
+     
+
+📚 Documentación 
+
+     📋 Arquitectura del Sistema 
+     💻 Guía de Desarrollo Local 
+     🚀 Guía de Despliegue 
+     🤝 Cómo Contribuir 
+     
