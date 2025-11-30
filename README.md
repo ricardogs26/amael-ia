@@ -56,6 +56,9 @@ graph TD
     E -->|Pull Images| H
     D -->|Pull Images| H
 
+```
+---
+
 ## 🚀 Despliegue Rápido 
 
 El despliegue se gestiona completamente a través de Argo CD. Para desplegar la plataforma en tu clúster, sigue la guía detallada: 
