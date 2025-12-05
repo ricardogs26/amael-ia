@@ -23,6 +23,13 @@ spec:
         args:
         - --model_name=imagenet_classifier
         - --model_base_path=/models/mobilenet
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
         volumeMounts:
         - name: model-storage
           mountPath: /models/mobilenet
@@ -30,18 +37,6 @@ spec:
         - name: model-storage
           persistentVolumeClaim:
             claimName: tf-model-pvc
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: tf-model-pvc
-  namespace: amael-ia
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 2Gi # Suficiente para el modelo
 ---
 apiVersion: v1
 kind: Service
@@ -55,3 +50,4 @@ spec:
     - port: 8501
       targetPort: 8501
   type: ClusterIP
+  

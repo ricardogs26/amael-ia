@@ -21,6 +21,13 @@ spec:
         image: localhost:32000/command-executor:0.0.1
         ports:
         - containerPort: 8001
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
 ---
 apiVersion: v1
 kind: Service
@@ -34,3 +41,4 @@ spec:
     - protocol: TCP
       port: 8001
       targetPort: 8001
+
