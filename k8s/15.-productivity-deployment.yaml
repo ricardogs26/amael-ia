@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: productivity-service-deployment
+  namespace: amael-ia
+  labels:
+    app: productivity-service
+spec:
+  replicas: 1  # Puedes aumentar esto si necesitas más disponibilidad
+  selector:
+    matchLabels:
+      app: productivity-service
+  template:
+    metadata:
+      labels:
+        app: productivity-service
+    spec:
+      containers:
+      - name: productivity-service
+        # Reemplaza con la ruta a tu imagen en tu registro de contenedores
+        image: localhost:32000/productivity-service:0.0.5
+        ports:
+        - containerPort: 8001
+        envFrom:
+        - configMapRef:
+            name: productivity-service-config
+        - secretRef:
+            name: productivity-service-secrets
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 5
+          periodSeconds: 10

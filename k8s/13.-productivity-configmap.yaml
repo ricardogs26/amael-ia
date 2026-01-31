@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: productivity-service-config
+  namespace: amael-ia
+data:
+  # Reemplaza estos valores con los tuyos
+  OLLAMA_BASE_URL: "http://ollama-service:11434"
+  MODEL_NAME: "glm4"
+  # IMPORTANTE: Esta URI debe ser pública y estar configurada en Google Cloud Console
+  REDIRECT_URI: "https://amael-ia.richardx.dev/api/auth/callback"
+  GOOGLE_CLIENT_ID: "206335935766-lrlpm2tckn55lluujp2b2q8lbk28uhlp.apps.googleusercontent.com"
