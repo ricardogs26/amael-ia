@@ -31,6 +31,10 @@ from PIL import Image
 import numpy as np
 import io
 
+# --- CONFIGURACIÓN DEL SERVICIO DE PRODUCTIVIDAD ---
+PRODUCTIVITY_SERVICE_URL = "http://productivity-service:8001" # URL del nuevo servicio en la red de Docker/K8s
+INTERNAL_API_SECRET = "g686GnXRZFfJ48Au1a1pGkVTxCQoEE" # Debe ser el mismo que en el .env del microservicio
+
 # URL del nuevo servicio ejecutor dentro del clúster
 COMMAND_EXECUTOR_URL = "http://command-executor-service:8001/execute"
 
@@ -96,7 +100,7 @@ CHAT_HISTORIES_DIR = "/chat_histories" # <-- NUEVO: Directorio para los historia
 # --- DEFINICIÓN DEL PROMPT (MOVIDO AQUÍ - ANTES DE LAS FUNCIONES QUE LO USAN) ---
 system_prompt_template = """
 ### PERSONAJE
-Eres un asistente de IA avanzado con nombre de Amael, versátil y servicial. Tu objetivo es proporcionar respuestas precisas, claras y útiles. Adapta tu estilo de respuesta a la naturaleza de la pregunta del usuario, adaptate a su lenguaje.
+Eres un asistente de IA avanzado con nombre de Amael creado por Ricardo Guzman, versátil y servicial. Tu objetivo es proporcionar respuestas precisas, claras y útiles. Adapta tu estilo de respuesta a la naturaleza de la pregunta del usuario, adaptate a su lenguaje.
 
 ### REGLAS DE INTERACCIÓN
     Usa el Historial y el Contexto: Analiza primero el HISTORIAL DE LA CONVERSACIÓN y luego el CONTEXTO DE DOCUMENTOS. 
@@ -297,8 +301,42 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
     """Endpoint para chatear, ahora con soporte para múltiples usuarios por ID y ejecución de herramientas."""
     
     # --- LÓGICA DEL ENDPOINT ---
-    
+     
+    # Validar que el prompt no esté vacío o contenga solo espacios en blanco.
+    if not request.prompt or request.prompt.strip() == "":
+        # En lugar de dejar que la aplicación falle, devolvemos una respuesta amigable.
+        # Esto hace que la experiencia sea mejor y no se registra un error en el bridge de WhatsApp.
+        return ChatResponse(response="¡Hola! como te encuentras, envía tu consulta.")
+    # Asegurarse de que el directorio de historiales exista   
     os.makedirs(CHAT_HISTORIES_DIR, exist_ok=True)
+
+    # --- NUEVA LÓGICA PARA ORGANIZAR EL DÍA ---
+    if "organiza mi día" in request.prompt.lower():
+        try:
+            headers = {"Authorization": f"Bearer {INTERNAL_API_SECRET}"}
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{PRODUCTIVITY_SERVICE_URL}/organize",
+                    json={"user_email": user}, # Pasamos el email del usuario
+                    headers=headers,
+                    timeout=60.0 # La operación puede tardar
+                )
+                response.raise_for_status() # Lanza un error si la petición falló (ej. 500)
+                
+                result_data = response.json()
+                summary = result_data.get("summary", "Tu día ha sido organizado.")
+                tasks_created = result_data.get("tasks_created", 0)
+                final_response = f"{summary}\n\nHe creado {tasks_created} nuevas tareas en tu calendario."
+
+            return ChatResponse(response=final_response)
+
+        except httpx.RequestError as e:
+            print(f"Error contacting productivity service: {e}")
+            raise HTTPException(status_code=503, detail="El servicio de productividad no está disponible en este momento.")
+        except httpx.HTTPStatusError as e:
+            print(f"Productivity service returned an error: {e.response.text}")
+            raise HTTPException(status_code=500, detail="Ocurrió un error al organizar tu día.")
+
 
     # Determinar qué ID usar para el historial (email del usuario o user_id de WhatsApp)
     history_id = request.user_id if request.user_id else user
