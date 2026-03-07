@@ -1,7 +1,0 @@
-fastapi
-uvicorn
-python-multipart
-authlib
-starlette
-python-jose[cryptography]
-requests

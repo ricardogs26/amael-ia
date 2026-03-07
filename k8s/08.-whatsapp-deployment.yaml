@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: whatsapp-bridge
-        image: localhost:32000/whatsapp-bridge:0.1.10
+        image: localhost:32000/whatsapp-bridge:0.1.11
         ports:
         - containerPort: 3000
         volumeMounts:

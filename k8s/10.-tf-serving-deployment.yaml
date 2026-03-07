@@ -13,6 +13,25 @@ spec:
       labels:
         app: tf-serving
     spec:
+      initContainers:
+      - name: download-model
+        image: tensorflow/tensorflow:2.13.0
+        command:
+        - python
+        - -c
+        - |
+          import os
+          import tensorflow as tf
+          if not os.path.exists('/models/mobilenet/1/saved_model.pb'):
+              print("Downloading model...")
+              model = tf.keras.applications.MobileNetV2(weights='imagenet')
+              tf.saved_model.save(model, '/models/mobilenet/1')
+              print("Model saved.")
+          else:
+              print("Model already exists.")
+        volumeMounts:
+        - name: model-storage
+          mountPath: /models/mobilenet
       containers:
       - name: tf-serving-container
         # Imagen oficial de TensorFlow Serving
