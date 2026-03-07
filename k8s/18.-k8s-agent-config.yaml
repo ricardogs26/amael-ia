@@ -15,4 +15,4 @@ metadata:
   namespace: amael-ia
 data:
   OLLAMA_BASE_URL: "http://ollama-service:11434"
-  MODEL_NAME: "glm4"
+  MODEL_NAME: "qwen2.5:14b"

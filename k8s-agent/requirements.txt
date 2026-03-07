@@ -4,3 +4,4 @@ requests
 langchain
 langchain-ollama
 pydantic
+kubernetes

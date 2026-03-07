@@ -10,7 +10,7 @@ metadata:
   name: k8s-agent-role
 rules:
 - apiGroups: ["", "apps", "batch", "extensions"]
-  resources: ["pods", "services", "endpoints", "persistentvolumeclaims", "events", "configmaps", "secrets", "deployments", "replicasets", "statefulsets", "daemonsets", "jobs", "cronjobs", "nodes"]
+  resources: ["pods", "services", "endpoints", "persistentvolumeclaims", "events", "configmaps", "secrets", "deployments", "replicasets", "statefulsets", "daemonsets", "jobs", "cronjobs", "nodes", "namespaces"]
   verbs: ["get", "list", "watch", "delete"]
 - apiGroups: [""]
   resources: ["pods/log"]
@@ -50,8 +50,8 @@ spec:
       serviceAccountName: k8s-agent-sa
       containers:
       - name: k8s-agent
-        image: registry.richardx.dev/k8s-agent:0.1.7
-        imagePullPolicy: IfNotPresent
+        image: registry.richardx.dev/k8s-agent:0.2.8
+        imagePullPolicy: Always
         ports:
         - containerPort: 8002
         envFrom:

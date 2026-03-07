@@ -20,28 +20,36 @@ if (!AMAEL_JWT_TOKEN) {
 
 // Almacenará el código QR para mostrarlo en la web
 let qrCodeData = null;
+let clientStatus = 'initializing';
 
 // Configuración del cliente de WhatsApp para que guarde la sesión
 // --- CONFIGURACIÓN ROBUSTA PARA PUPPETEER EN KUBERNETES ---
+const puppeteerCore = require('puppeteer-core');
+
+// Configuración del cliente de WhatsApp para que guarde la sesión
+// --- CONFIGURACIÓN ROBUSTA PARA PUPPETEER EN KUBERNETES ---
+// Usar el Chromium bundled de puppeteer-core (versión compatible con la librería)
+const CHROMIUM_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || puppeteerCore.executablePath();
+console.log(`Usando Chromium en: ${CHROMIUM_PATH}`);
+
 const client = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: {
         headless: true,
-        // --- RUTA CORRECTA PARA LA IMAGEN DEBIAN/SLIM ---
-        executablePath: '/usr/bin/chromium',
-        // --- ARGUMENTOS CLAVE PARA CONTENEDORES ---
+        executablePath: CHROMIUM_PATH,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
-            '--disable-gpu'
+            '--disable-gpu',
+            '--disable-extensions',
+            '--disable-software-rasterizer',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-renderer-backgrounding',
         ]
     },
-    // --- FIJAR VERSIÓN DE WA WEB PARA EVITAR CRASH DEL CONTEXTO DE EJECUCIÓN ---
-    webVersionCache: {
-        type: "remote",
-        remotePath: "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html",
-    }
+    // using default local web version cache
 });
 
 // --- EVENTOS DE WHATSAPP ---
@@ -51,12 +59,42 @@ client.on('qr', (qr) => {
     console.log('QR Code recibido, escanéalo!');
     qrcode.generate(qr, { small: true }); // Muestra el QR en la consola
     qrCodeData = qr; // Guarda el QR para la web
+    clientStatus = 'awaiting_qr';
 });
 
 // Cuando el cliente se ha conectado correctamente
 client.on('ready', () => {
     console.log('¡Cliente de WhatsApp listo!');
     qrCodeData = 'CLIENTE_LISTO'; // Indica que ya no se necesita el QR
+    clientStatus = 'ready';
+});
+
+// Cuando hay un fallo de autenticación
+client.on('auth_failure', (msg) => {
+    console.error('ERROR de autenticación de WhatsApp:', msg);
+    clientStatus = 'auth_failure';
+    qrCodeData = null;
+});
+
+// Cuando el cliente se desconecta
+client.on('disconnected', (reason) => {
+    console.log('WhatsApp desconectado. Razón:', reason);
+    clientStatus = 'disconnected';
+    qrCodeData = null;
+    // Reintentar inicialización después de 5 segundos
+    console.log('Reintentando inicialización en 5 segundos...');
+    setTimeout(() => {
+        console.log('Reintentando client.initialize()...');
+        client.initialize().catch(err => {
+            console.error('Error al reintentar initialize():', err);
+        });
+    }, 5000);
+});
+
+// Capturar errores del proceso de Puppeteer
+client.on('loading_screen', (percent, message) => {
+    console.log(`Cargando WhatsApp Web: ${percent}% - ${message}`);
+    clientStatus = `loading:${percent}%`;
 });
 
 // Cuando se recibe un mensaje
@@ -98,25 +136,58 @@ client.on('message', async message => {
 
 // --- ENDPOINTS WEB ---
 
-// Endpoint para servir la página con el QR
+// Endpoint para servir la página con el QR (con auto-refresh)
 app.get('/qr', (req, res) => {
-    if (qrCodeData === 'CLIENTE_LISTO') {
-        res.send('<h1>El bot ya está conectado y listo.</h1><p>Puedes cerrar esta pestaña.</p>');
-    } else if (qrCodeData) {
+    if (clientStatus === 'ready') {
+        res.send('<h1>✅ El bot ya está conectado y listo.</h1><p>Puedes cerrar esta pestaña.</p>');
+    } else if (qrCodeData && clientStatus === 'awaiting_qr') {
         res.send(`
-            <h1>Escanea este código QR con WhatsApp</h1>
-            <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(qrCodeData)}" alt="QR Code">
+            <!DOCTYPE html>
+            <html>
+            <head><title>WhatsApp QR</title></head>
+            <body style="text-align:center;font-family:sans-serif;padding:40px">
+                <h1>📱 Escanea este código QR con WhatsApp</h1>
+                <img src="https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qrCodeData)}" alt="QR Code">
+                <p>Abre WhatsApp → Dispositivos vinculados → Vincular un dispositivo</p>
+                <meta http-equiv="refresh" content="30">
+            </body>
+            </html>
         `);
     } else {
-        res.send('<h1>Esperando el código QR... Por favor, espera.</h1><meta http-equiv="refresh" content="5">');
+        res.send(`
+            <!DOCTYPE html>
+            <html>
+            <head><title>WhatsApp Bridge</title></head>
+            <body style="text-align:center;font-family:sans-serif;padding:40px">
+                <h1>⏳ Iniciando WhatsApp Bridge...</h1>
+                <p>Estado actual: <strong>${clientStatus}</strong></p>
+                <p>Esto puede tomar hasta 30 segundos. La página se recargará automáticamente.</p>
+                <meta http-equiv="refresh" content="5">
+            </body>
+            </html>
+        `);
     }
+});
+
+// Endpoint de estado para diagnóstico
+app.get('/status', (req, res) => {
+    res.json({
+        status: clientStatus,
+        hasQR: !!qrCodeData && qrCodeData !== 'CLIENTE_LISTO',
+        timestamp: new Date().toISOString()
+    });
 });
 
 // Inicializa el cliente de WhatsApp (solo una vez)
 console.log("Intentando inicializar el cliente de WhatsApp...");
-client.initialize();
+client.initialize().catch(err => {
+    console.error('ERROR FATAL al inicializar el cliente de WhatsApp:', err);
+    clientStatus = 'error';
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Servidor web corriendo en http://localhost:${PORT}`);
+    console.log(`QR disponible en: http://localhost:${PORT}/qr`);
+    console.log(`Estado en: http://localhost:${PORT}/status`);
 });

@@ -63,10 +63,18 @@ def initialize_session_state():
 
 # --- LÓGICA DE AUTENTICACIÓN ---
 def check_authentication():
+    # En nuevas versiones de Streamlit, st.query_params se comporta diferente
+    # Extraemos asegurándonos que sea un string y no una lista
     jwt_token = st.query_params.get("token")
+    if isinstance(jwt_token, list): jwt_token = jwt_token[0]
+        
     error = st.query_params.get("error")
+    
     user_name = st.query_params.get("name")
+    if isinstance(user_name, list): user_name = user_name[0]
+        
     user_picture = st.query_params.get("picture")
+    if isinstance(user_picture, list): user_picture = user_picture[0]
 
     if jwt_token:
         st.session_state.jwt_token = jwt_token
@@ -204,7 +212,7 @@ def mostrar_pantalla_login():
             <div class="logo-icon">✨</div>
             <h1>Amael-IA</h1>
             <p>Tu asistente inteligente personal</p>
-            <a href="{BACKEND_URL}/auth/login" class="google-btn">
+            <a href="{BACKEND_URL}/auth/login" class="google-btn" target="_self">
                 <img src="https://www.svgrepo.com/show/475656/google-color.svg" alt="Google Logo">
                 Continuar con Google
             </a>
@@ -611,27 +619,39 @@ def mostrar_app_principal():
         with st.chat_message("user", avatar="👤"):
             render_chat_message(prompt)
 
-        with st.chat_message("assistant", avatar="✨"):
-            message_placeholder = st.empty()
-            headers = {"Authorization": f"Bearer {st.session_state.jwt_token}"}
-            try:
-                payload = {
-                    "prompt": prompt, 
-                    "history": st.session_state.messages
-                }
+        headers = {"Authorization": f"Bearer {st.session_state.jwt_token}"}
+        payload = {
+            "prompt": prompt, 
+            "history": st.session_state.messages
+        }
+        
+        # Ocupamos un contenedor general (no de chat) para la fase de "Pensando"
+        spinner_placeholder = st.empty()
+        error_placeholder = st.empty()
+        
+        try:
+            with spinner_placeholder.container():
                 with st.spinner("Pensando respuesta..."):
                     response = requests.post(f"{BACKEND_URL}/chat", json=payload, headers=headers)
-                
-                if response.status_code == 200:
-                    full_response = response.json().get("response", "No pude generar una respuesta.")
-                    message_placeholder.empty()
+            
+            # Limpiamos el spinner
+            spinner_placeholder.empty()
+
+            if response.status_code == 200:
+                full_response = response.json().get("response", "No pude generar una respuesta.")
+                # Solo pintamos en el chat si tuvimos éxito
+                with st.chat_message("assistant", avatar="✨"):
                     render_chat_message(full_response)
-                    st.session_state.messages.append({"role": "assistant", "content": full_response})
-                else:
-                    error_detail = response.json().get("detail", "Error desconocido.")
-                    message_placeholder.error(f"Error del backend: {error_detail}")
-            except requests.exceptions.RequestException as e:
-                message_placeholder.error(f"No se pudo contactar al backend: {e}")
+                st.session_state.messages.append({"role": "assistant", "content": full_response})
+            else:
+                try:
+                    error_detail = response.json().get("detail", f"Error HTTP {response.status_code}")
+                except ValueError:
+                    error_detail = f"Error HTTP {response.status_code}: {response.text[:100]}"
+                error_placeholder.error(f"Error del backend: {error_detail}")
+        except requests.exceptions.RequestException as e:
+            spinner_placeholder.empty()
+            error_placeholder.error(f"No se pudo contactar al backend: {e}")
 
 def main():
     initialize_session_state()

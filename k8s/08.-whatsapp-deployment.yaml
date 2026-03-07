@@ -16,31 +16,38 @@ spec:
     spec:
       containers:
       - name: whatsapp-bridge
-        image: localhost:32000/whatsapp-bridge:0.1.11
+        image: registry.richardx.dev/whatsapp-bridge:0.1.13
+        imagePullPolicy: Always
         ports:
         - containerPort: 3000
         volumeMounts:
         - name: whatsapp-session-storage
-          mountPath: /usr/src/app/.wwebjs_auth # Monta el volumen aqu
+          mountPath: /usr/src/app/.wwebjs_auth
+        - name: shm
+          mountPath: /dev/shm
         env:
         - name: AMAEL_API_URL
-          value: "http://backend-service:8000/api/chat" # <-- AJUSTA ESTO si es necesario
+          value: "http://backend-service:8000/api/chat"
         - name: AMAEL_JWT_TOKEN
           valueFrom:
             secretKeyRef:
-              name: amael-secrets # <-- Asumes que tienes un secret para esto
+              name: amael-secrets
               key: jwt-token
         resources:
           requests:
-            memory: "256Mi"
+            memory: "768Mi"
             cpu: "250m"
           limits:
-            memory: "512Mi"
-            cpu: "500m"
+            memory: "1.5Gi"
+            cpu: "1000m"
       volumes:
       - name: whatsapp-session-storage
         persistentVolumeClaim:
-          claimName: whatsapp-session-pvc        
+          claimName: whatsapp-session-pvc
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 256Mi
 ---
 apiVersion: v1
 kind: Service

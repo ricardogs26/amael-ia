@@ -4,4 +4,6 @@ metadata:
   name: allowed-users-configmap
   namespace: amael-ia
 data:
-  ALLOWED_EMAILS_CSV: "ricardogs26@gmail.com,rguzmans@bancobase.com,admin@gmail.com,test@example.com"
+  ALLOWED_EMAILS_CSV: "lucero.ahumada26@gmail.com,ricardogs26@gmail.com,rguzmans@bancobase.com,admin@gmail.com,test@example.com"
+  # Lista estricta. Solo estos podrán listar pods, borrar deployments, etc. (Puede incluir números de WA)
+  K8S_ALLOWED_USERS_CSV: "ricardogs26@gmail.com,rguzmans@bancobase.com"

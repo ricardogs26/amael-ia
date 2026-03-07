@@ -16,9 +16,9 @@ spec:
       imagePullSecrets: []
       containers:
       - name: frontend-container
-        image: registry.richardx.dev/frontend-ia:0.3.0.9
+        image: registry.richardx.dev/frontend-ia:0.1.9
         #image: localhost:32000/frontend-ia:0.2.4.5 # Asegúrate que esta es la etiqueta que construiste
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: Always
         ports:
         - containerPort: 8501
         resources:

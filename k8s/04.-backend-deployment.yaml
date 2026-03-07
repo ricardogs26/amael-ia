@@ -16,7 +16,7 @@ spec:
       imagePullSecrets: []
       containers:
       - name: backend-container
-        image: registry.richardx.dev/backend-ia:0.1.8 #<-- Asegúrate que esta es tu última versión
+        image: registry.richardx.dev/backend-ia:0.3.5
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8000
@@ -60,6 +60,18 @@ spec:
               configMapKeyRef:
                 name: allowed-users-configmap
                 key: ALLOWED_EMAILS_CSV
+          # Nueva variable de Whitelist para Infraestructura
+          - name: K8S_ALLOWED_USERS_CSV
+            valueFrom:
+              configMapKeyRef:
+                name: allowed-users-configmap
+                key: K8S_ALLOWED_USERS_CSV
+          # Secreto de API interna refactorizado
+          - name: INTERNAL_API_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: google-auth-secret
+                key: internal_api_secret
         volumeMounts:
         - name: chroma-storage
           mountPath: /chroma_data

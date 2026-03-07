@@ -33,7 +33,11 @@ import io
 
 # --- CONFIGURACIÓN DEL SERVICIO DE PRODUCTIVIDAD ---
 PRODUCTIVITY_SERVICE_URL = "http://productivity-service:8001" # URL del nuevo servicio en la red de Docker/K8s
-INTERNAL_API_SECRET = "g686GnXRZFfJ48Au1a1pGkVTxCQoEE" # Debe ser el mismo que en el .env del microservicio
+# Seguridad: Leído desde Kubernetes Secrets para cumplimiento de buenas prácticas
+INTERNAL_API_SECRET = os.environ.get("INTERNAL_API_SECRET")
+
+if not INTERNAL_API_SECRET:
+    raise ValueError("Falta la variable de entorno 'INTERNAL_API_SECRET' montada en el Pod.")
 
 # URL del nuevo servicio ejecutor dentro del clúster (ELIMINADO)
 
@@ -54,6 +58,14 @@ allowed_emails_csv = os.environ.get("ALLOWED_EMAILS_CSV")
 if not allowed_emails_csv:
     raise ValueError("La variable de entorno ALLOWED_EMAILS_CSV no está configurada.")
 ALLOWED_EMAILS = [email.strip() for email in allowed_emails_csv.split(',') if email.strip()]
+
+k8s_allowed_users_csv = os.environ.get("K8S_ALLOWED_USERS_CSV")
+if not k8s_allowed_users_csv:
+    print("Warning: Variable K8S_ALLOWED_USERS_CSV no encontrada. Usando ALLOWED_EMAILS como respaldo temporal.")
+    K8S_ALLOWED_USERS = ALLOWED_EMAILS
+else:
+    K8S_ALLOWED_USERS = [u.strip() for u in k8s_allowed_users_csv.split(',') if u.strip()]
+
 
 # --- FUNCIONES DE AUTENTICACIÓN JWT ---
 SECRET_KEY = os.environ.get("JWT_SECRET_KEY")
@@ -78,8 +90,9 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 
 # --- CONFIGURACIÓN E INICIALIZACIÓN DE IA ---
 OLLAMA_BASE_URL = "http://ollama-service:11434"
-MODEL_NAME = "glm4"
-llm = OllamaLLM(model=MODEL_NAME, base_url=OLLAMA_BASE_URL)
+LLM_MODEL = "qwen2.5:14b"       # Modelo principal: razonamiento, chat, agente K8s
+EMBED_MODEL = "nomic-embed-text" # Modelo dedicado para embeddings RAG (274 MB, 3x más rápido)
+llm = OllamaLLM(model=LLM_MODEL, base_url=OLLAMA_BASE_URL)
 # <-- CAMBIO IMPORTANTE: Usamos un directorio base, pero la inicialización de Chroma será por usuario.
 CHROMA_BASE_DIR = "/chroma_data"
 CHAT_HISTORIES_DIR = "/chat_histories" # <-- NUEVO: Directorio para los historiales
@@ -128,16 +141,35 @@ def sanitize_email(email: str) -> str:
     return email.replace("@", "_at_").replace(".", "_dot_")
 
 def get_user_vectorstore(user_email: str):
-    """Carga o crea la base de datos vectorial para un usuario específico."""
+    """Carga o crea la base de datos vectorial para un usuario específico.
+    Si la colección tiene dimensiones incompatibles (ej. migración de modelo),
+    la borra y la recrea limpia automáticamente.
+    """
+    import shutil
     user_dir = os.path.join(CHROMA_BASE_DIR, sanitize_email(user_email))
     os.makedirs(user_dir, exist_ok=True)
-    
-    embeddings = OllamaEmbeddings(model=MODEL_NAME, base_url=OLLAMA_BASE_URL)
-    vectorstore = Chroma(
-        embedding_function=embeddings,
-        persist_directory=user_dir
-    )
-    return vectorstore
+
+    embeddings = OllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_BASE_URL)
+    try:
+        vectorstore = Chroma(
+            embedding_function=embeddings,
+            persist_directory=user_dir
+        )
+        # Prueba rápida para detectar incompatibilidad de dimensiones
+        vectorstore._collection.count()
+        return vectorstore
+    except Exception as e:
+        error_str = str(e)
+        if "dimension" in error_str.lower() or "InvalidArgument" in type(e).__name__:
+            print(f"[ChromaDB] Dimensiones incompatibles para {user_email}. Recreando colección...")
+            shutil.rmtree(user_dir, ignore_errors=True)
+            os.makedirs(user_dir, exist_ok=True)
+            vectorstore = Chroma(
+                embedding_function=embeddings,
+                persist_directory=user_dir
+            )
+            return vectorstore
+        raise
 
 def get_history_path_for_id(identifier: str) -> str:
     """Obtiene la ruta al archivo de historial para un identificador único (email o teléfono)."""
@@ -308,8 +340,14 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
             raise HTTPException(status_code=500, detail="Ocurrió un error al organizar tu día.")
 
     # --- NUEVA LÓGICA PARA GESTIÓN DE CLUSTER Y NEW RELIC ---
-    k8s_keywords = ["kubernetes", "cluster", "clúster", "new relic", "newrelic", "pods", "pod", "deployments", "deployment", "logs", "métricas", "rendimiento", "cpu", "memoria", "eliminar", "borrar"]
+    k8s_keywords = ["kubernetes", "cluster", "clúster", "new relic", "newrelic", "pods", "pod", "deployments", "deployment", "logs", "métricas", "rendimiento", "cpu", "memoria", "eliminar", "borrar", "namespace", "namespaces", "espacio de nombres", "espacios de nombres"]
     if any(keyword in request.prompt.lower() for keyword in k8s_keywords):
+        
+        # VALIDACIÓN DE WHITELIST DE INFRAESTRUCTURA
+        if user not in K8S_ALLOWED_USERS:
+            print(f"Intento de acceso a k8s bloqueado para el usuario: {user}")
+            return ChatResponse(response="Lo siento, tu usuario no cuenta con los privilegios de administrador requeridos para interactuar con la infraestructura del clúster o consultar métricas avanzadas. Puedo ayudarte con dudas regulares sobre conocimiento general.")
+
         try:
             K8S_AGENT_URL = "http://k8s-agent-service:8002"
             async with httpx.AsyncClient() as client:
@@ -358,10 +396,17 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
             history = json.load(f)
 
     # 1. Recuperar documentos relevantes del USUARIO AUTENTICADO (el bot)
-    user_vectorstore = get_user_vectorstore(user)
-    retriever = user_vectorstore.as_retriever()
-    relevant_docs = retriever.invoke(request.prompt)
-    context = "\n".join([doc.page_content for doc in relevant_docs])
+    context = ""
+    try:
+        user_vectorstore = get_user_vectorstore(user)
+        retriever = user_vectorstore.as_retriever()
+        relevant_docs = retriever.invoke(request.prompt)
+        context = "\n".join([doc.page_content for doc in relevant_docs])
+    except Exception as e:
+        # Si ChromaDB falla por cualquier razón, continuamos sin contexto RAG
+        # Esto garantiza que el chat nunca devuelva un 500 por un error de embeddings
+        print(f"[RAG] Advertencia: No se pudo recuperar contexto de documentos: {e}")
+        context = ""
 
     # 2. Construir el historial de conversación (usando el historial cargado del archivo)
     conversation_history = ""
