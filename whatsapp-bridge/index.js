@@ -25,7 +25,7 @@ let qrCodeData = null;
 // --- CONFIGURACIÓN ROBUSTA PARA PUPPETEER EN KUBERNETES ---
 const client = new Client({
     authStrategy: new LocalAuth(),
-    puppeteer: { 
+    puppeteer: {
         headless: true,
         // --- RUTA CORRECTA PARA LA IMAGEN DEBIAN/SLIM ---
         executablePath: '/usr/bin/chromium',
@@ -36,6 +36,11 @@ const client = new Client({
             '--disable-dev-shm-usage',
             '--disable-gpu'
         ]
+    },
+    // --- FIJAR VERSIÓN DE WA WEB PARA EVITAR CRASH DEL CONTEXTO DE EJECUCIÓN ---
+    webVersionCache: {
+        type: "remote",
+        remotePath: "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html",
     }
 });
 
@@ -66,13 +71,13 @@ client.on('message', async message => {
     const phoneNumber = message.from.split('@')[0];
 
     console.log(`Mensaje recibido de ${message.from} (Número: ${phoneNumber}): ${message.body}`);
-    
+
     try {
         // Llama a tu API de amael-ia
         const response = await axios.post(AMAEL_API_URL, {
             prompt: message.body,
             // --- CAMBIO CLAVE: Enviar el phoneNumber como user_id ---
-            user_id: phoneNumber 
+            user_id: phoneNumber
         }, {
             headers: {
                 'Authorization': `Bearer ${AMAEL_JWT_TOKEN}`

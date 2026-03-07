@@ -1,0 +1,91 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-agent-sa
+  namespace: amael-ia
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-agent-role
+rules:
+- apiGroups: ["", "apps", "batch", "extensions"]
+  resources: ["pods", "services", "endpoints", "persistentvolumeclaims", "events", "configmaps", "secrets", "deployments", "replicasets", "statefulsets", "daemonsets", "jobs", "cronjobs", "nodes"]
+  verbs: ["get", "list", "watch", "delete"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["pods", "nodes"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-agent-rolebinding
+subjects:
+- kind: ServiceAccount
+  name: k8s-agent-sa
+  namespace: amael-ia
+roleRef:
+  kind: ClusterRole
+  name: k8s-agent-role
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-agent-deployment
+  namespace: amael-ia
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8s-agent
+  template:
+    metadata:
+      labels:
+        app: k8s-agent
+    spec:
+      serviceAccountName: k8s-agent-sa
+      containers:
+      - name: k8s-agent
+        image: registry.richardx.dev/k8s-agent:0.1.7
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8002
+        envFrom:
+        - configMapRef:
+            name: k8s-agent-configmap
+        env:
+        - name: NEW_RELIC_ACCOUNT_ID
+          valueFrom:
+            secretKeyRef:
+              name: k8s-agent-secret
+              key: new_relic_account_id
+        - name: NEW_RELIC_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: k8s-agent-secret
+              key: new_relic_api_key
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8s-agent-service
+  namespace: amael-ia
+spec:
+  selector:
+    app: k8s-agent
+  ports:
+    - protocol: TCP
+      port: 8002
+      targetPort: 8002
+  type: ClusterIP

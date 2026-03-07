@@ -4,24 +4,58 @@ from urllib.parse import urlparse, parse_qs
 import streamlit.components.v1 as components
 
 # --- CONFIGURACIÓN DE LA PÁGINA DE STREAMLIT ---
-# ESTA LÍNEA DEBE SER LA PRIMERA COMANDO DE STREAMLIT EN EL SCRIPT
 st.set_page_config(
-    page_title="Amael-IA",
-    page_icon="🤖", # Puedes usar un emoji o un archivo de imagen local
-    layout="wide"   # Opciones: "centered" o "wide"
+    page_title="Amael-IA | Tu Asistente Inteligente",
+    page_icon="✨",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
 # --- CONFIGURACIÓN ---
 BACKEND_URL = "https://amael-ia.richardx.dev/api"
 
+# Inject Global CSS for fonts and general resets
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+    
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+    }
+    
+    /* Ocultar elementos por defecto de Streamlit */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    /* header {visibility: hidden;} */
+    header { background-color: transparent !important; border-bottom: none !important; }
+    [data-testid="stHeader"] { background-color: transparent !important; }
+    
+    .stDeployButton {display:none;}
+    
+    /* Mejorar el scrollbar */
+    ::-webkit-scrollbar {
+        width: 8px;
+        height: 8px;
+    }
+    ::-webkit-scrollbar-track {
+        background: transparent;
+    }
+    ::-webkit-scrollbar-thumb {
+        background: var(--text-secondary, #cbd5e1);
+        border-radius: 4px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+        background: var(--text-primary, #94a3b8);
+    }
+</style>
+""", unsafe_allow_html=True)
+
 # --- ESTADO DE SESIÓN ---
-# Inicializa el estado de la sesión si no existe
 def initialize_session_state():
     if "jwt_token" not in st.session_state:
         st.session_state.jwt_token = None
     if "messages" not in st.session_state:
         st.session_state.messages = []
-    # --- AÑADE ESTAS NUEVAS VARIABLES DE SESIÓN Imagen de perfil---
     if "user_name" not in st.session_state:
         st.session_state.user_name = None
     if "user_picture" not in st.session_state:
@@ -29,25 +63,20 @@ def initialize_session_state():
 
 # --- LÓGICA DE AUTENTICACIÓN ---
 def check_authentication():
-    """Verifica si el token está en los parámetros de la URL o en el estado de la sesión."""
     jwt_token = st.query_params.get("token")
     error = st.query_params.get("error")
-
-    # --- CAMBIO IMPORTANTE AQUÍ ---
-    # Obtener información del perfil de los parámetros de la URL
     user_name = st.query_params.get("name")
     user_picture = st.query_params.get("picture")
 
     if jwt_token:
         st.session_state.jwt_token = jwt_token
-        # Guardar la información del perfil en el estado de la sesión
         if user_name:
             st.session_state.user_name = user_name
         if user_picture:
             st.session_state.user_picture = user_picture
             
         st.query_params.clear()
-        st.rerun() # Recarga la app para que los cambios de sesión surtan efecto
+        st.rerun()
 
     if error:
         st.error("No tienes permiso para acceder. Contacta al administrador.")
@@ -56,193 +85,533 @@ def check_authentication():
     return st.session_state.jwt_token is not None
 
 def mostrar_pantalla_login():
-    """Muestra la pantalla de login con un enlace de redirección simple."""
     st.markdown("""
     <style>
-        /* Estilos existentes sin cambios */
-        .main-header {visibility: hidden;}
-        .stDeployButton {display:none;}
-        .stAppViewContainer { margin-top: -2.5rem; }
+        :root {
+            --card-bg: rgba(255, 255, 255, 0.75);
+            --text-primary: #1e293b;
+            --text-secondary: #64748b;
+            --btn-bg: #ffffff;
+            --btn-border: #e2e8f0;
+            --btn-hover-bg: #f8fafc;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --card-bg: rgba(30, 41, 59, 0.75);
+                --text-primary: #f8fafc;
+                --text-secondary: #94a3b8;
+                --btn-bg: #0f172a;
+                --btn-border: #334155;
+                --btn-hover-bg: #1e293b;
+            }
+        }
+    
+        .stApp {
+            background: linear-gradient(-45deg, #FF9A9E, #FECFEF, #A1C4FD, #C2E9FB);
+            background-size: 400% 400%;
+            animation: gradientBG 15s ease infinite;
+        }
+        
+        @media (prefers-color-scheme: dark) {
+            .stApp {
+                background: linear-gradient(-45deg, #0f172a, #1e1b4b, #312e81, #1e293b);
+                background-size: 400% 400%;
+                animation: gradientBG 15s ease infinite;
+            }
+        }
+        
+        @keyframes gradientBG {
+            0% {background-position: 0% 50%;}
+            50% {background-position: 100% 50%;}
+            100% {background-position: 0% 50%;}
+        }
         .login-container {
             display: flex;
             justify-content: center;
             align-items: center;
-            height: 80vh;
+            height: 100vh;
+            margin-top: -80px; /* Offset the top padding */
         }
         .login-card {
-            padding: 40px;
-            border-radius: 15px;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+            background: var(--card-bg);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border-radius: 24px;
+            padding: 60px 40px;
+            box-shadow: 0 10px 40px -10px rgba(0, 0, 0, 0.15);
+            border: 1px solid rgba(255, 255, 255, 0.1);
             text-align: center;
-            background-color: #ffffff;
             width: 100%;
-            max-width: 400px;
-            border: 1px solid #e0e0e0;
+            max-width: 440px;
+            animation: fadeIn 0.8s cubic-bezier(0.2, 0.8, 0.2, 1);
         }
-        .login-card h1 { margin-bottom: 10px; color: #1a1a1a; font-size: 28px; }
-        .login-card p { color: #666; margin-bottom: 30px; font-size: 16px; }
-        /* Usamos <a> en lugar de <button>, pero mantenemos la misma clase para el estilo */
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(30px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .login-card h1 { 
+            margin-bottom: 8px; 
+            color: var(--text-primary); 
+            font-size: 36px; 
+            font-weight: 800;
+            letter-spacing: -0.02em;
+        }
+        .login-card p { 
+            color: var(--text-secondary); 
+            margin-bottom: 48px; 
+            font-size: 17px; 
+            font-weight: 400;
+        }
         .google-btn {
-            display: inline-flex;
+            display: flex;
             align-items: center;
             justify-content: center;
             width: 100%;
-            padding: 14px 20px;
-            background-color: #4285F4;
-            color: white;
-            border: none;
-            border-radius: 8px;
+            padding: 16px 24px;
+            background-color: var(--btn-bg);
+            color: var(--text-primary);
+            border: 1px solid var(--btn-border);
+            border-radius: 16px;
             font-size: 16px;
-            font-weight: 500;
+            font-weight: 600;
             cursor: pointer;
-            text-decoration: none; /* Quitamos el subrayado del enlace */
-            transition: background-color 0.3s, box-shadow 0.3s;
+            text-decoration: none;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -1px rgba(0,0,0,0.03);
         }
-        .google-btn:hover { background-color: #357AE8; box-shadow: 0 4px 12px rgba(66, 133, 244, 0.4); }
-        .google-btn svg { margin-right: 12px; }
+        .google-btn:hover { 
+            background-color: var(--btn-hover-bg); 
+            border-color: var(--btn-border);
+            box-shadow: 0 10px 15px -3px rgba(0,0,0,0.08), 0 4px 6px -2px rgba(0,0,0,0.04); 
+            transform: translateY(-2px);
+        }
+        .google-btn img { margin-right: 14px; width: 24px; height: 24px; }
+        .logo-icon {
+            font-size: 56px;
+            margin-bottom: 16px;
+            display: inline-block;
+            background: linear-gradient(135deg, #6366f1 0%, #a855f7 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            filter: drop-shadow(0 4px 6px rgba(99, 102, 241, 0.2));
+        }
     </style>
     """, unsafe_allow_html=True)
 
-    # --- HTML SIMPLE Y SIN JAVASCRIPT ---
     login_html = f"""
     <div class="login-container">
         <div class="login-card">
-            <h1>🤖 Bienvenido a Amael-IA</h1>
-            <p>Inicia sesión para comenzar a chatear.</p>
-            <!-- Cambiamos el <button> por un <a> simple -->
+            <div class="logo-icon">✨</div>
+            <h1>Amael-IA</h1>
+            <p>Tu asistente inteligente personal</p>
             <a href="{BACKEND_URL}/auth/login" class="google-btn">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="24px" height="24px">
-                    <path fill="#FFC107" d="M43.611,20.083H42V20H24v8h11.303c-1.649,4.657-6.083,8-11.303,8c-6.627,0-12-5.373-12-12c0-6.627,5.373-12,12-12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C12.955,4,4,12.955,4,24c0,11.045,8.955,20,20,20c11.045,0,20-8.955,20-20C44,22.659,43.862,21.35,43.611,20.083z"/>
-                    <path fill="#FF3D00" d="M6.306,14.691l6.571,4.819C14.655,15.108,18.961,12,24,12c3.059,0,5.842,1.154,7.961,3.039l5.657-5.657C34.046,6.053,29.268,4,24,4C16.318,4,9.656,8.337,6.306,14.691z"/>
-                    <path fill="#4CAF50" d="M24,44c5.166,0,9.86-1.977,13.409-5.192l-6.19-5.238C29.211,35.091,26.715,36,24,36c-5.202,0-9.619-3.317-11.283-7.946l-6.522,5.024C9.505,39.556,16.227,44,24,44z"/>
-                    <path fill="#1976D2" d="M43.611,20.083H42V20H24v8h11.303c-0.792,2.237-2.231,4.166-4.087,5.571c0.001-0.001,0.002-0.001,0.003-0.002l6.19,5.238C36.971,39.205,44,34,44,24C44,22.659,43.862,21.35,43.611,20.083z"/>
-                </svg>
-                Iniciar sesión con Google
+                <img src="https://www.svgrepo.com/show/475656/google-color.svg" alt="Google Logo">
+                Continuar con Google
             </a>
         </div>
     </div>
     """
     st.markdown(login_html, unsafe_allow_html=True)
 
-# --- APLICACIÓN PRINCIPAL ---
-def mostrar_app_principal():
-    """Muestra la interfaz principal de la aplicación después del login."""
-    # Oculta elementos de Streamlit para una vista más limpia
-    hide_st_style = """
-                <style>
-                #MainMenu {visibility: hidden;}
-                footer {visibility: hidden;}
-                header {visibility: hidden;}
-                .stDeployButton {display:none;}
-                </style>
-                """
-    st.markdown(hide_st_style, unsafe_allow_html=True)
+import re
 
-    # CSS para estilizar el chat y el perfil
+def render_chat_message(content):
+    # Limpiar si el LLM intentó usar markdown clásico de imagen
+    content = re.sub(r'!\[.*?\]\((https://quickchart\.io/chart.*?)\)', r'\1', content)
+    
+    current_text = content
+    while "https://quickchart.io/chart" in current_text:
+        start_idx = current_text.find("https://quickchart.io/chart")
+        
+        if start_idx > 0:
+            st.markdown(current_text[:start_idx])
+            
+        rest = current_text[start_idx:]
+        
+        # Parse for JSON object inside the quickchart URL (counts curly braces)
+        brace_count = 0
+        in_braces = False
+        end_idx = 0
+        
+        for i, char in enumerate(rest):
+            if char == '{':
+                in_braces = True
+                brace_count += 1
+            elif char == '}':
+                brace_count -= 1
+                if in_braces and brace_count == 0:
+                    end_idx = i + 1
+                    break
+                    
+        # Fallback to normal delimiter if no braces
+        if end_idx == 0 or not in_braces:
+            match = re.search(r'[\s"\'\n\)]', rest)
+            end_idx = match.start() if match else len(rest)
+            
+        url = rest[:end_idx]
+        
+        try:
+            # Streamlit is safer with encoded spaces in URLs
+            safe_url = url.replace(" ", "%20")
+            st.image(safe_url)
+        except Exception as e:
+            st.markdown(f"**Gráfico:** [Ver aquí]({safe_url})")
+             
+        current_text = rest[end_idx:]
+        
+        # Extra parenthesis cleanup from markdown syntax
+        if current_text.startswith(')'):
+            current_text = current_text[1:]
+            
+    if current_text.strip():
+        st.markdown(current_text)
+
+def mostrar_app_principal():
     st.markdown("""
     <style>
-        .stChatMessage {
-            border-radius: 10px;
-            padding: 12px;
-            margin-bottom: 10px;
+        :root {
+            --app-bg: #f8fafc;
+            --glass-bg: rgba(255, 255, 255, 0.9);
+            --text-primary: #334155;
+            --text-heading: #0f172a;
+            --text-secondary: #64748b;
+            --border-color: #e2e8f0;
+            --assistant-bg: #ffffff;
+            --sidebar-bg: #f8fafc;
+            --uploader-bg: #ffffff;
+            --empty-icon-bg: #e0e7ff;
+            --btn-bg: #ffffff;
         }
-        .stChatMessage[data-testid="chat-message-container-user"] {
-            background-color: #E3F2FD; /* Azul claro para el usuario */
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --app-bg: #0f172a;
+                --glass-bg: rgba(30, 41, 59, 0.9);
+                --text-primary: #e2e8f0;
+                --text-heading: #f8fafc;
+                --text-secondary: #94a3b8;
+                --border-color: #334155;
+                --assistant-bg: #1e293b;
+                --sidebar-bg: #0f172a;
+                --uploader-bg: #1e293b;
+                --empty-icon-bg: #312e81;
+                --btn-bg: #1e293b;
+            }
         }
-        .stChatMessage[data-testid="chat-message-container-assistant"] {
-            background-color: #F1F3F4; /* Gris claro para el asistente */
+        
+        /* Ajuste general del layout principal */
+        .block-container {
+            padding-top: 2.5rem !important;
+            padding-bottom: 6rem !important;
+            max-width: 960px !important;
         }
-        /* --- AÑADE ESTOS NUEVOS ESTILOS --- */
-        .profile-header-container {
-            display: flex;
-            justify-content: flex-end;
-            padding: 0 10px 10px 0;
+        
+        .stApp {
+            background-color: var(--app-bg);
         }
-        .profile-header {
+        
+        /* Contenedor del perfil en la esquina superior */
+        .profile-container {
             display: flex;
             align-items: center;
-            background-color: #ffffff;
-            padding: 5px 15px;
-            border-radius: 20px;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            justify-content: flex-end;
+            padding: 8px 16px;
+            background: var(--glass-bg);
+            backdrop-filter: blur(12px);
+            border-radius: 100px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
+            position: fixed;
+            top: 16px;
+            right: 24px;
+            z-index: 999;
+            border: 1px solid var(--border-color);
+            transition: all 0.3s ease;
         }
-        .profile-header img {
-            width: 35px;
-            height: 35px;
+        .profile-container:hover {
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            transform: translateY(-1px);
+        }
+        .profile-name {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-right: 12px;
+        }
+        .profile-pic {
+            width: 36px;
+            height: 36px;
             border-radius: 50%;
-            margin-left: 10px;
-            border: 2px solid #e0e0e0;
+            object-fit: cover;
+            border: 2px solid var(--border-color);
         }
-        .profile-header span {
-            font-size: 16px;
-            font-weight: 500;
-            color: #333;
+        
+        /* Estilos de los mensajes de chat */
+        .stChatMessage {
+            background-color: transparent !important;
+            border: none !important;
+            padding: 0 !important;
+            margin-bottom: 1.5rem;
+        }
+        
+        /* Contenedor de cada mensaje */
+        [data-testid="chat-message-container-user"] {
+            flex-direction: row-reverse;
+        }
+        [data-testid="chat-message-container-user"] .stMarkdown {
+            background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+            color: white;
+            padding: 14px 20px;
+            border-radius: 24px 24px 4px 24px;
+            box-shadow: 0 4px 12px -2px rgba(99, 102, 241, 0.3);
+            max-width: 85%;
+            font-size: 15.5px;
+            line-height: 1.6;
+            margin-left: auto;
+        }
+        /* Ajustar color del texto dentro del burbuja user */
+        [data-testid="chat-message-container-user"] .stMarkdown p {
+            color: white !important;
+            margin: 0;
+        }
+        /* Ocultar avatar de usuario para un look más moderno tipo iMessage (opcional, aquí solo lo hacemos más sutil) */
+        [data-testid="chat-message-container-user"] .stAvatar {
+            margin-left: 12px;
+            margin-right: 0;
+        }
+        
+        [data-testid="chat-message-container-assistant"] {
+        }
+        [data-testid="chat-message-container-assistant"] .stMarkdown {
+            background-color: var(--assistant-bg);
+            color: var(--text-primary);
+            padding: 14px 20px;
+            border-radius: 24px 24px 24px 4px;
+            box-shadow: 0 4px 12px -2px rgba(0, 0, 0, 0.05);
+            border: 1px solid var(--border-color);
+            max-width: 90%;
+            font-size: 15.5px;
+            line-height: 1.6;
+        }
+        [data-testid="chat-message-container-assistant"] .stMarkdown p,
+        [data-testid="chat-message-container-assistant"] .stMarkdown li,
+        [data-testid="chat-message-container-assistant"] .stMarkdown span {
+            color: var(--text-primary) !important;
+        }
+        [data-testid="chat-message-container-assistant"] .stMarkdown p {
+            margin-bottom: 0.5rem;
+        }
+        [data-testid="chat-message-container-assistant"] .stMarkdown p:last-child {
+            margin-bottom: 0;
+        }
+        
+        /* Avatares */
+        .stAvatar {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background-color: var(--assistant-bg);
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+            border-radius: 50%;
+        }
+        
+        /* Input del chat flotante */
+        [data-testid="stChatInput"] {
+            background: var(--glass-bg);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--border-color);
+            border-radius: 30px;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+            padding: 6px 16px;
+            margin-bottom: 20px; /* Separación del borde inferior */
+            transition: all 0.3s ease;
+        }
+        [data-testid="stChatInput"] textarea {
+            color: var(--text-primary) !important;
+        }
+        [data-testid="stChatInput"]:focus-within {
+            border-color: #6366f1;
+            box-shadow: 0 10px 25px -5px rgba(99, 102, 241, 0.2), 0 0 0 3px rgba(99, 102, 241, 0.1);
+            transform: translateY(-2px);
+        }
+        
+        /* Botones del Sidebar estilizados */
+        .stButton button {
+            width: 100%;
+            border-radius: 16px;
+            font-weight: 600;
+            padding: 12px 20px;
+            transition: all 0.3s ease;
+            background-color: var(--btn-bg);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -1px rgba(0,0,0,0.03);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .stButton button p {
+            font-size: 15px !important;
+        }
+        .stButton button:hover {
+            border-color: #6366f1;
+            color: #6366f1;
+            background-color: var(--app-bg);
+            box-shadow: 0 10px 15px -3px rgba(0,0,0,0.08), 0 4px 6px -2px rgba(0,0,0,0.04);
+            transform: translateY(-2px);
+        }
+        
+        /* Headers y texto en sidebar */
+        [data-testid="stSidebar"] {
+            background-color: var(--sidebar-bg);
+            border-right: 1px solid var(--border-color);
+        }
+        [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2 {
+            color: var(--text-heading);
+        }
+        
+        /* Uploader area */
+        [data-testid="stFileUploader"] {
+            background-color: var(--uploader-bg);
+            border-radius: 16px;
+            padding: 1.5rem 1rem;
+            border: 2px dashed var(--border-color);
+            transition: all 0.3s ease;
+            text-align: center;
+            box-shadow: inset 0 2px 4px 0 rgba(0, 0, 0, 0.02);
+        }
+        [data-testid="stFileUploader"]:hover {
+            border-color: #6366f1;
+            background-color: var(--app-bg);
+            box-shadow: inset 0 2px 4px 0 rgba(99, 102, 241, 0.05);
+        }
+        [data-testid="stFileUploader"] div, [data-testid="stFileUploader"] small {
+            color: var(--text-primary) !important;
+        }
+        [data-testid="stFileUploader"] section > button {
+            border-radius: 12px !important;
+            background-color: var(--btn-bg) !important;
+            border: 1px solid var(--border-color) !important;
+            color: var(--text-primary) !important;
+            font-weight: 500 !important;
+            padding: 8px 16px !important;
+            margin-top: 12px;
+            box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05) !important;
+        }
+        [data-testid="stFileUploader"] section > button:hover {
+            border-color: #6366f1 !important;
+            color: #6366f1 !important;
+            transform: translateY(-1px) !important;
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05) !important;
+        }
+        
+        /* Notificaciones toast top right adjustment */
+        .stToastContainer {
+            top: 70px !important;
         }
     </style>
     """, unsafe_allow_html=True)
 
-    # --- NUEVA SECCIÓN PARA MOSTRAR EL PERFIL ---
     if st.session_state.user_picture and st.session_state.user_name:
+        # Extraer solo el primer nombre para una apariencia más amigable
+        first_name = st.session_state.user_name.split()[0]
         st.markdown(f"""
-        <div class="profile-header-container">
-            <div class="profile-header">
-                <span>{st.session_state.user_name}</span>
-                <img src="{st.session_state.user_picture}" alt="Foto de perfil">
-            </div>
+        <div class="profile-container">
+            <span class="profile-name">Hola, {first_name}</span>
+            <img src="{st.session_state.user_picture}" alt="Profile" class="profile-pic">
         </div>
         """, unsafe_allow_html=True)
+    else:
+        first_name = "ahí"
 
-    st.title("💬 Amael-IA")
+    # Empty state wrapper
+    if not st.session_state.messages:
+        st.markdown(f"""
+        <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:65vh; text-align:center; animation: fadeIn 0.8s ease;">
+            <div style="width: 88px; height: 88px; background: linear-gradient(135deg, var(--empty-icon-bg) 0%, #c7d2fe 100%); border-radius: 50%; display:flex; align-items:center; justify-content:center; margin-bottom: 24px; box-shadow: 0 10px 25px -5px rgba(99,102,241,0.3);">
+                <span style="font-size: 44px;">✨</span>
+            </div>
+            <h1 style="color:var(--text-heading); margin-bottom: 12px; font-weight: 800; font-size: 32px; letter-spacing: -0.02em;">¡Hola, {first_name}!</h1>
+            <p style="color:var(--text-secondary); font-size: 18px; max-width: 500px; line-height: 1.6; padding: 0 20px;">
+                ¿En qué puedo ayudarte hoy?<br>Pregúntame cualquier cosa o sube datos para que aprenda.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
     
-    # --- Barra Lateral ---
     with st.sidebar:
-        st.title("⚙️ Configuración")
-
-        if st.button("🔄 Nueva Conversación"):
-            st.session_state.messages = []
-            st.success("¡Conversación reiniciada!")
-            st.rerun()
-
-        st.markdown("---") # Separador
-
-        if st.button("🚪 Cerrar Sesión"):
-            st.session_state.jwt_token = None
-            st.info("Has cerrado sesión.")
-            st.rerun()
+        st.markdown("""
+        <style>
+            .sidebar-title { margin:0; font-weight: 700; color: var(--text-heading); font-size: 20px; }
+            .sidebar-subtitle { color: var(--text-secondary); font-size: 13px; margin-top: 4px; }
+            .sidebar-hr { margin: 1.5rem 0; border: none; border-top: 1px solid var(--border-color); }
+            .sidebar-header-sm { color: var(--text-secondary); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 1rem; }
+        </style>
+        <div style="text-align: center; margin-bottom: 1.5rem;">
+            <div style="font-size: 36px; margin-bottom: 8px;">✨</div>
+            <h2 class="sidebar-title">Amael-IA</h2>
+            <p class="sidebar-subtitle">Tu asistente inteligente</p>
+        </div>
+        """, unsafe_allow_html=True)
         
-        st.markdown("---") # Separador
+        if st.button("➕ Nueva Conversación", use_container_width=True):
+            st.session_state.messages = []
+            st.rerun()
 
-        st.header("📚 Aprender de tus Datos")
-        uploaded_file = st.file_uploader("Sube un archivo (PDF o TXT)", type=["pdf", "txt"])
+        st.markdown("<hr class='sidebar-hr'>", unsafe_allow_html=True)
+
+        st.markdown("<h4 class='sidebar-header-sm'>🧠 Base de Conocimiento y Análisis Visual</h4>", unsafe_allow_html=True)
+        uploaded_file = st.file_uploader("Sube PDF, TXT o Imágenes", type=["pdf", "txt", "png", "jpg", "jpeg"], help="Los documentos de texto se procesarán para el asistente. Las imágenes serán analizadas por TensorFlow.")
         
         if uploaded_file is not None:
-            with st.spinner("Procesando archivo..."):
+            # Notificación visual más atractiva usando toast si es posible, o mantenemos success
+            is_image = uploaded_file.name.lower().endswith(('.png', '.jpg', '.jpeg'))
+            
+            with st.spinner("Procesando archivo analíticamente..." if not is_image else "Analizando imagen con TensorFlow..."):
                 files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
                 headers = {"Authorization": f"Bearer {st.session_state.jwt_token}"}
                 try:
-                    response = requests.post(f"{BACKEND_URL}/ingest", files=files, headers=headers)
+                    # Determinar el endpoint basado en el tipo de archivo
+                    endpoint = f"{BACKEND_URL}/analyze-image" if is_image else f"{BACKEND_URL}/ingest"
+                    
+                    response = requests.post(endpoint, files=files, headers=headers)
                     if response.status_code == 200:
-                        st.sidebar.success(response.json().get("message"))
+                        if is_image:
+                            analysis_result = response.json()
+                            
+                            # Extraer datos procesados por el backend
+                            detalles = analysis_result.get("analisis_detallado", analysis_result.get("analysis_result", []))
+                            resumen_ia = analysis_result.get("resumen_ia", "Completado sin resumen.")
+                            
+                            st.success("¡Imagen analizada exitosamente!")
+                            st.json(detalles) # Mostrar el top 5 de probabilidades
+                            
+                            # Pasar el reporte semántico al historial del chat para análisis de la LLM
+                            report_text = f"He subido una imagen para su análisis. El modelo de visión detectó lo siguiente: {resumen_ia}. Por favor interpreta estos resultados y dime de qué podría tratarse la imagen o qué elementos destacan."
+                            st.session_state.messages.append({"role": "user", "content": report_text})
+                            st.session_state.messages.append({"role": "assistant", "content": f"He recibido el análisis de la imagen que muestra: {resumen_ia}. ¿Qué te gustaría saber en detalle sobre estos elementos?"})
+                        else:
+                            st.success(response.json().get("message", "Documento procesado con éxito."))
                     else:
-                        st.sidebar.error(f"Error: {response.json().get('detail')}")
+                        st.error(f"Error: {response.json().get('detail')}")
                 except requests.exceptions.RequestException as e:
-                    st.sidebar.error(f"Error de conexión: {e}")
+                    st.error(f"Error de conexión: {e}")
 
-    # --- Interfaz de Chat ---
-    # Mostrar mensajes anteriores
+        st.markdown("<hr class='sidebar-hr'>", unsafe_allow_html=True)
+        
+        if st.button("🚪 Cerrar Sesión", use_container_width=True):
+            st.session_state.jwt_token = None
+            st.rerun()
+
     for message in st.session_state.messages:
-        with st.chat_message(message["role"], avatar="🧑‍💻" if message["role"] == "user" else "🤖"):
-            st.markdown(message["content"])
+        # Avatar emoji or keep clean
+        avatar = "👤" if message["role"] == "user" else "✨"
+        with st.chat_message(message["role"], avatar=avatar):
+            render_chat_message(message["content"])
 
-    # Input del usuario
-    if prompt := st.chat_input("¿En qué puedo ayudarte?"):
-        # Añadir mensaje del usuario al estado y mostrarlo
+    if prompt := st.chat_input("Escribe tu pregunta o mensaje aquí..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user", avatar="🧑‍💻"):
-            st.markdown(prompt)
+        with st.chat_message("user", avatar="👤"):
+            render_chat_message(prompt)
 
-        # Obtener respuesta del asistente
-        with st.chat_message("assistant", avatar="🤖"):
+        with st.chat_message("assistant", avatar="✨"):
             message_placeholder = st.empty()
             headers = {"Authorization": f"Bearer {st.session_state.jwt_token}"}
             try:
@@ -250,11 +619,13 @@ def mostrar_app_principal():
                     "prompt": prompt, 
                     "history": st.session_state.messages
                 }
-                response = requests.post(f"{BACKEND_URL}/chat", json=payload, headers=headers)
+                with st.spinner("Pensando respuesta..."):
+                    response = requests.post(f"{BACKEND_URL}/chat", json=payload, headers=headers)
                 
                 if response.status_code == 200:
                     full_response = response.json().get("response", "No pude generar una respuesta.")
-                    message_placeholder.markdown(full_response)
+                    message_placeholder.empty()
+                    render_chat_message(full_response)
                     st.session_state.messages.append({"role": "assistant", "content": full_response})
                 else:
                     error_detail = response.json().get("detail", "Error desconocido.")
@@ -262,9 +633,7 @@ def mostrar_app_principal():
             except requests.exceptions.RequestException as e:
                 message_placeholder.error(f"No se pudo contactar al backend: {e}")
 
-# --- FUNCIÓN PRINCIPAL ---
 def main():
-    """Función principal que orquesta la aplicación."""
     initialize_session_state()
     
     if check_authentication():
@@ -272,6 +641,5 @@ def main():
     else:
         mostrar_pantalla_login()
 
-# Ejecutar la aplicación
 if __name__ == "__main__":
     main()

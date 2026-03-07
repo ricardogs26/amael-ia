@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-adapter
+  namespace: amael-ia # O el namespace que uses
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-adapter
+  template:
+    metadata:
+      labels:
+        app: llm-adapter
+    spec:
+      containers:
+      - name: adapter
+        image: registry.richardx.dev/llm-adapter:0.0.1
+        ports:
+        - containerPort: 8000
+        env:
+        - name: OLLAMA_BASE_URL
+          # IMPORTANTE: Esta es la URL interna del cluster de tu Ollama
+          value: "http://ollama-service.amael-ia.svc.cluster.local:11434" 
+        - name: DEFAULT_MODEL
+          value: "glm4" # Nombre exacto del modelo en Ollama
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-adapter-service
+  namespace: amael-ia
+spec:
+  selector:
+    app: llm-adapter
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8000

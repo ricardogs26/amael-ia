@@ -35,20 +35,7 @@ import io
 PRODUCTIVITY_SERVICE_URL = "http://productivity-service:8001" # URL del nuevo servicio en la red de Docker/K8s
 INTERNAL_API_SECRET = "g686GnXRZFfJ48Au1a1pGkVTxCQoEE" # Debe ser el mismo que en el .env del microservicio
 
-# URL del nuevo servicio ejecutor dentro del clúster
-COMMAND_EXECUTOR_URL = "http://command-executor-service:8001/execute"
-
-async def run_kubectl_command(command_key: str, namespace: str = "amael-ia"):
-    """Llama al servicio ejecutor de comandos de forma segura."""
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(COMMAND_EXECUTOR_URL, json={"command_key": command_key, "namespace": namespace})
-            response.raise_for_status()
-            return response.json()
-    except httpx.HTTPStatusError as e:
-        return {"error": f"Error calling executor service: {e.response.status_code}", "detail": e.response.json()}
-    except Exception as e:
-        return {"error": f"An unexpected error occurred: {e}"}
+# URL del nuevo servicio ejecutor dentro del clúster (ELIMINADO)
 
 # --- CONFIGURACIÓN DE OAUTH Y JWT ---
 config = Config(environ=os.environ)
@@ -105,24 +92,8 @@ Eres un asistente de IA avanzado con nombre de Amael creado por Ricardo Guzman, 
 ### REGLAS DE INTERACCIÓN
     Usa el Historial y el Contexto: Analiza primero el HISTORIAL DE LA CONVERSACIÓN y luego el CONTEXTO DE DOCUMENTOS. 
     Sé Natural: Para preguntas simples, responde de forma natural. 
-    Usa Herramientas cuando sea Necesario: Si el usuario te pide información sobre el estado del clúster (ej. "muéstrame los pods"), usa la herramienta run_kubectl_command. No inventes la respuesta. 
-    Procesa la Salida de la Herramienta: Después de llamar a la herramienta, recibirás una respuesta. Usa esa respuesta para formatear una respuesta clara y útil para el usuario. Muestra la salida del comando en un bloque de código. 
     Sé Transparente: Si el CONTEXTO no contiene la información, pero tu conocimiento general te permite responder, indícalo explícitamente. 
     No Inventes Datos Específicos: Nunca inventes métricas, nombres de archivos o detalles que no estén en el CONTEXTO o el HISTORIAL. 
-### HERRAMIENTAS DISPONIBLES
-Tienes acceso a una herramienta para ejecutar comandos de Kubernetes en el namespace 'amael-ia'.
-Para usarla, responde con un bloque de código JSON en el siguiente formato:
-```json
-{{
-  "tool_call": {{
-    "name": "run_kubectl_command",
-    "arguments": {{
-      "command_key": "get pods"
-    }}
-  }}
-}}
-```
-    - Los `command_key` permitidos son: "get pods", "get services", "get deployments".
 
 ### INSTRUCCIONES
 1.  **Analiza la Petición del Usuario:** Entiende la pregunta o solicitud del usuario.
@@ -130,7 +101,6 @@ Para usarla, responde con un bloque de código JSON en el siguiente formato:
     - Primero, revisa el `HISTORIAL DE LA CONVERSACIÓN` para entender el contexto.
     - Luego, utiliza el `CONTEXTO DE DOCUMENTOS` para fundamentar tu respuesta con datos específicos.
 3.  **Decide Cómo Responder:**
-    - **¿El usuario pide información del clúster?** (ej: "muéstrame los pods"). Usa la herramienta `run_kubectl_command`. No inventes la respuesta.
     - **¿Es una pregunta general o conversacional?** (ej: "hola", "¿cómo estás?"). Responde de forma natural y directa.
     - **¿Es una pregunta compleja?** Estructura tu respuesta con Markdown (títulos, listas, negrita) para que sea clara y fácil de leer.
 4.  **Sé Preciso y Transparente:** Basa tus respuestas en la información proporcionada. Si el contexto es insuficiente, admítelo. Si usas tu conocimiento general, indícalo.
@@ -337,6 +307,45 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
             print(f"Productivity service returned an error: {e.response.text}")
             raise HTTPException(status_code=500, detail="Ocurrió un error al organizar tu día.")
 
+    # --- NUEVA LÓGICA PARA GESTIÓN DE CLUSTER Y NEW RELIC ---
+    k8s_keywords = ["kubernetes", "cluster", "clúster", "new relic", "newrelic", "pods", "pod", "deployments", "deployment", "logs", "métricas", "rendimiento", "cpu", "memoria", "eliminar", "borrar"]
+    if any(keyword in request.prompt.lower() for keyword in k8s_keywords):
+        try:
+            K8S_AGENT_URL = "http://k8s-agent-service:8002"
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{K8S_AGENT_URL}/api/k8s-agent",
+                    json={"query": request.prompt, "user_email": user},
+                    timeout=120.0 # LangChain agentes pueden tardar pensando
+                )
+                response.raise_for_status()
+                result_data = response.json()
+                
+                # Devolvemos la respuesta del Agente en lugar del LLM estándar
+                # Guardamos en el historial pero como respuesta del sistema experto
+                history_id = request.user_id if request.user_id else user
+                history_path = get_history_path_for_id(history_id)
+                history = []
+                if os.path.exists(history_path):
+                    with open(history_path, "r") as f:
+                        history = json.load(f)
+                        
+                updated_history = history + [
+                    {"role": "user", "content": request.prompt},
+                    {"role": "assistant", "content": result_data["response"]} 
+                ]
+                with open(history_path, "w") as f:
+                    json.dump(updated_history, f)
+                    
+                return ChatResponse(response=result_data["response"])
+
+        except httpx.RequestError as e:
+            print(f"Error contacting k8s-agent service: {e}")
+            raise HTTPException(status_code=503, detail="El servicio de agente experto de Kubernetes no está disponible.")
+        except httpx.HTTPStatusError as e:
+            print(f"K8s-agent returned an error: {e.response.text}")
+            raise HTTPException(status_code=500, detail="Ocurrió un error al consultar el estado de tu cluster.")
+
 
     # Determinar qué ID usar para el historial (email del usuario o user_id de WhatsApp)
     history_id = request.user_id if request.user_id else user
@@ -360,7 +369,7 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
         history_lines = [f"Human: {msg['content']}" if msg['role'] == 'user' else f"Assistant: {msg['content']}" for msg in history]
         conversation_history = "\n".join(history_lines)
 
-    # 3. Crear el prompt final
+    # 3. Crear el prompt final (Sin herramientas para el backend)
     final_prompt = system_prompt_template.format(
         conversation_history=conversation_history,
         request_prompt=request.prompt
@@ -368,34 +377,15 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
     final_prompt = final_prompt.replace("<<<CONTEXT>>>", context)
 
     try:
-        # 4. Invocar al LLM
+        # 4. Invocar al LLM (El backend solo responde texto, las herramientas k8s las maneja el k8s-agent)
         response = llm.invoke(final_prompt)
 
-        # --- LÓGICA PARA MANEJAR LLAMADAS A HERRAMIENTAS ---
+        # Extraemos solo el texto evitando llamadas JSON residuales si el modelo alucina
         if "```json" in response and "tool_call" in response:
-            try:
-                # Extraer el JSON de la respuesta
-                start_index = response.find("```json") + 7
-                end_index = response.find("```", start_index)
-                json_str = response[start_index:end_index].strip()
-                tool_call_data = json.loads(json_str)
-
-                if tool_call_data.get("tool_call", {}).get("name") == "run_kubectl_command":
-                    command_key = tool_call_data["tool_call"]["arguments"]["command_key"]
-                    print(f"Agent is requesting to execute command: {command_key}")
-                    
-                    # Llamar a la función que ejecuta el comando
-                    command_result = await run_kubectl_command(command_key)
-                    
-                    # Formatear la respuesta final con el resultado del comando
-                    final_response = f"Aquí está la salida del comando `{command_key}`:\n\n```\n{command_result.get('output', command_result.get('error'))}\n```"
-                else:
-                    final_response = "Lo siento, no reconozco esa herramienta."
-            except (json.JSONDecodeError, KeyError) as e:
-                final_response = f"Error al procesar la solicitud de la herramienta: {e}"
+             # Si por algún motivo el modelo intenta usar herramientas, ignoramos la herramienta y le pedimos que responda normal
+             final_response = "Entiendo tu solicitud, pero para acciones de infraestructura por favor sé más específico con las palabras clave como 'kubernetes', 'pods', etc."
         else:
-            # Si no hay llamada a herramienta, la respuesta es la del LLM directamente
-            final_response = response
+             final_response = response
 
         # --- GUARDAR EL HISTORIAL ACTUALIZADO (AHORA DENTRO DEL TRY) ---
         updated_history = history + [
@@ -432,7 +422,38 @@ async def analyze_image(file: UploadFile = File(...), user: str = Depends(get_cu
 
         if response.status_code == 200:
             predictions = response.json()['predictions'][0]
-            return {"analysis_result": predictions}
+            
+            # --- NUEVA LÓGICA DE DECODIFICACIÓN ---
+            # Obtenemos las etiquetas de ImageNet si no están cacheadas
+            if not hasattr(app.state, "imagenet_labels"):
+                url = "https://storage.googleapis.com/download.tensorflow.org/data/imagenet_class_index.json"
+                try:
+                    labels_response = requests.get(url, timeout=5)
+                    app.state.imagenet_labels = labels_response.json()
+                except Exception as e:
+                    print(f"Error descargando etiquetas ImageNet: {e}")
+                    return {"analysis_result": predictions[:5]} # Fallback
+            
+            labels_dict = app.state.imagenet_labels
+            
+            # Obtener los top 5 índices con mayor probabilidad
+            top_indices = np.argsort(predictions)[-5:][::-1]
+            
+            results = []
+            for idx in top_indices:
+                class_id, label = labels_dict[str(idx)]
+                prob = float(predictions[idx])
+                results.append({
+                    "etiqueta": label.replace("_", " "),
+                    "probabilidad": f"{round(prob * 100, 2)}%"
+                })
+                
+            resumen_ia = ", ".join([f"{item['etiqueta']} ({item['probabilidad']})" for item in results])
+            
+            return {
+                "analisis_detallado": results,
+                "resumen_ia": resumen_ia
+            }
         else:
             raise HTTPException(status_code=500, detail="Error en TensorFlow Serving")
     except Exception as e:

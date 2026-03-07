@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: allowed-users-configmap
+  namespace: amael-ia
+data:
+  ALLOWED_EMAILS_CSV: "ricardogs26@gmail.com,rguzmans@bancobase.com,admin@gmail.com,test@example.com"
