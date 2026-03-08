@@ -16,7 +16,7 @@ spec:
       imagePullSecrets: []
       containers:
       - name: backend-container
-        image: registry.richardx.dev/backend-ia:0.3.5
+        image: registry.richardx.dev/backend-ia:1.0.0
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8000

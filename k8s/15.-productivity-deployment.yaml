@@ -18,7 +18,8 @@ spec:
       containers:
       - name: productivity-service
         # Reemplaza con la ruta a tu imagen en tu registro de contenedores
-        image: localhost:32000/productivity-service:0.0.5
+        image: registry.richardx.dev/productivity-service:1.0.0
+        imagePullPolicy: Always
         ports:
         - containerPort: 8001
         envFrom:

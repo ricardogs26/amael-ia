@@ -212,7 +212,7 @@ def mostrar_pantalla_login():
             <div class="logo-icon">✨</div>
             <h1>Amael-IA</h1>
             <p>Tu asistente inteligente personal</p>
-            <a href="{BACKEND_URL}/auth/login" class="google-btn" target="_self">
+            <a href="{BACKEND_URL}/auth/login" class="google-btn" target="_parent">
                 <img src="https://www.svgrepo.com/show/475656/google-color.svg" alt="Google Logo">
                 Continuar con Google
             </a>

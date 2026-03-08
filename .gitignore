@@ -22,3 +22,4 @@ token.json
 # VSCode and IDEs
 .vscode/
 .idea/
+new_token_output.txt

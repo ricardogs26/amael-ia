@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: whatsapp-bridge
-        image: registry.richardx.dev/whatsapp-bridge:0.1.13
+        image: registry.richardx.dev/whatsapp-bridge:1.0.0
         imagePullPolicy: Always
         ports:
         - containerPort: 3000

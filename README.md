@@ -13,10 +13,10 @@ Desplegada completamente sobre Kubernetes, Amael IA no solo responde a preguntas
 
 ## ✨ Características Principales
 
-*   💬 **Interfaz Conversacional:** Acceso mediante un frontend web moderno en **Streamlit** y conectividad nativa vía **WhatsApp** (`whatsapp-bridge`).
-*   🔒 **Autenticación y Seguridad:** Soporte para **Google OAuth**, encriptado con JWT y persistencia segura de sesiones por perfil.
+*   💬 **Interfaz Conversacional:** Acceso mediante un frontend web moderno en **Streamlit** y conectividad nativa vía **WhatsApp** (`whatsapp-bridge`), manteniendo los historiales y límites de consumo **aislados estrictamente por número de teléfono (`user_id`)**.
+*   🔒 **Autenticación y Seguridad Estricta:** Soporte para **Google OAuth**, encriptado con JWT. Además, cuenta con un sistema de **Listas Blancas (Whitelists)**, separando a los usuarios regulares de los administradores de infraestructura.
 *   🧠 **RAG Multiusuario:** Ingesta de PDFs y TXTs con vectorización en **ChromaDB**. Cada usuario tiene su propio espacio de memoria y contexto aislado en un volumen persistente.
-*   🛠️ **DevOps Autónomo (K8s Agent):** Amael administra tu clúster en tiempo real. Puede listar pods, revisar logs, consultar el consumo de recursos (`New Relic`) e incluso **eliminar pods anómalos** directamente desde el chat usando `Langchain agents`.
+*   🛠️ **DevOps Autónomo (K8s Native Agent):** Amael administra tu clúster en tiempo real mediante el **SDK nativo de Kubernetes para Python**. Puede listar pods, revisar logs, consultar métricas (`New Relic`) e incluso **eliminar pods anómalos** directamente desde el chat usando agentes estructurados.
 *   📅 **Productividad Integrada:** Analiza correos y requerimientos para programar tareas directamente en tu calendario mediante su módulo especializado `productivity-service`.
 *   👁️ **Visión Artificial:** Interacción con modelos de Deep Learning alojados en **TensorFlow Serving** para análisis y clasificación de imágenes subidas en el chat.
 
@@ -28,10 +28,10 @@ Amael IA sigue un enfoque de diseño modular nativo de la nube. Cada función es
 
 ### Componentes Clave:
 1.  **`frontend-ia`**: Interfaz de usuario rica desarrollada en Python/Streamlit. Maneja el estado de la sesión, la subida de archivos multimedias y documentos RAG.
-2.  **`backend-ia`**: El "Cerebro Central" (FastAPI). Gestiona la autenticación, el historial conversacional (JSON), el proxy hacia modelos LLM (`ollama`) y rutea de forma inteligente (basado en intenciones semánticas) las peticiones operativas hacia otros micro-agentes especializados.
-3.  **`k8s-agent`**: Agente experto (`ZERO_SHOT_REACT`) con comandos e integraciones embebidas de la API de Kubernetes. Protegido rigurosamente mediante roles (RBAC). Interpreta lenguaje natural para realizar operaciones seguras (`kubectl delete`, `get`, `logs`) e interactúa vía GraphQL con New Relic para dar resúmenes sobre CPU y RAM.
+2.  **`backend-ia`**: El "Cerebro Central" (FastAPI). Gestiona la autenticación, el historial conversacional (JSON), el proxy hacia modelos LLM (`ollama`) y rutea de forma inteligente las peticiones. **Aquí se valida la Whitelist**: si el usuario consulta sobre infraestructura, verifica que su correo (o celular) exista en el `K8S_ALLOWED_USERS_CSV` antes de consultar al agente.
+3.  **`k8s-agent`**: Agente experto (`ZERO_SHOT_REACT`) con herramientas (Tools) construidas sobre el **cliente oficial de Kubernetes en Python**. Protegido por Roles (RBAC), interpreta lenguaje natural para realizar operaciones seguras y deterministas (`list_namespaced_pod`, `delete_namespaced_pod`) e interactúa vía GraphQL con New Relic para dar resúmenes sobre CPU y RAM, eliminando el uso de frágiles comandos shell de texto plano.
 4.  **`productivity-service`**: Microservicio enfocado en el parseo y organización de calendarios basados en intenciones temporales.
-5.  **`whatsapp-bridge`**: Backend Express.js que interactúa con la API Cloud de Meta, permitiendo iniciar sesíón y chatear con Amael directamente desde WhatsApp manteniendo el mismo historial.
+5.  **`whatsapp-bridge`**: Backend Express.js apoyado en Puppeteer. Conecta con WhatsApp Web, recibiendo mensajes y enviándolos al backend usando el **número de remitente** como identificador de sesión aislado.
 6.  **`ollama-service` & `tf-serving`**: Capas base de inferencia. Ollama procesa la lógica generativa y los embeddings, mientras que TensorFlow Serving hostea ImageNet/MobileNet para la visión artificial.
 
 ### Diagrama Arquitectónico
@@ -94,16 +94,18 @@ Los manifiestos YAML de Kubernetes se encuentran dentro de la carpeta `k8s/` y d
 ### Guía Rápida:
 1. Asegurarte que el registro de imágenes esté corriendo y tus DNS (`registry.richardx.dev`) estén propagados a los nodos físicos de MicroK8s.
 2. Contar con un `.env` que contenga las credenciales (`JWT_SECRET`, tokens OAuth de Google y WhatsApp, y API Keys de New Relic).
-3. Construir la imagen de un microservicio específico y luego aplicarlo en el clúster usando la CLI o herramientas GitOps. Ejemplo:
+3. **Control de Versiones:** Todos los microservicios parten desde la versión `1.0.0` registrada en el registry local. Cualquier cambio subsecuente deberá incrementar este tag consecuentemente.
+4. Construir la imagen de un microservicio específico y luego aplicarlo en el clúster usando la CLI o herramientas GitOps. Ejemplo:
 ```bash
 cd k8s-agent
-docker build -t registry.richardx.dev/k8s-agent:latest .
-docker push registry.richardx.dev/k8s-agent:latest
+docker build -t registry.richardx.dev/k8s-agent:1.0.1 .
+docker push registry.richardx.dev/k8s-agent:1.0.1
 kubectl apply -f ../k8s/19.-k8s-agent-deployment.yaml
 kubectl rollout restart deployment k8s-agent-deployment -n amael-ia
 ```
 
 ## 🔐 Seguridad y Limitaciones
-* Todas las acciones sobre el clúster están delimitadas con el namespace `-n amael-ia` para aislar el alcance del IA.
-* El RBAC de k8s provee permisos exactos basándose en el principio de mínimo privilegio (`get, list, delete`).
-* Queda **restringido** para el K8s Agent buscar o listar credenciales, APIs, Secrets o Tokens dentro de Kubernetes para prevenir brechas de seguridad informando todo por chat.
+* **Lista Blanca K8s (Whitelist):** El clúster expone la variable `K8S_ALLOWED_USERS_CSV` al backend. Solo los usuarios/correos explícitamente listados allí pueden triggerar acciones de DevOps. Los demás recibirán un mensaje de acceso denegado elegante.
+* **Aislamiento de Sesión:** WhatsApp Bridge no unifica los historiales del número hospedador. Cada remitente se convierte en una entidad única con su historial JSON separado gracias al identificador paramétrico.
+* **RBAC de K8s:** Todas las acciones del `k8s-agent` sobre el clúster están delimitadas al namespace `amael-ia` para aislar el alcance. Sus ServiceAccounts proveen permisos precisos (`get, list, delete`).
+* Queda **restringido** para el Agente nativo buscar o listar credenciales, Secretos o Tokens dentro de Kubernetes.

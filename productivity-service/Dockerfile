@@ -1,6 +1,6 @@
 # --- Paso 1: Elegir una imagen base ---
 # Usamos una versión oficial y ligera de Python. 'slim' es un buen balance entre tamaño y funcionalidad.
-FROM python:3.9-slim
+FROM python:3.10-slim
 
 # --- Paso 2: Establecer el directorio de trabajo ---
 # Todas las acciones siguientes se ejecutarán dentro de este directorio en el contenedor.
@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir --upgrade -r /app/requirements.txt
 # --- Paso 4: Copiar el código de la aplicación ---
 # Ahora copiamos el resto del código de la aplicación al directorio de trabajo.
 # Esta capa se reconstruirá solo si el código fuente cambia.
-COPY ./app /app
+COPY ./app /app/app
 
 
 ENV PYTHONPATH=/app

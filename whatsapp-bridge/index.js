@@ -26,10 +26,8 @@ let clientStatus = 'initializing';
 // --- CONFIGURACIÓN ROBUSTA PARA PUPPETEER EN KUBERNETES ---
 const puppeteerCore = require('puppeteer-core');
 
-// Configuración del cliente de WhatsApp para que guarde la sesión
-// --- CONFIGURACIÓN ROBUSTA PARA PUPPETEER EN KUBERNETES ---
-// Usar el Chromium bundled de puppeteer-core (versión compatible con la librería)
-const CHROMIUM_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || puppeteerCore.executablePath();
+// Usar el Chromium instalado en el sistema
+const CHROMIUM_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium';
 console.log(`Usando Chromium en: ${CHROMIUM_PATH}`);
 
 const client = new Client({
@@ -37,6 +35,7 @@ const client = new Client({
     puppeteer: {
         headless: true,
         executablePath: CHROMIUM_PATH,
+        protocolTimeout: 240000, // Important to prevent Runtime.callFunctionOn timeout
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
