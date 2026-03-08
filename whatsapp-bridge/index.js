@@ -32,15 +32,10 @@ console.log(`Usando Chromium en: ${CHROMIUM_PATH}`);
 
 const client = new Client({
     authStrategy: new LocalAuth(),
-    // Use local version to avoid injection issues and be more stable
-    webVersionCache: {
-        type: 'local',
-    },
-    webVersion: '2.2318.11',
     puppeteer: {
         headless: true,
         executablePath: CHROMIUM_PATH,
-        protocolTimeout: 240000, // Important to prevent Runtime.callFunctionOn timeout
+        protocolTimeout: 600000, // 10 minutes
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -51,9 +46,10 @@ const client = new Client({
             '--disable-background-timer-throttling',
             '--disable-backgrounding-occluded-windows',
             '--disable-renderer-backgrounding',
+            '--no-zygote',
+            '--single-process',
         ]
     },
-    // using default local web version cache
 });
 
 // --- EVENTOS DE WHATSAPP ---

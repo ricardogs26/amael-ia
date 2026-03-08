@@ -4,12 +4,19 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any, Union
+from prometheus_fastapi_instrumentator import Instrumentator
+from prometheus_client import Counter, Histogram
+import time
 
 app = FastAPI(title="LLM Adapter: OpenAI to Ollama")
 
 # Configuración
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama-service.default.svc.cluster.local:11434")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "glm4") # Ajusta esto al nombre exacto de tu modelo en Ollama
+
+# --- CUSTOM PROMETHEUS METRICS ---
+LLM_TOKENS_TOTAL = Counter('amael_llm_tokens_total', 'Total tokens used by LLM', ['model', 'type'])
+LLM_LATENCY_SECONDS = Histogram('amael_llm_latency_seconds', 'Latency of LLM requests in seconds', ['model'])
 
 # Modelos de datos para simular la API de OpenAI (simplificado)
 class ChatMessage(BaseModel):
@@ -85,9 +92,18 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
             else:
                 # Petición síncrona (No streaming)
+                start_time = time.time()
                 response = await client.post(ollama_url, json=ollama_payload)
+                latency = time.time() - start_time
                 response.raise_for_status()
                 ollama_data = response.json()
+
+                # Record metrics
+                LLM_LATENCY_SECONDS.labels(model=target_model).observe(latency)
+                prompt_tokens = ollama_data.get("prompt_eval_count", 0)
+                completion_tokens = ollama_data.get("eval_count", 0)
+                LLM_TOKENS_TOTAL.labels(model=target_model, type="prompt").inc(prompt_tokens)
+                LLM_TOKENS_TOTAL.labels(model=target_model, type="completion").inc(completion_tokens)
 
                 # Formatear respuesta como OpenAI
                 openai_response = {
@@ -119,3 +135,6 @@ async def create_chat_completion(request: ChatCompletionRequest):
 @app.get("/llm/health")
 async def health():
     return {"status": "healthy"}
+
+# --- INSTRUMENTATION ---
+Instrumentator().instrument(app).expose(app)

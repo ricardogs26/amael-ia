@@ -5,3 +5,5 @@ langchain
 langchain-ollama
 pydantic
 kubernetes
+prometheus-fastapi-instrumentator
+prometheus-client

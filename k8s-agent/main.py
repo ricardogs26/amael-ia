@@ -7,8 +7,30 @@ import json
 from langchain_ollama import OllamaLLM
 from langchain.agents import initialize_agent, AgentType, Tool
 from langchain.prompts import PromptTemplate
+from langchain.callbacks.base import BaseCallbackHandler
+from prometheus_fastapi_instrumentator import Instrumentator
+from prometheus_client import Counter
+from typing import Dict, Any
 
 app = FastAPI(title="K8s Agentic AI Service")
+
+# --- MÉTRICAS PROMETHEUS ---
+AGENT_STEPS_TOTAL = Counter('amael_agent_steps_total', 'Total steps taken by the agent')
+AGENT_TOOLS_USAGE_TOTAL = Counter('amael_agent_tools_usage_total', 'Total usage of agent tools', ['tool'])
+AGENT_REQUESTS_TOTAL = Counter('amael_agent_requests_total', 'Total requests to the agent')
+
+# --- CALLBACK PARA MÉTRICAS ---
+class PrometheusMetricsCallback(BaseCallbackHandler):
+    def on_tool_start(self, serialized: Dict[str, Any], input_str: str, **kwargs: Any) -> Any:
+        tool_name = serialized.get("name", "unknown")
+        # Incrementar contador de herramienta
+        AGENT_TOOLS_USAGE_TOTAL.labels(tool=tool_name).inc()
+    
+    def on_agent_action(self, action: Any, **kwargs: Any) -> Any:
+        # Incrementar contador de pasos (iteraciones Reason/Act)
+        AGENT_STEPS_TOTAL.inc()
+
+metrics_callback = PrometheusMetricsCallback()
 
 # --- MODELOS DE DATOS ---
 class AgentRequest(BaseModel):
@@ -226,10 +248,12 @@ def extract_final_answer(raw_response: str) -> str:
 
 @app.post("/api/k8s-agent")
 async def chat_with_agent(request: AgentRequest):
+    AGENT_REQUESTS_TOTAL.inc()
     print(f"Recibiendo petición de {request.user_email}: {request.query}")
     try:
         final_prompt = agent_prompt.format(query=request.query)
-        raw_response = agent.run(final_prompt)
+        # Ejecutar el agente con el callback de métricas
+        raw_response = agent.run(final_prompt, callbacks=[metrics_callback])
         clean_response = extract_final_answer(raw_response)
         return {"response": clean_response}
     except Exception as e:
@@ -273,3 +297,6 @@ Termina SIEMPRE tu respuesta hacia el usuario con:
 Final Answer: [Tu mensaje detallado y profesional para el usuario]
 
 Pregunta del usuario: {query}"""
+
+# --- INSTRUMENTACIÓN ---
+Instrumentator().instrument(app).expose(app)

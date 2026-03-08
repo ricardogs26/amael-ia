@@ -4,7 +4,10 @@ from fastapi import FastAPI, HTTPException, Depends, status, Request, Response, 
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware import Middleware
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
+from prometheus_client import Counter, Histogram, Gauge
 from starlette.middleware.sessions import SessionMiddleware
+import time
 from pydantic import BaseModel
 import requests
 import os
@@ -142,6 +145,15 @@ minio_client = Minio(
     secure=False
 )
 CHAT_HISTORIES_DIR = os.getenv("CHAT_HISTORIES_DIR", "/chat_histories")
+
+# --- CUSTOM PROMETHEUS METRICS ---
+LLM_TOKENS_TOTAL = Counter('amael_llm_tokens_total', 'Total tokens used by LLM', ['model', 'type'])
+LLM_LATENCY_SECONDS = Histogram('amael_llm_latency_seconds', 'Latency of LLM requests in seconds', ['model'])
+AGENT_STEPS_TOTAL = Counter('amael_agent_steps_total', 'Total steps taken by the agent')
+AGENT_FAILURES_TOTAL = Counter('amael_agent_failures_total', 'Total failures in agent execution')
+AGENT_TOOLS_USAGE_TOTAL = Counter('amael_agent_tools_usage_total', 'Total usage of agent tools', ['tool'])
+RAG_HITS_TOTAL = Counter('amael_rag_hits_total', 'Total number of RAG hits')
+RAG_MISS_TOTAL = Counter('amael_rag_miss_total', 'Total number of RAG misses')
 
 # --- DEFINICIÓN DEL PROMPT (MOVIDO AQUÍ - ANTES DE LAS FUNCIONES QUE LO USAN) ---
 system_prompt_template = """
@@ -319,6 +331,9 @@ app = FastAPI(
         ),
     ]
 )
+
+# Inicializar Instrumentator fuera del ciclo de vida para evitar RuntimeError
+Instrumentator().instrument(app).expose(app)
 
 # Llamar a la inicialización al arrancar
 @app.on_event("startup")
@@ -519,6 +534,7 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
             print(f"Error contacting k8s-agent service: {e}")
             raise HTTPException(status_code=503, detail="El servicio de agente experto de Kubernetes no está disponible.")
         except httpx.HTTPStatusError as e:
+            AGENT_FAILURES_TOTAL.inc() # Increment failure count
             print(f"K8s-agent returned an error: {e.response.text}")
             raise HTTPException(status_code=500, detail="Ocurrió un error al consultar el estado de tu cluster.")
 
@@ -545,8 +561,13 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
     try:
         user_vectorstore = get_user_vectorstore(user)
         relevant_docs = user_vectorstore.similarity_search(request.prompt, k=3)
+        if relevant_docs:
+            RAG_HITS_TOTAL.inc()
+        else:
+            RAG_MISS_TOTAL.inc()
         context = "\n".join([doc.page_content for doc in relevant_docs])
     except Exception as e:
+        RAG_MISS_TOTAL.inc()
         print(f"[RAG/Qdrant] Error: {e}")
         context = ""
 
@@ -602,8 +623,21 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
 
     try:
         # 4. Invocar al LLM estándar
+        start_time = time.time()
         response = llm.invoke(final_prompt)
+        latency = time.time() - start_time
+        
         final_response = response
+
+        # Record metrics
+        LLM_LATENCY_SECONDS.labels(model=LLM_MODEL).observe(latency)
+        # Assuming we can estimate tokens roughly or get them from response
+        # OllamaLLM doesn't easily return token counts in Invoke, but we can estimate
+        # For now, let's increment by 1 for simplicity or estimate 1 token per 4 chars
+        prompt_tokens = len(final_prompt) // 4
+        completion_tokens = len(final_response) // 4
+        LLM_TOKENS_TOTAL.labels(model=LLM_MODEL, type="prompt").inc(prompt_tokens)
+        LLM_TOKENS_TOTAL.labels(model=LLM_MODEL, type="completion").inc(completion_tokens)
 
         # --- GUARDAR EN LA NUEVA CAPA DE DATOS ---
         save_chat_message(history_id, "user", request.prompt)
