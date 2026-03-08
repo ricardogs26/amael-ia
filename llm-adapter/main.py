@@ -22,7 +22,7 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     temperature: Optional[float] = 0.7
 
-@app.post("/v1/chat/completions")
+@app.post("/llm/v1/chat/completions")
 async def create_chat_completion(request: ChatCompletionRequest):
     """
     Endpoint compatible con OpenAI SDK.
@@ -111,6 +111,6 @@ async def create_chat_completion(request: ChatCompletionRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/health")
+@app.get("/llm/health")
 async def health():
     return {"status": "healthy"}
