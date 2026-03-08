@@ -32,6 +32,14 @@ spec:
             name: backend-service
             port:
               number: 8000
+      # --- REGLA PARA EL LLM ADAPTER (OpenAI Compatible) ---
+      - path: /llm
+        pathType: Prefix
+        backend:
+          service:
+            name: llm-adapter-service
+            port:
+              number: 80
       # --- REGLA PARA EL FRONTEND ---
       - path: /
         pathType: Prefix
