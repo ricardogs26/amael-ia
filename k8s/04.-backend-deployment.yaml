@@ -16,7 +16,7 @@ spec:
       imagePullSecrets: []
       containers:
       - name: backend-container
-        image: registry.richardx.dev/backend-ia:1.0.0
+        image: registry.richardx.dev/backend-ia:2.2.6
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8000
@@ -27,12 +27,9 @@ spec:
           limits:
             cpu: "500m"
             memory: "512Mi"
-        # --- SECCIÓN ENV CORRECTAMENTE ANIDADA ---
         env:
-          # ... VAriable de TensorFlow2
           - name: TF_SERVING_URL
             value: "http://tf-serving-service:8501/v1/models/imagenet_classifier:predict"
-          # Secretos de Google OAuth
           - name: GOOGLE_CLIENT_ID
             valueFrom:
               secretKeyRef:
@@ -43,7 +40,6 @@ spec:
               secretKeyRef:
                 name: google-auth-secret
                 key: client_secret
-          # Claves para JWT y Sesión
           - name: JWT_SECRET_KEY
             valueFrom:
               secretKeyRef:
@@ -54,29 +50,39 @@ spec:
               secretKeyRef:
                 name: google-auth-secret
                 key: session_secret_key
-          # Lista blanca de usuarios desde ConfigMap
           - name: ALLOWED_EMAILS_CSV
             valueFrom:
               configMapKeyRef:
                 name: allowed-users-configmap
                 key: ALLOWED_EMAILS_CSV
-          # Nueva variable de Whitelist para Infraestructura
           - name: K8S_ALLOWED_USERS_CSV
             valueFrom:
               configMapKeyRef:
                 name: allowed-users-configmap
                 key: K8S_ALLOWED_USERS_CSV
-          # Secreto de API interna refactorizado
           - name: INTERNAL_API_SECRET
             valueFrom:
               secretKeyRef:
                 name: google-auth-secret
                 key: internal_api_secret
+          # --- NUEVAS VARIABLES DATABASE (PHASE 2) ---
+          - name: POSTGRES_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: amael-secrets
+                key: POSTGRES_PASSWORD
+          - name: MINIO_SECRET_KEY
+            valueFrom:
+              secretKeyRef:
+                name: amael-secrets
+                key: MINIO_ROOT_PASSWORD
+          - name: CHAT_HISTORIES_DIR
+            value: "/chat_histories"
         volumeMounts:
-        - name: chroma-storage
-          mountPath: /chroma_data
+        - name: legacy-history
+          mountPath: /chat_histories
       volumes:
-        - name: chroma-storage
+        - name: legacy-history
           persistentVolumeClaim:
             claimName: chroma-pvc
 ---

@@ -22,90 +22,116 @@ Desplegada completamente sobre Kubernetes, Amael IA no solo responde a preguntas
 
 ---
 
-## 🏗️ Arquitectura de Microservicios
+## 🏗️ Arquitectura de Microservicios Detallada
 
-Amael IA sigue un enfoque de diseño modular nativo de la nube. Cada función especializada recae en un microservicio orquestado por Kubernetes (MicroK8s).
+Amael IA sigue un enfoque de diseño modular nativo de la nube, orquestado por **Kubernetes (MicroK8s)**. Cada componente está especializado y aislado.
 
-### Componentes Clave:
-1.  **`frontend-ia`**: Interfaz de usuario rica desarrollada en Python/Streamlit. Maneja el estado de la sesión, la subida de archivos multimedias y documentos RAG.
-2.  **`backend-ia`**: El "Cerebro Central" (FastAPI). Gestiona la autenticación, el historial conversacional (JSON), el proxy hacia modelos LLM (`ollama`) y rutea de forma inteligente las peticiones. **Aquí se valida la Whitelist**: si el usuario consulta sobre infraestructura, verifica que su correo (o celular) exista en el `K8S_ALLOWED_USERS_CSV` antes de consultar al agente.
-3.  **`k8s-agent`**: Agente experto (`ZERO_SHOT_REACT`) con herramientas (Tools) construidas sobre el **cliente oficial de Kubernetes en Python**. Protegido por Roles (RBAC), interpreta lenguaje natural para realizar operaciones seguras y deterministas (`list_namespaced_pod`, `delete_namespaced_pod`) e interactúa vía GraphQL con New Relic para dar resúmenes sobre CPU y RAM, eliminando el uso de frágiles comandos shell de texto plano.
-4.  **`productivity-service`**: Microservicio enfocado en el parseo y organización de calendarios basados en intenciones temporales.
-5.  **`whatsapp-bridge`**: Backend Express.js apoyado en Puppeteer. Conecta con WhatsApp Web, recibiendo mensajes y enviándolos al backend usando el **número de remitente** como identificador de sesión aislado.
-6.  **`ollama-service` & `tf-serving`**: Capas base de inferencia. Ollama procesa la lógica generativa y los embeddings, mientras que TensorFlow Serving hostea ImageNet/MobileNet para la visión artificial.
+### 🧠 Modelos de IA Utilizados
+*   **LLM Principal:** `qwen2.5:14b` (alojado en Ollama). Utilizado por el Backend, K8s Agent y Productivity Service para razonamiento y generación de texto.
+*   **Embeddings:** `nomic-embed-text` (alojado en Ollama). Utilizado para la vectorización RAG con una dimensión de **768**.
+*   **Visión:** `MobileNetV2` / `ImageNet` (alojado en TensorFlow Serving).
 
-### Diagrama Arquitectónico
+### Componentes y Conectividad:
+
+1.  **`frontend-ia` (Python/Streamlit)**
+    *   **Interfaz:** Web rich-UI.
+    *   **Conectividad:** API REST hacia el Backend.
+    *   **Auth:** Maneja el flujo de login con Google OAuth.
+
+2.  **`backend-ia` (FastAPI) - El Cerebro Central**
+    *   **Modelos:** `qwen2.5:14b`, `nomic-embed-text`.
+    *   **Almacenamiento:**
+        *   **PostgreSQL:** Persistencia de historiales de chat y metadatos.
+        *   **Redis:** Caché de respuestas rápidas y estado de sesión.
+        *   **Qdrant:** Base de datos vectorial para RAG (aislada por usuario).
+        *   **MinIO:** Almacenamiento de archivos originales (PDF/TXT).
+    *   **Seguridad:** Validación de JWT y Listas Blancas (`K8S_ALLOWED_USERS_CSV`).
+
+3.  **`k8s-agent` (LangChain Agent - Zero Shot React)**
+    *   **Modelo:** `qwen2.5:14b`.
+    *   **Herramientas (Tools):**
+        *   `Listar_Namespaces`: Visualización completa del clúster.
+        *   `Detalle_Namespace`: Inspección de estados y metadata.
+        *   `Listar_Pods`: Reporte de salud y detección de fallos (`CrashLoopBackOff`, `OOMKilled`).
+        *   `Obtener_Logs_Pod`: Depuración profunda de errores en tiempo real.
+        *   `Eliminar_Pod`: Capacidad de ejecución para forzar reinicios de pods anómalos.
+        *   `New_Relic_Query`: Consultas NRQL predefinidas (`cpu_cluster`, `ram_pods`, etc.) vía GraphQL API.
+    *   **Conectividad:** SDK oficial de Kubernetes (RBAC in-cluster) y New Relic Platform.
+
+4.  **`productivity-service` (FastAPI)**
+    *   **Modelo:** `qwen2.5:14b`.
+    *   **Conectividad:** Integración directa con **Google Calendar API** y **Gmail API**.
+    *   **Función:** Automatización de agenda basada en el análisis de correos electrónicos no leídos y eventos del día.
+
+5.  **`whatsapp-bridge` (Node.js/Express)**
+    *   **Motor:** Puppeteer + WhatsApp Web.
+    *   **Aislamiento:** Mapea números de teléfono a IDs de sesión únicos en el Backend, permitiendo historiales RAG dedicados por usuario de WhatsApp.
+
+6.  **`ollama-service` & `tf-serving`**
+    *   Capa de infraestructura de inferencia que provee los modelos de lenguaje y visión a todo el ecosistema.
+
+### Diagrama de Flujo y Conectividad
 
 ```mermaid
 graph TD
-    subgraph "Interfaces de Usuario (Endpoints)"
-        UI[Frontend Web Streamlit]
-        WA[Dispositivo WhatsApp]
+    subgraph "Interfaces"
+        UI[Frontend Streamlit]
+        WA[WhatsApp App]
     end
 
-    subgraph "APIs y Conectores"
-        GW[WhatsApp Bridge Node.js]
-        BE[Backend IA FastAPI]
-        AUTH[Google OAuth Provider]
+    subgraph "Core API Layer"
+        BE[Backend IA - FastAPI]
+        DB[(PostgreSQL / Redis)]
+        VS[(Qdrant Vector DB)]
+        OBJ[(MinIO Storage)]
     end
 
-    subgraph "Agentes Expertos & Lógica"
-        K8S[K8s Agent LangChain]
-        PROD[Productivity Service]
-        RAG[(ChromaDB Vols por User)]
+    subgraph "Expert Agents"
+        K8S[K8s Agent - SRE Expert]
+        PROD[Productivity - Google API]
     end
 
-    subgraph "Capa de Inferencia (AI Models)"
-        OLLAMA[Ollama LLM & Embeddings]
-        TF[TensorFlow Serving]
+    subgraph "Inference Providers"
+        OL[Ollama - qwen2.5:14b]
+        TF[TF Serving - Computer Vision]
     end
 
-    subgraph "Infraestructura & Telemetría"
-        KUBE(MicroK8s Control Plane)
-        NR(New Relic Platform)
+    subgraph "External Platforms"
+        KUBE[K8s API / RBAC]
+        NR[New Relic GraphQL]
+        GAPI[Google Calendar/Gmail]
     end
 
-    %% Flujos de ingreso
-    UI -->|JWT Auth & Chat JSON| BE
-    UI <-->|Login Redirect| AUTH
-    WA -->|Webhook Payload| GW
-    GW -->|REST Push| BE
-    
-    %% Ruteo del Backend
-    BE <-->|Conversación Gen & Embeddings| RAG
-    BE <-->|Inferencia Básica| OLLAMA
-    BE -->|Si detecta palabras de infraestructura| K8S
-    BE -->|Si detecta 'Organiza mi día'| PROD
-    BE -->|Si envía Imagen| TF
-    
-    %% Acciones del K8s Agent
-    K8S <-->|Reflexión de Acción| OLLAMA
-    K8S -->|Seguridad RBAC Delete/Get| KUBE
-    K8S -->|Queries NRQL| NR
+    %% Connectivity
+    UI & WA <--> BE
+    BE <--> DB & VS & OBJ
+    BE <--> OL & TF
+    BE -->|K8s Query| K8S
+    BE -->|Planning Task| PROD
+    K8S <--> OL
+    K8S -->|Action| KUBE
+    K8S -->|Metrics| NR
+    PROD -->|Sync| GAPI
 ```
 
 ---
 
-## 🚀 Despliegue Rápido y Flujo de Desarrollo
+## 🚀 Despliegue y Desarrollo
 
-Todo el despliegue está contenerizado usando **Docker** y alojado en un `registry` local.
-Los manifiestos YAML de Kubernetes se encuentran dentro de la carpeta `k8s/` y describen todos los recursos necesarios (ConfigMaps, Secrets, PVCs, Deployments y Services) para configurar el espacio de trabajo `amael-ia` de cero.
+### Flujo de CI/CD Manual:
+1.  **Build:** `docker build -t registry.richardx.dev/<service>:<tag> .`
+2.  **Push:** `docker push registry.richardx.dev/<service>:<tag>`
+3.  **Apply:** `kubectl apply -f k8s/<manifest>.yaml`
+4.  **Restart:** `kubectl rollout restart deployment <service-name> -n amael-ia`
 
-### Guía Rápida:
-1. Asegurarte que el registro de imágenes esté corriendo y tus DNS (`registry.richardx.dev`) estén propagados a los nodos físicos de MicroK8s.
-2. Contar con un `.env` que contenga las credenciales (`JWT_SECRET`, tokens OAuth de Google y WhatsApp, y API Keys de New Relic).
-3. **Control de Versiones:** Todos los microservicios parten desde la versión `1.0.0` registrada en el registry local. Cualquier cambio subsecuente deberá incrementar este tag consecuentemente.
-4. Construir la imagen de un microservicio específico y luego aplicarlo en el clúster usando la CLI o herramientas GitOps. Ejemplo:
-```bash
-cd k8s-agent
-docker build -t registry.richardx.dev/k8s-agent:1.0.1 .
-docker push registry.richardx.dev/k8s-agent:1.0.1
-kubectl apply -f ../k8s/19.-k8s-agent-deployment.yaml
-kubectl rollout restart deployment k8s-agent-deployment -n amael-ia
-```
+### Registro de Versiones Relevantes:
+*   **Backend IA:** `2.2.6` (Corrección de Qdrant Dimension Mismatch).
+*   **WhatsApp Bridge:** `1.1.0`.
+*   **K8s Agent:** `1.0.1`.
 
-## 🔐 Seguridad y Limitaciones
-* **Lista Blanca K8s (Whitelist):** El clúster expone la variable `K8S_ALLOWED_USERS_CSV` al backend. Solo los usuarios/correos explícitamente listados allí pueden triggerar acciones de DevOps. Los demás recibirán un mensaje de acceso denegado elegante.
-* **Aislamiento de Sesión:** WhatsApp Bridge no unifica los historiales del número hospedador. Cada remitente se convierte en una entidad única con su historial JSON separado gracias al identificador paramétrico.
-* **RBAC de K8s:** Todas las acciones del `k8s-agent` sobre el clúster están delimitadas al namespace `amael-ia` para aislar el alcance. Sus ServiceAccounts proveen permisos precisos (`get, list, delete`).
-* Queda **restringido** para el Agente nativo buscar o listar credenciales, Secretos o Tokens dentro de Kubernetes.
+---
+
+## 🔐 Seguridad
+*   **RBAC strico:** El `k8s-agent` solo tiene permisos sobre el namespace `amael-ia`.
+*   **Whitelist:** Doble validación en Backend para comandos de infraestructura.
+*   **Secretos:** Gestión centralizada vía Kubernetes Secrets (`amael-secrets`).

@@ -21,9 +21,16 @@ import magic # libreria para determinar el tipo de formato en un archivo a inges
 
 # --- IMPORTACIONES DE LANGCHAIN ---
 from langchain_ollama import OllamaLLM, OllamaEmbeddings
-from langchain_chroma import Chroma
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_qdrant import QdrantVectorStore
+from qdrant_client import QdrantClient
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
+
+# --- MEMORIA Y PERSISTENCIA ---
+import redis
+import psycopg2
+from psycopg2 import pool
+from minio import Minio
 
 # ... IMPORTACIONDES DE TENSOFLOW2
 import base64
@@ -89,13 +96,47 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         raise HTTPException(status_code=401, detail="Token inválido o expirado")
 
 # --- CONFIGURACIÓN E INICIALIZACIÓN DE IA ---
-OLLAMA_BASE_URL = "http://ollama-service:11434"
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama-service:11434")
 LLM_MODEL = "qwen2.5:14b"       # Modelo principal: razonamiento, chat, agente K8s
 EMBED_MODEL = "nomic-embed-text" # Modelo dedicado para embeddings RAG (274 MB, 3x más rápido)
 llm = OllamaLLM(model=LLM_MODEL, base_url=OLLAMA_BASE_URL)
-# <-- CAMBIO IMPORTANTE: Usamos un directorio base, pero la inicialización de Chroma será por usuario.
-CHROMA_BASE_DIR = "/chroma_data"
-CHAT_HISTORIES_DIR = "/chat_histories" # <-- NUEVO: Directorio para los historiales
+
+# --- CONFIGURACIÓN DE CAPA DE DATOS (PHASE 2) ---
+REDIS_HOST = os.getenv("REDIS_HOST", "redis-service")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+
+QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant-service:6333")
+
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "postgres-service")
+POSTGRES_DB = os.getenv("POSTGRES_DB", "amael_db")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "amael_user")
+POSTGRES_PASS = os.getenv("POSTGRES_PASSWORD", "amael_password_2026")
+
+# Pool de conexiones para Postgres
+try:
+    postgres_pool = psycopg2.pool.SimpleConnectionPool(1, 10,
+        user=POSTGRES_USER,
+        password=POSTGRES_PASS,
+        host=POSTGRES_HOST,
+        database=POSTGRES_DB
+    )
+    print("PostgreSQL connection pool created successfully")
+except Exception as e:
+    print(f"Error creating PostgreSQL pool: {e}")
+    postgres_pool = None
+
+MINIO_URL = os.getenv("MINIO_URL", "minio-service:9000")
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "amael_admin")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "amael_minio_secret_key")
+
+minio_client = Minio(
+    MINIO_URL,
+    access_key=MINIO_ACCESS_KEY,
+    secret_key=MINIO_SECRET_KEY,
+    secure=False
+)
+CHAT_HISTORIES_DIR = os.getenv("CHAT_HISTORIES_DIR", "/chat_histories")
 
 # --- DEFINICIÓN DEL PROMPT (MOVIDO AQUÍ - ANTES DE LAS FUNCIONES QUE LO USAN) ---
 system_prompt_template = """
@@ -141,35 +182,106 @@ def sanitize_email(email: str) -> str:
     return email.replace("@", "_at_").replace(".", "_dot_")
 
 def get_user_vectorstore(user_email: str):
-    """Carga o crea la base de datos vectorial para un usuario específico.
-    Si la colección tiene dimensiones incompatibles (ej. migración de modelo),
-    la borra y la recrea limpia automáticamente.
-    """
-    import shutil
-    user_dir = os.path.join(CHROMA_BASE_DIR, sanitize_email(user_email))
-    os.makedirs(user_dir, exist_ok=True)
-
+    """Carga o crea la base de datos vectorial para un usuario específico en Qdrant."""
     embeddings = OllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_BASE_URL)
+    collection_name = sanitize_email(user_email)
+    
     try:
-        vectorstore = Chroma(
-            embedding_function=embeddings,
-            persist_directory=user_dir
+        vectorstore = QdrantVectorStore.from_existing_collection(
+            embedding=embeddings,
+            collection_name=collection_name,
+            url=QDRANT_URL,
         )
-        # Prueba rápida para detectar incompatibilidad de dimensiones
-        vectorstore._collection.count()
         return vectorstore
     except Exception as e:
-        error_str = str(e)
-        if "dimension" in error_str.lower() or "InvalidArgument" in type(e).__name__:
-            print(f"[ChromaDB] Dimensiones incompatibles para {user_email}. Recreando colección...")
-            shutil.rmtree(user_dir, ignore_errors=True)
-            os.makedirs(user_dir, exist_ok=True)
-            vectorstore = Chroma(
-                embedding_function=embeddings,
-                persist_directory=user_dir
-            )
-            return vectorstore
-        raise
+        print(f"[Qdrant] Error o diferencia de dimensiones en {collection_name}: {e}. Recreando...")
+        client = QdrantClient(url=QDRANT_URL)
+        
+        # Si la colección existe pero dio error (probablemente dimensiones), la borramos
+        if client.collection_exists(collection_name):
+            print(f"[Qdrant] Borrando colección existente {collection_name} para corregir configuración...")
+            client.delete_collection(collection_name)
+            
+        client.create_collection(
+            collection_name=collection_name,
+            vectors_config={"size": 768, "distance": "Cosine"} # nomic-embed-text es de 768
+        )
+        
+        return QdrantVectorStore(
+            client=client,
+            collection_name=collection_name,
+            embedding=embeddings
+        )
+
+def init_db():
+    """Inicializa las tablas necesarias en PostgreSQL."""
+    if not postgres_pool: return
+    conn = postgres_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS chat_history (
+                    id SERIAL PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_user_id ON chat_history(user_id);
+            """)
+            conn.commit()
+    finally:
+        postgres_pool.putconn(conn)
+
+
+def save_chat_message(user_id: str, role: str, content: str):
+    """Guarda un mensaje en Redis (caché) y Postgres (persistente)."""
+    # 1. Guardar en Redis (Lista de los últimos 10 mensajes)
+    redis_key = f"chat_history:{user_id}"
+    message_json = json.dumps({"role": role, "content": content})
+    redis_client.lpush(redis_key, message_json)
+    redis_client.ltrim(redis_key, 0, 9) # Mantener solo los últimos 10
+    
+    # 2. Guardar en Postgres
+    if postgres_pool:
+        conn = postgres_pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO chat_history (user_id, role, content) VALUES (%s, %s, %s)",
+                    (user_id, role, content)
+                )
+                conn.commit()
+        finally:
+            postgres_pool.putconn(conn)
+
+def get_chat_history(user_id: str, limit: int = 10) -> list:
+    """Intenta obtener el historial de Redis, si falla va a Postgres."""
+    redis_key = f"chat_history:{user_id}"
+    try:
+        history = redis_client.lrange(redis_key, 0, limit - 1)
+        if history:
+            # Redis devuelve los más recientes primero, los invertimos para el prompt
+            return [json.loads(m) for m in reversed(history)]
+    except Exception as e:
+        print(f"Redis error: {e}")
+
+    # Fallback a Postgres
+    if postgres_pool:
+        conn = postgres_pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT role, content FROM chat_history WHERE user_id = %s ORDER BY timestamp DESC LIMIT %s",
+                    (user_id, limit)
+                )
+                rows = cur.fetchall()
+                # Voltear para orden cronológico
+                return [{"role": r, "content": c} for r, c in reversed(rows)]
+        finally:
+            postgres_pool.putconn(conn)
+    
+    return []
 
 def get_history_path_for_id(identifier: str) -> str:
     """Obtiene la ruta al archivo de historial para un identificador único (email o teléfono)."""
@@ -201,6 +313,11 @@ app = FastAPI(
         ),
     ]
 )
+
+# Llamar a la inicialización al arrancar
+@app.on_event("startup")
+async def startup_event():
+    init_db()
 
 # --- ENDPOINTS DE AUTENTICACIÓN (Sin cambios) ---
 @app.get('/api/auth/login')
@@ -277,15 +394,30 @@ async def ingest_data(file: UploadFile = File(...), user: str = Depends(get_curr
                 detail=f"Tipo de archivo no soportado: '{mime}'. Solo se permiten archivos PDF y TXT."
             )
         
-        # 5. Procesar el documento como antes
+        # 5. Procesar el documento
         documents = loader.load()
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         texts = text_splitter.split_documents(documents)
 
+        # 6. Guardar en Qdrant
         user_vectorstore = get_user_vectorstore(user)
         user_vectorstore.add_documents(texts)
         
-        return {"message": f"Usuario {user} ha ingerido el archivo correctamente en su perfil."}
+        # 7. Guardar el archivo original en MinIO para referencia futura
+        bucket_name = sanitize_email(user).replace("_", "-") # MinIO buckets prefer dashes
+        if not minio_client.bucket_exists(bucket_name):
+            minio_client.make_bucket(bucket_name)
+        
+        with open(temp_file_path, "rb") as f:
+            minio_client.put_object(
+                bucket_name, 
+                file.filename, 
+                f, 
+                length=os.path.getsize(temp_file_path),
+                content_type=mime
+            )
+        
+        return {"message": f"Archivo '{file.filename}' ingerido en Qdrant y respaldado en MinIO para el usuario {user}."}
 
     except HTTPException as http_e:
         # Si ya es un HTTPException, simplemente la volvemos a lanzar
@@ -385,36 +517,40 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
             raise HTTPException(status_code=500, detail="Ocurrió un error al consultar el estado de tu cluster.")
 
 
-    # Determinar qué ID usar para el historial (email del usuario o user_id de WhatsApp)
+    # Determinar qué ID usar para el historial
     history_id = request.user_id if request.user_id else user
-    history_path = get_history_path_for_id(history_id)
+    
+    # --- MIGRACIÓN DE HISTORIAL (JSON -> DB) ---
+    history = get_chat_history(history_id)
+    if not history:
+        history_path = get_history_path_for_id(history_id)
+        if os.path.exists(history_path):
+            print(f"Migrando historial JSON para {history_id}...")
+            with open(history_path, "r") as f:
+                old_history = json.load(f)
+                for msg in old_history:
+                    save_chat_message(history_id, msg['role'], msg['content'])
+            # Opcional: renombrar el archivo para no migrarlo de nuevo
+            os.rename(history_path, history_path + ".migrated")
+            history = get_chat_history(history_id)
 
-    # Cargar el historial del usuario específico desde el archivo
-    history = []
-    if os.path.exists(history_path):
-        with open(history_path, "r") as f:
-            history = json.load(f)
-
-    # 1. Recuperar documentos relevantes del USUARIO AUTENTICADO (el bot)
+    # 1. Recuperar documentos relevantes del USUARIO AUTENTICADO desde QDRANT
     context = ""
     try:
         user_vectorstore = get_user_vectorstore(user)
-        retriever = user_vectorstore.as_retriever()
-        relevant_docs = retriever.invoke(request.prompt)
+        relevant_docs = user_vectorstore.similarity_search(request.prompt, k=3)
         context = "\n".join([doc.page_content for doc in relevant_docs])
     except Exception as e:
-        # Si ChromaDB falla por cualquier razón, continuamos sin contexto RAG
-        # Esto garantiza que el chat nunca devuelva un 500 por un error de embeddings
-        print(f"[RAG] Advertencia: No se pudo recuperar contexto de documentos: {e}")
+        print(f"[RAG/Qdrant] Error: {e}")
         context = ""
 
-    # 2. Construir el historial de conversación (usando el historial cargado del archivo)
+    # 2. Construir el historial de conversación
     conversation_history = ""
     if history:
         history_lines = [f"Human: {msg['content']}" if msg['role'] == 'user' else f"Assistant: {msg['content']}" for msg in history]
         conversation_history = "\n".join(history_lines)
 
-    # 3. Crear el prompt final (Sin herramientas para el backend)
+    # 3. Crear el prompt final
     final_prompt = system_prompt_template.format(
         conversation_history=conversation_history,
         request_prompt=request.prompt
@@ -422,23 +558,13 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
     final_prompt = final_prompt.replace("<<<CONTEXT>>>", context)
 
     try:
-        # 4. Invocar al LLM (El backend solo responde texto, las herramientas k8s las maneja el k8s-agent)
+        # 4. Invocar al LLM
         response = llm.invoke(final_prompt)
+        final_response = response
 
-        # Extraemos solo el texto evitando llamadas JSON residuales si el modelo alucina
-        if "```json" in response and "tool_call" in response:
-             # Si por algún motivo el modelo intenta usar herramientas, ignoramos la herramienta y le pedimos que responda normal
-             final_response = "Entiendo tu solicitud, pero para acciones de infraestructura por favor sé más específico con las palabras clave como 'kubernetes', 'pods', etc."
-        else:
-             final_response = response
-
-        # --- GUARDAR EL HISTORIAL ACTUALIZADO (AHORA DENTRO DEL TRY) ---
-        updated_history = history + [
-            {"role": "user", "content": request.prompt},
-            {"role": "assistant", "content": final_response} # <-- Usar la respuesta final
-        ]
-        with open(history_path, "w") as f:
-            json.dump(updated_history, f)
+        # --- GUARDAR EN LA NUEVA CAPA DE DATOS ---
+        save_chat_message(history_id, "user", request.prompt)
+        save_chat_message(history_id, "assistant", final_response)
 
         return ChatResponse(response=final_response)
 
