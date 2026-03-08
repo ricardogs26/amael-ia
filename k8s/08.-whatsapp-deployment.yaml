@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: whatsapp-bridge
-        image: registry.richardx.dev/whatsapp-bridge:1.0.0
+        image: registry.richardx.dev/whatsapp-bridge:1.1.5
         imagePullPolicy: Always
         ports:
         - containerPort: 3000
@@ -38,7 +38,7 @@ spec:
             memory: "768Mi"
             cpu: "250m"
           limits:
-            memory: "1.5Gi"
+            memory: "2Gi"
             cpu: "1000m"
       volumes:
       - name: whatsapp-session-storage

@@ -16,7 +16,7 @@ spec:
       imagePullSecrets: []
       containers:
       - name: backend-container
-        image: registry.richardx.dev/backend-ia:2.2.6
+        image: registry.richardx.dev/backend-ia:2.2.7
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8000
@@ -28,6 +28,8 @@ spec:
             cpu: "500m"
             memory: "512Mi"
         env:
+          - name: LLM_VISION_MODEL
+            value: "qwen2.5vl:3b"
           - name: TF_SERVING_URL
             value: "http://tf-serving-service:8501/v1/models/imagenet_classifier:predict"
           - name: GOOGLE_CLIENT_ID

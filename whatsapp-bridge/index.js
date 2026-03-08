@@ -32,6 +32,11 @@ console.log(`Usando Chromium en: ${CHROMIUM_PATH}`);
 
 const client = new Client({
     authStrategy: new LocalAuth(),
+    // Use local version to avoid injection issues and be more stable
+    webVersionCache: {
+        type: 'local',
+    },
+    webVersion: '2.2318.11',
     puppeteer: {
         headless: true,
         executablePath: CHROMIUM_PATH,
@@ -110,12 +115,28 @@ client.on('message', async message => {
     console.log(`Mensaje recibido de ${message.from} (Número: ${phoneNumber}): ${message.body}`);
 
     try {
-        // Llama a tu API de amael-ia
-        const response = await axios.post(AMAEL_API_URL, {
-            prompt: message.body,
-            // --- CAMBIO CLAVE: Enviar el phoneNumber como user_id ---
+        let payload = {
+            prompt: message.body || "",
             user_id: phoneNumber
-        }, {
+        };
+
+        // --- SOPORTE MULTIMODAL: Manejo de imágenes ---
+        if (message.hasMedia) {
+            console.log('Descargando contenido multimedia...');
+            const media = await message.downloadMedia();
+            if (media && media.mimetype.startsWith('image/')) {
+                console.log(`Imagen recibida (${media.mimetype}). Convirtiendo a base64...`);
+                payload.image = media.data; // media.data ya es base64 en whatsapp-web.js
+
+                // Si el mensaje no trae texto, le ponemos un prompt por defecto
+                if (!payload.prompt) {
+                    payload.prompt = "Analiza esta imagen.";
+                }
+            }
+        }
+
+        // Llama a tu API de amael-ia
+        const response = await axios.post(AMAEL_API_URL, payload, {
             headers: {
                 'Authorization': `Bearer ${AMAEL_JWT_TOKEN}`
             }

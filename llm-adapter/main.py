@@ -19,6 +19,7 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str = DEFAULT_MODEL
     messages: List[ChatMessage]
+    images: Optional[List[str]] = None # Base64 images
     stream: bool = False
     temperature: Optional[float] = 0.7
 
@@ -42,6 +43,10 @@ async def create_chat_completion(request: ChatCompletionRequest):
             "temperature": request.temperature
         }
     }
+
+    # Si se envían imágenes, las agregamos al payload de Ollama
+    if request.images:
+        ollama_payload["images"] = request.images
 
     ollama_url = f"{OLLAMA_BASE_URL}/api/chat"
 

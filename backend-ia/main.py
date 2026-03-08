@@ -20,7 +20,8 @@ import magic # libreria para determinar el tipo de formato en un archivo a inges
 
 
 # --- IMPORTACIONES DE LANGCHAIN ---
-from langchain_ollama import OllamaLLM, OllamaEmbeddings
+from langchain_ollama import OllamaLLM, OllamaEmbeddings, ChatOllama
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -97,9 +98,13 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 
 # --- CONFIGURACIÓN E INICIALIZACIÓN DE IA ---
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama-service:11434")
-LLM_MODEL = "qwen2.5:14b"       # Modelo principal: razonamiento, chat, agente K8s
-EMBED_MODEL = "nomic-embed-text" # Modelo dedicado para embeddings RAG (274 MB, 3x más rápido)
+LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:14b")       # Modelo principal
+VISION_MODEL = os.getenv("LLM_VISION_MODEL", "qwen2.5-vl:7b") # Modelo Vision
+EMBED_MODEL = "nomic-embed-text" 
+
+# Modelos definitivos
 llm = OllamaLLM(model=LLM_MODEL, base_url=OLLAMA_BASE_URL)
+vision_llm = ChatOllama(model=VISION_MODEL, base_url=OLLAMA_BASE_URL)
 
 # --- CONFIGURACIÓN DE CAPA DE DATOS (PHASE 2) ---
 REDIS_HOST = os.getenv("REDIS_HOST", "redis-service")
@@ -292,8 +297,9 @@ def get_history_path_for_id(identifier: str) -> str:
 # --- MODELOS DE DATOS ---
 class ChatRequest(BaseModel):
     prompt: str
-    history: list[dict] = [] # Para recibir el historial del frontend
-    user_id: str = None     # <-- NUEVO: Identificador único del usuario (ej. número de teléfono)
+    history: list[dict] = [] 
+    user_id: str = None     
+    image: str = None  # Base64 string
 
 class ChatResponse(BaseModel):
     response: str
@@ -551,6 +557,43 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
         conversation_history = "\n".join(history_lines)
 
     # 3. Crear el prompt final
+    # Si hay imagen, usamos Vision Model con ChatOllama
+    if request.image:
+        try:
+            # Construir mensajes para ChatOllama
+            content = [
+                {"type": "text", "text": request.prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{request.image}"},
+                },
+            ]
+            
+            # Incorporamos contexto RAG si existe
+            system_content = "Eres Amael, un asistente avanzado. Analiza la imagen y el texto proporcionado."
+            if context:
+                system_content += f"\n\nContexto relevante:\n{context}"
+
+            messages = [
+                SystemMessage(content=system_content),
+                HumanMessage(content=content)
+            ]
+
+            # Invocación multimodal
+            response = vision_llm.invoke(messages)
+            final_response = response.content
+
+            # Guardar en historial
+            save_chat_message(history_id, "user", request.prompt + " [Imagen enviada]")
+            save_chat_message(history_id, "assistant", final_response)
+
+            return ChatResponse(response=final_response)
+
+        except Exception as e:
+            print(f"Error en Vision LLM: {e}")
+            raise HTTPException(status_code=500, detail=f"Error al procesar la imagen con Qwen-VL: {e}")
+
+    # Si no hay imagen, seguimos con el flujo normal de OllamaLLM
     final_prompt = system_prompt_template.format(
         conversation_history=conversation_history,
         request_prompt=request.prompt
@@ -558,7 +601,7 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
     final_prompt = final_prompt.replace("<<<CONTEXT>>>", context)
 
     try:
-        # 4. Invocar al LLM
+        # 4. Invocar al LLM estándar
         response = llm.invoke(final_prompt)
         final_response = response
 
