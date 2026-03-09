@@ -48,4 +48,12 @@ spec:
             name: frontend-service
             port:
               number: 8501
+      # --- REGLA PARA EL TTS (CosyVoice) ---
+      - path: /tts
+        pathType: Prefix
+        backend:
+          service:
+            name: amael-tts-service
+            port:
+              number: 8000
               

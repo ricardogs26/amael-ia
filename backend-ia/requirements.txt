@@ -3,11 +3,13 @@ fastapi
 uvicorn[standard]
 requests
 python-multipart
+httpx
 
 # LangChain Core
 langchain
 langchain-community
 langchain-text-splitters
+langgraph
 
 # Integraciones específicas y actualizadas
 langchain-ollama

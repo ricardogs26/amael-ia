@@ -45,6 +45,10 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "qwen2.5:14b")
 NEW_RELIC_ACCOUNT_ID = os.environ.get("NEW_RELIC_ACCOUNT_ID", "YOUR_ACCOUNT_ID")
 NEW_RELIC_API_KEY = os.environ.get("NEW_RELIC_API_KEY", "YOUR_API_KEY")
 NEW_RELIC_GRAPHQL_URL = "https://api.newrelic.com/graphql"
+PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://kube-prometheus-stack-prometheus.observability.svc.cluster.local:9090")
+GRAFANA_URL = os.environ.get("GRAFANA_URL", "http://kube-prometheus-stack-grafana.observability.svc.cluster.local:80")
+GRAFANA_USER = os.environ.get("GRAFANA_USER", "admin")
+GRAFANA_PASSWORD = os.environ.get("GRAFANA_PASSWORD", "admin")
 
 # Inicializar LLM
 llm = OllamaLLM(model=MODEL_NAME, base_url=OLLAMA_BASE_URL)
@@ -185,6 +189,54 @@ def query_new_relic_tool(query_alias: str) -> str:
     except Exception as e:
         return f"Excepción al conectar con New Relic: {str(e)}"
 
+def query_prometheus(query: str) -> str:
+    """Útil para ejecutar consultas PromQL en Prometheus y obtener métricas del clúster. 
+    Ejemplo de input: 'sum(rate(container_cpu_usage_seconds_total{namespace="amael-ia"}[5m])) by (pod)'"""
+    query = query.strip("'\" \n")
+    try:
+        response = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            if data["status"] == "success":
+                results = data["data"]["result"]
+                # Simplificar la respuesta para el LLM
+                simplified = []
+                for res in results:
+                    metric = res.get("metric", {})
+                    value = res.get("value", [None, None])[1]
+                    simplified.append({"metric": metric, "value": value})
+                return json.dumps(simplified[:10]) # Limitar a 10 resultados para no saturar contexto
+            else:
+                return f"Error en Prometheus: {data.get('error', 'Unknown error')}"
+        else:
+            return f"Error HTTP {response.status_code} al consultar Prometheus."
+    except Exception as e:
+        return f"Excepción al conectar con Prometheus: {str(e)}"
+
+def list_grafana_dashboards(query: str = "") -> str:
+    """Útil para buscar dashboards en Grafana consultando los ConfigMaps del clúster. 
+    Retorna una lista de dashboards disponibles para monitoreo."""
+    try:
+        v1 = client.CoreV1Api()
+        # Buscar ConfigMaps etiquetados como dashboards de grafana en el namespace de observabilidad
+        cms = v1.list_namespaced_config_map(
+            namespace="observability", 
+            label_selector="grafana_dashboard=1"
+        )
+        
+        if not cms.items:
+            return "No se encontraron dashboards registrados en el clúster (vía ConfigMaps)."
+            
+        result = "Dashboards de Kubernetes encontrados en el sistema:\n"
+        for cm in cms.items:
+            title = cm.metadata.name.replace("kube-prometheus-stack-", "").replace("-", " ").title()
+            result += f"- {title} (ConfigMap: {cm.metadata.name})\n"
+        
+        result += "\nNota: Puedes acceder a ellos en la interfaz de Grafana (grafana.richardx.dev)."
+        return result
+    except Exception as e:
+        return f"Excepción al listar dashboards vía K8s API: {str(e)}"
+
 # Definir herramientas para LangChain
 tools = [
     Tool(
@@ -216,6 +268,16 @@ tools = [
         name="New_Relic_Query",
         func=query_new_relic_tool,
         description="Útil para obtener métricas desde New Relic. SOLO PUEDES INGRESAR COMO INPUT UNO DE ESTOS 5 VALORES LITERAMENTE: 'estatus_cluster', 'cpu_cluster', 'ram_cluster', 'cpu_pods', o 'ram_pods'."
+    ),
+    Tool(
+        name="Prometheus_Query",
+        func=query_prometheus,
+        description="Útil para ejecutar consultas PromQL y obtener métricas avanzadas (CPU, RAM, red, etc.) desde Prometheus."
+    ),
+    Tool(
+        name="Listar_Grafana_Dashboards",
+        func=list_grafana_dashboards,
+        description="Útil para buscar dashboards en Grafana y obtener sus URLs."
     )
 ]
 
@@ -225,9 +287,27 @@ agent = initialize_agent(
     llm, 
     agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, 
     verbose=True,
-    handle_parsing_errors=True,
-    max_iterations=8,
-    early_stopping_method="generate"
+    handle_parsing_errors="Check your output format. Remember to use 'Action:' and 'Action Input:' or 'Final Answer:'.",
+    max_iterations=10,
+    early_stopping_method="generate",
+    agent_kwargs={
+        "prefix": """Eres un SRE (Site Reliability Engineer) Senior y experto en Kubernetes. 
+Tu objetivo es resolver problemas técnicos en el clúster de forma autónoma.
+TIENES PERMISO para ejecutar acciones como listar pods, ver logs, eliminar pods y consultar métricas en Prometheus/New Relic.
+
+Debes seguir SIEMPRE este formato EXACTO:
+Thought: Describe tu razonamiento sobre qué hacer a continuación.
+Action: El nombre de la herramienta a usar (debe ser una de las herramientas listadas abajo).
+Action Input: El parámetro de entrada para la herramienta.
+Observation: El resultado de la herramienta (esto lo recibirás tú).
+... (puedes repetir Thought/Action/Action Input/Observation varias veces)
+Thought: Cuando tengas la respuesta final.
+Final Answer: La respuesta detallada y profesional para el usuario.
+
+Herramientas disponibles:""",
+        "suffix": """Pregunta del usuario: {input}
+{agent_scratchpad}"""
+    }
 )
 
 def extract_final_answer(raw_response: str) -> str:
@@ -251,52 +331,18 @@ async def chat_with_agent(request: AgentRequest):
     AGENT_REQUESTS_TOTAL.inc()
     print(f"Recibiendo petición de {request.user_email}: {request.query}")
     try:
-        final_prompt = agent_prompt.format(query=request.query)
         # Ejecutar el agente con el callback de métricas
-        raw_response = agent.run(final_prompt, callbacks=[metrics_callback])
+        raw_response = agent.run(request.query, callbacks=[metrics_callback])
         clean_response = extract_final_answer(raw_response)
         return {"response": clean_response}
     except Exception as e:
         error_msg = str(e)
         print(f"Agent error: {error_msg}")
-        return {"response": f"El agente tuvo dificultades entendiendo la petición o la herramienta. Error: {error_msg[:100]}... Intenta ser más específico."}
+        return {"response": f"El agente tuvo dificultades entendiendo la petición o la herramienta. Error: {error_msg[:150]}... Intenta ser más específico."}
 
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
-
-agent_prompt = """Eres un SRE (Site Reliability Engineer) Senior y experto en Kubernetes que administra un clúster 'MicroK8s'. Eres un AGENTE AUTÓNOMO con capacidad de toma de decisiones y ejecución, NO un simple chatbot.
-
-## Tu comportamiento es de resolución de problemas (Troubleshooting SRE Real):
-- NO sugieras eliminar un pod fallido sin antes investigar por qué falló.
-- Si un usuario pide revisar el clúster o listar pods:
-   1. Usa 'Listar_Pods'.
-   2. Si detectas pods con problemas ("Failed", "Unknown", "CrashLoopBackOff", "Error"):
-      - INFORMA al usuario del problema.
-      - **DEDUCCIÓN SRE:** Usa INMEDIATAMENTE la herramienta 'Obtener_Logs_Pod' en los pods fallidos para investigar la causa raíz. 
-      - EXPLICA la causa raíz encontrada en los logs al usuario.
-      - SOLO DESPUÉS de explicar la causa, propón soluciones (ej. "Podemos eliminar el pod para que se reinice, ¿procedo?").
-
-## Herramientas disponibles:
-- 'Listar_Namespaces': Muestra todos los namespaces en el clúster.
-- 'Detalle_Namespace': Input OBLIGATORIO: nombre exacto del namespace. Para ver estado y detalles del namespace.
-- 'Listar_Pods': Muestra estado actual de los pods.
-- 'Obtener_Logs_Pod': Input OBLIGATORIO: nombre exacto del pod. Para ver por qué un pod está fallando.
-- 'Eliminar_Pod': Input OBLIGATORIO: nombre exacto del pod. Para borrar pods (útil para forzar reinicio).
-- 'New_Relic_Query': Extrae métricas de CPU/RAM.
-
-## IMPORTANTE para New_Relic_Query: NUNCA inventes consultas NRQL. Solo usa uno de estos 5 alias: 'estatus_cluster', 'cpu_cluster', 'ram_cluster', 'cpu_pods', 'ram_pods'.
-
-## PERMISOS Y AUTONOMÍA (CAPACIDAD DE EJECUCIÓN):
-- TÚ TIENES PERMISO TOTAL para usar todas las herramientas, incluida 'Eliminar_Pod'.
-- NUNCA digas "no tengo la capacidad de ejecutar comandos" o "hazlo tú desde tu terminal". Tienes la herramienta, úsala si el usuario lo autoriza.
-- Eres el operador. Si el usuario te confirma que elimines un pod, lanza la acción inmediatamente con tu herramienta.
-
-## Formato de comunicación:
-Termina SIEMPRE tu respuesta hacia el usuario con:
-Final Answer: [Tu mensaje detallado y profesional para el usuario]
-
-Pregunta del usuario: {query}"""
 
 # --- INSTRUMENTACIÓN ---
 Instrumentator().instrument(app).expose(app)
