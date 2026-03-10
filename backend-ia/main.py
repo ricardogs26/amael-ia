@@ -1071,7 +1071,8 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
                 timeout=120.0
             )
             if response.status_code == 200:
-                return response.json().get("response", "K8s info retrieved.")
+                raw = response.json().get("response", "K8s info retrieved.")
+                return f"```bash\n{raw}\n```"
             return "Error calling K8s agent."
 
         def web_search_tool(query: str) -> str:
@@ -1346,7 +1347,10 @@ async def chat_stream(request: ChatRequest, user: str = Depends(get_current_user
                 headers={"Authorization": f"Bearer {INTERNAL_API_SECRET}"},
                 timeout=120.0,
             )
-            return r.json().get("response", "K8s info.") if r.status_code == 200 else "Error."
+            if r.status_code == 200:
+                raw = r.json().get("response", "K8s info.")
+                return f"```bash\n{raw}\n```"
+            return "Error."
 
         def web_search_tool(query: str) -> str:
             TOOL_CALLS_TOTAL.labels(tool="web_search").inc()

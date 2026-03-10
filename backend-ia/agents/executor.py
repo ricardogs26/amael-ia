@@ -143,15 +143,15 @@ def _run_reasoning_step(
     context_for_llm = _truncate(current_answer, MAX_ANSWER_CHARS, "final_answer")
 
     prompt = (
-        f"Contexto previo: {context_for_llm}\n"
+        f"Contexto previo:\n{context_for_llm}\n\n"
         f"Tarea a realizar: {reasoning_task}\n\n"
         f"Instrucción: Genera una respuesta en ESPAÑOL basada en el contexto anterior.\n"
-        f"FORMATO OBLIGATORIO:\n"
-        f"- Si la respuesta incluye listados de pods, nodos, servicios o cualquier salida de comandos kubectl, "
-        f"envuélvela en un bloque de código markdown con triple backtick y lenguaje 'bash': ```bash ... ```\n"
-        f"- Si incluyes scripts de bash o comandos shell, usa ```bash ... ```\n"
-        f"- Si incluyes manifiestos YAML o JSON, usa ```yaml ... ``` o ```json ... ```\n"
-        f"- El texto explicativo va fuera de los bloques de código, en prosa normal."
+        f"REGLAS DE FORMATO ESTRICTAS:\n"
+        f"1. Si el contexto contiene bloques delimitados por triple backtick (```bash, ```yaml, etc.), "
+        f"DEBES copiarlos EXACTAMENTE en tu respuesta sin reformatearlos ni convertirlos a tablas.\n"
+        f"2. Si generas scripts bash, comandos kubectl o manifiestos YAML, envuélvelos en el bloque correspondiente.\n"
+        f"3. NO conviertas datos tabulares de kubectl en tablas markdown; usa ```bash para preservarlos.\n"
+        f"4. El texto explicativo va fuera de los bloques, en prosa normal."
     )
 
     estimated_tokens = len(prompt) // 4
