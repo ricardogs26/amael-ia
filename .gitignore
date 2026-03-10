@@ -1,3 +1,29 @@
 node_modules/
 whatsapp-bridge/node_modules/
 venv/
+env/
+.env
+
+# Archivos de SO
+.DS_Store
+
+# Archivos Python
+__pycache__/
+*.pyc
+
+# Security and Kubernetes Secrets
+*.secret.yaml
+*secrets.yaml
+!*.template.yaml
+token.json
+*jwt_token*
+*service_account*
+vault.root
+*.root
+unseal_keys*
+vault_token*
+
+# VSCode and IDEs
+.vscode/
+.idea/
+new_token_output.txt

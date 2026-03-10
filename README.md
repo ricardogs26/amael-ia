@@ -7,103 +7,103 @@
 
 > **Amael IA** es una plataforma avanzada de Inteligencia Artificial Autónoma y Multi-Agente enfocada en la asistencia conversacional y la administración automatizada de infraestructuras (DevOps).
 
-Desplegada completamente sobre Kubernetes, Amael IA no solo responde a preguntas generales integrando capacidades **RAG (Retrieval-Augmented Generation)** aisladas por usuario, sino que actúa activamente sobre tu entorno, organizando tareas y administrando clústeres reales con herramientas expertas.
+Desplegada completamente sobre Kubernetes, Amael IA utiliza una arquitectura de orquestación basada en **LangGraph** siguiendo el patrón **Planner → Grouper → Batch Executor → Supervisor**. Esto le permite descomponer tareas complejas, ejecutar herramientas en paralelo y auto-corregirse mediante una capa de retroalimentación de calidad.
 
 ---
 
 ## ✨ Características Principales
 
-*   💬 **Interfaz Conversacional:** Acceso mediante un frontend web moderno en **Streamlit** y conectividad nativa vía **WhatsApp** (`whatsapp-bridge`).
-*   🔒 **Autenticación y Seguridad:** Soporte para **Google OAuth**, encriptado con JWT y persistencia segura de sesiones por perfil.
-*   🧠 **RAG Multiusuario:** Ingesta de PDFs y TXTs con vectorización en **ChromaDB**. Cada usuario tiene su propio espacio de memoria y contexto aislado en un volumen persistente.
-*   🛠️ **DevOps Autónomo (K8s Agent):** Amael administra tu clúster en tiempo real. Puede listar pods, revisar logs, consultar el consumo de recursos (`New Relic`) e incluso **eliminar pods anómalos** directamente desde el chat usando `Langchain agents`.
-*   📅 **Productividad Integrada:** Analiza correos y requerimientos para programar tareas directamente en tu calendario mediante su módulo especializado `productivity-service`.
-*   👁️ **Visión Artificial:** Interacción con modelos de Deep Learning alojados en **TensorFlow Serving** para análisis y clasificación de imágenes subidas en el chat.
+*   💬 **Interfaz Conversacional:** Acceso mediante un frontend web moderno en **Streamlit** y conectividad nativa vía **WhatsApp** (`whatsapp-bridge` v1.2.4), con historiales y RAG **aislados por usuario**.
+*   🔒 **Seguridad & Hardening:** Autenticación **Google OAuth**, encriptado con Vault, validación de prompts anti-inyección, rate limiting mediante Redis y sanitización de outputs.
+*   🧠 **RAG Multiusuario:** Ingesta de documentos con vectorización en **Qdrant**. Cada usuario cuenta con memoria contextual aislada.
+*   🛠️ **DevOps Autónomo (K8s SRE Agent):** Administra el clúster en tiempo real. Lista pods, revisa logs, consulta PromQL/Grafana y ejecuta acciones correctivas (`Eliminar_Pod`).
+*   📅 **Productividad Integrada:** Automatización de agenda mediante integración con **Google Calendar** y **Gmail API** (`productivity-service`).
+*   📊 **Observabilidad Full-Stack:** Monitoreo con **Prometheus, Grafana y Tempo**. Incluye un **Service Map** en tiempo real y dashboards especializados de seguridad y performance.
 
 ---
 
 ## 🏗️ Arquitectura de Microservicios
 
-Amael IA sigue un enfoque de diseño modular nativo de la nube. Cada función especializada recae en un microservicio orquestado por Kubernetes (MicroK8s).
+Amael IA orquestado por **Kubernetes (MicroK8s)** con imágenes en registro privado `registry.richardx.dev`.
 
-### Componentes Clave:
-1.  **`frontend-ia`**: Interfaz de usuario rica desarrollada en Python/Streamlit. Maneja el estado de la sesión, la subida de archivos multimedias y documentos RAG.
-2.  **`backend-ia`**: El "Cerebro Central" (FastAPI). Gestiona la autenticación, el historial conversacional (JSON), el proxy hacia modelos LLM (`ollama`) y rutea de forma inteligente (basado en intenciones semánticas) las peticiones operativas hacia otros micro-agentes especializados.
-3.  **`k8s-agent`**: Agente experto (`ZERO_SHOT_REACT`) con comandos e integraciones embebidas de la API de Kubernetes. Protegido rigurosamente mediante roles (RBAC). Interpreta lenguaje natural para realizar operaciones seguras (`kubectl delete`, `get`, `logs`) e interactúa vía GraphQL con New Relic para dar resúmenes sobre CPU y RAM.
-4.  **`productivity-service`**: Microservicio enfocado en el parseo y organización de calendarios basados en intenciones temporales.
-5.  **`whatsapp-bridge`**: Backend Express.js que interactúa con la API Cloud de Meta, permitiendo iniciar sesíón y chatear con Amael directamente desde WhatsApp manteniendo el mismo historial.
-6.  **`ollama-service` & `tf-serving`**: Capas base de inferencia. Ollama procesa la lógica generativa y los embeddings, mientras que TensorFlow Serving hostea ImageNet/MobileNet para la visión artificial.
+### 🧠 Capa de Inferencia (Single NVIDIA RTX 5070)
+*   **LLM Principal:** `qwen2.5:14b` (alojado en Ollama).
+*   **Embeddings:** `nomic-embed-text` (alojado en Ollama) - 768 dim.
+*   **Voz (TTS):** `CosyVoice-300M` (alojado en `cosyvoice-service`).
 
-### Diagrama Arquitectónico
+### Componentes Core:
+
+| Servicio | Versión | Descripción |
+|---------|---------|-------------|
+| `backend-ia` | `2.11.0` | Orquestador LangGraph, FastAPI. |
+| `k8s-agent` | `1.6.0` | SRE Expert, automatización K8s + Vault. |
+| `productivity-service` | `1.2.0` | Integración Google Workspace. |
+| `frontend-ia` | `2.0.0` | Streamlit Rich-UI, system-token theming. |
+| `whatsapp-bridge` | `1.2.4` | Puppeteer bridge con reintentos y timeout extendido. |
+| `llm-adapter` | `1.0.0` | Proxy OpenAI-compatible hacia Ollama. |
+
+---
+
+### Diagrama de Flujo y Conectividad
 
 ```mermaid
 graph TD
-    subgraph "Interfaces de Usuario (Endpoints)"
-        UI[Frontend Web Streamlit]
-        WA[Dispositivo WhatsApp]
+    subgraph "Interfaces"
+        UI[Frontend Streamlit]
+        WA[WhatsApp App]
     end
 
-    subgraph "APIs y Conectores"
-        GW[WhatsApp Bridge Node.js]
-        BE[Backend IA FastAPI]
-        AUTH[Google OAuth Provider]
+    subgraph "Core API Layer"
+        BE[Backend IA - FastAPI]
+        DB[(PostgreSQL / Redis)]
+        VS[(Qdrant Vector DB)]
+        VA[(HashiCorp Vault)]
     end
 
-    subgraph "Agentes Expertos & Lógica"
-        K8S[K8s Agent LangChain]
-        PROD[Productivity Service]
-        RAG[(ChromaDB Vols por User)]
+    subgraph "Agent Orchestrator (LangGraph)"
+        BE --> PLAN[Planner]
+        PLAN --> GRP[Grouper]
+        GRP --> EXEC[Batch Executor]
+        EXEC --> SUP[Supervisor]
+        SUP -- REPLAN --> PLAN
     end
 
-    subgraph "Capa de Inferencia (AI Models)"
-        OLLAMA[Ollama LLM & Embeddings]
-        TF[TensorFlow Serving]
+    subgraph "Expert Agents"
+        K8S[K8s Agent - SRE]
+        PROD[Productivity - Google]
     end
 
-    subgraph "Infraestructura & Telemetría"
-        KUBE(MicroK8s Control Plane)
-        NR(New Relic Platform)
+    subgraph "Inference Providers"
+        OL[Ollama - qwen2.5:14b]
+        TF[TF Serving]
+        CV[CosyVoice - TTS]
     end
 
-    %% Flujos de ingreso
-    UI -->|JWT Auth & Chat JSON| BE
-    UI <-->|Login Redirect| AUTH
-    WA -->|Webhook Payload| GW
-    GW -->|REST Push| BE
-    
-    %% Ruteo del Backend
-    BE <-->|Conversación Gen & Embeddings| RAG
-    BE <-->|Inferencia Básica| OLLAMA
-    BE -->|Si detecta palabras de infraestructura| K8S
-    BE -->|Si detecta 'Organiza mi día'| PROD
-    BE -->|Si envía Imagen| TF
-    
-    %% Acciones del K8s Agent
-    K8S <-->|Reflexión de Acción| OLLAMA
-    K8S -->|Seguridad RBAC Delete/Get| KUBE
-    K8S -->|Queries NRQL| NR
+    %% Connectivity
+    UI & WA <--> BE
+    BE <--> DB & VS & VA
+    BE <--> OL & TF
+    EXEC --> K8S & PROD
+    K8S -->|Action| KUBE[K8s API]
+    K8S -->|Metrics| PROM[Prometheus / Grafana]
+    PROD -->|Sync| GAPI[Google API]
 ```
 
 ---
 
-## 🚀 Despliegue Rápido y Flujo de Desarrollo
+## 🚀 Despliegue (Manual CI/CD)
 
-Todo el despliegue está contenerizado usando **Docker** y alojado en un `registry` local.
-Los manifiestos YAML de Kubernetes se encuentran dentro de la carpeta `k8s/` y describen todos los recursos necesarios (ConfigMaps, Secrets, PVCs, Deployments y Services) para configurar el espacio de trabajo `amael-ia` de cero.
-
-### Guía Rápida:
-1. Asegurarte que el registro de imágenes esté corriendo y tus DNS (`registry.richardx.dev`) estén propagados a los nodos físicos de MicroK8s.
-2. Contar con un `.env` que contenga las credenciales (`JWT_SECRET`, tokens OAuth de Google y WhatsApp, y API Keys de New Relic).
-3. Construir la imagen de un microservicio específico y luego aplicarlo en el clúster usando la CLI o herramientas GitOps. Ejemplo:
 ```bash
-cd k8s-agent
-docker build -t registry.richardx.dev/k8s-agent:latest .
-docker push registry.richardx.dev/k8s-agent:latest
-kubectl apply -f ../k8s/19.-k8s-agent-deployment.yaml
-kubectl rollout restart deployment k8s-agent-deployment -n amael-ia
+# 1. Build & Push
+docker build -t registry.richardx.dev/<service>:<tag> ./<service>/
+docker push registry.richardx.dev/<service>:<tag>
+
+# 2. Deploy
+kubectl apply -f k8s/<manifest>.yaml -n amael-ia
+kubectl rollout restart deployment <service> -n amael-ia
 ```
 
-## 🔐 Seguridad y Limitaciones
-* Todas las acciones sobre el clúster están delimitadas con el namespace `-n amael-ia` para aislar el alcance del IA.
-* El RBAC de k8s provee permisos exactos basándose en el principio de mínimo privilegio (`get, list, delete`).
-* Queda **restringido** para el K8s Agent buscar o listar credenciales, APIs, Secrets o Tokens dentro de Kubernetes para prevenir brechas de seguridad informando todo por chat.
+## 🔐 Seguridad y Privacidad
+*   **Vault Integration:** Tokens de Google OAuth se almacenan cifrados por usuario.
+*   **RBAC strico:** El agente de K8s está restringido al namespace `amael-ia`.
+*   **Output Sanitization:** Redacción automática de tokens `hvs.*`, JWTs y passwords en las respuestas del bot.

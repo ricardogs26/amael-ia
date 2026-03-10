@@ -9,3 +9,9 @@ python-dotenv
 pydantic-settings
 langchain-ollama
 langchain-community
+hvac
+# P7: OpenTelemetry for service map tracing
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-grpc
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-httpx

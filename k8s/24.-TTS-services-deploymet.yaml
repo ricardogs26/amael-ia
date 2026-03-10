@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amael-tts
+  namespace: amael-ia
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: amael-tts
+  template:
+    metadata:
+      labels:
+        app: amael-tts
+    spec:
+      containers:
+      - name: cosyvoice
+        image: registry.richardx.dev/cosyvoice-service:0.01 # Nombre de tu nueva imagen
+        ports:
+        - containerPort: 8000
+        resources:
+          limits:
+            # SIN nvidia.com/gpu
+            memory: "4Gi"
+            cpu: "4" # Importante: Asignar CPUs suficientes para que hable rápido
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          failureThreshold: 30
+          periodSeconds: 10

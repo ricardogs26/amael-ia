@@ -1,10 +1,16 @@
 # generate_service_token.py
-from jose import JWTError, jwt
+import os
+from jose import jwt
+from datetime import datetime, timedelta
 
 
 # --- CONFIGURACIÓN ---
 # Debe ser exactamente la misma SECRET_KEY y ALGORITHM que en tu main.py
-SECRET_KEY = "1MwG7Bb27ann6M1nO0kUsuJNYHehlE" # ¡MUY IMPORTANTE!
+# Ahora se requiere pasar como variable de exportación o entorno
+SECRET_KEY = os.environ.get("JWT_SECRET_KEY")
+if not SECRET_KEY:
+    raise ValueError("Debes configurar la variable de entorno JWT_SECRET_KEY antes de ejecutar este script.")
+
 ALGORITHM = "HS256"
 
 # El email del "usuario de servicio" que añadiste a la lista blanca

@@ -3,14 +3,21 @@ fastapi
 uvicorn[standard]
 requests
 python-multipart
+httpx
 
 # LangChain Core
 langchain
 langchain-community
+langchain-text-splitters
+langgraph
 
 # Integraciones específicas y actualizadas
 langchain-ollama
 langchain-chroma
+langchain-qdrant
+redis
+psycopg2-binary
+minio
 
 # Dependencias para procesamiento de documentos
 pypdf
@@ -23,3 +30,11 @@ itsdangerous
 Pillow
 numpy
 python-magic
+prometheus-fastapi-instrumentator
+prometheus-client
+
+# OpenTelemetry — distributed tracing (spans → otel-collector → Tempo → Grafana)
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-grpc
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-httpx

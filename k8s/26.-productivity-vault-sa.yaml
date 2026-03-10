@@ -1,0 +1,8 @@
+---
+# ServiceAccount dedicado para el productivity-service
+# Vault usará este SA para autenticar el pod via Kubernetes auth method
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: productivity-service-sa
+  namespace: amael-ia
