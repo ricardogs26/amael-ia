@@ -145,7 +145,13 @@ def _run_reasoning_step(
     prompt = (
         f"Contexto previo: {context_for_llm}\n"
         f"Tarea a realizar: {reasoning_task}\n\n"
-        f"Instrucción: Genera una respuesta en ESPAÑOL basada en el contexto anterior."
+        f"Instrucción: Genera una respuesta en ESPAÑOL basada en el contexto anterior.\n"
+        f"FORMATO OBLIGATORIO:\n"
+        f"- Si la respuesta incluye listados de pods, nodos, servicios o cualquier salida de comandos kubectl, "
+        f"envuélvela en un bloque de código markdown con triple backtick y lenguaje 'bash': ```bash ... ```\n"
+        f"- Si incluyes scripts de bash o comandos shell, usa ```bash ... ```\n"
+        f"- Si incluyes manifiestos YAML o JSON, usa ```yaml ... ``` o ```json ... ```\n"
+        f"- El texto explicativo va fuera de los bloques de código, en prosa normal."
     )
 
     estimated_tokens = len(prompt) // 4
