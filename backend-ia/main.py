@@ -617,6 +617,56 @@ async def auth_callback(request: Request):
         raise HTTPException(status_code=500, detail=f"Error en la autenticación con Google: {e}")
 
 # --- ENDPOINTS DE LA APLICACIÓN (ahora protegidos y multiusuario) ---
+
+# Currencies/tickers detected → use exchange rate API instead of DDG
+_CURRENCY_KEYWORDS = {"dolar", "dollar", "usd", "euro", "eur", "tipo de cambio",
+                       "precio dolar", "cotizacion", "cotización", "divisas", "forex"}
+
+def _web_search(query: str) -> str:
+    """Web search: exchange rate API for currency queries, DuckDuckGo for the rest."""
+    q_lower = query.lower()
+
+    # ── Fast path: currency rates via free API ────────────────────────────────
+    if any(kw in q_lower for kw in _CURRENCY_KEYWORDS):
+        try:
+            r = _http_client.get("https://open.er-api.com/v6/latest/USD", timeout=10.0)
+            if r.status_code == 200:
+                data = r.json()
+                rates = data.get("rates", {})
+                updated = data.get("time_last_update_utc", "")
+                mxn = rates.get("MXN")
+                eur = rates.get("EUR")
+                cad = rates.get("CAD")
+                gbp = rates.get("GBP")
+                lines = ["**Tipo de cambio actual (base USD):**"]
+                if mxn: lines.append(f"• 1 USD = **{mxn:.4f} MXN** (Peso Mexicano)")
+                if eur: lines.append(f"• 1 USD = **{eur:.4f} EUR** (Euro)")
+                if cad: lines.append(f"• 1 USD = **{cad:.4f} CAD** (Dólar Canadiense)")
+                if gbp: lines.append(f"• 1 USD = **{gbp:.4f} GBP** (Libra Esterlina)")
+                lines.append(f"\nActualizado: {updated}\nFuente: open.er-api.com")
+                return "\n".join(lines)
+        except Exception as e:
+            logger.warning(f"[WEB_SEARCH] Exchange rate API falló: {e}")
+
+    # ── General search via DuckDuckGo ─────────────────────────────────────────
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, region="mx-es", safesearch="off",
+                                     timelimit="m", max_results=5))
+        if not results:
+            return "No se encontraron resultados para la búsqueda."
+        lines = []
+        for r in results:
+            title = r.get("title", "")
+            body = r.get("body", "")
+            href = r.get("href", "")
+            lines.append(f"**{title}**\n{body}\nFuente: {href}")
+        return "\n\n---\n\n".join(lines)
+    except Exception as e:
+        return f"Error en búsqueda web: {e}"
+
+
 def _extract_docx_text(content: bytes) -> str:
     """Extrae texto plano de un archivo DOCX."""
     from docx import Document as DocxDocument
@@ -1026,21 +1076,7 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
 
         def web_search_tool(query: str) -> str:
             TOOL_CALLS_TOTAL.labels(tool="web_search").inc()
-            try:
-                from duckduckgo_search import DDGS
-                with DDGS() as ddgs:
-                    results = list(ddgs.text(query, max_results=5))
-                if not results:
-                    return "No se encontraron resultados para la búsqueda."
-                lines = []
-                for r in results:
-                    title = r.get("title", "")
-                    body = r.get("body", "")
-                    href = r.get("href", "")
-                    lines.append(f"**{title}**\n{body}\nFuente: {href}")
-                return "\n\n---\n\n".join(lines)
-            except Exception as e:
-                return f"Error en búsqueda web: {e}"
+            return _web_search(query)
 
         tools_map = {
             "rag": rag_tool,
@@ -1314,18 +1350,7 @@ async def chat_stream(request: ChatRequest, user: str = Depends(get_current_user
 
         def web_search_tool(query: str) -> str:
             TOOL_CALLS_TOTAL.labels(tool="web_search").inc()
-            try:
-                from duckduckgo_search import DDGS
-                with DDGS() as ddgs:
-                    results = list(ddgs.text(query, max_results=5))
-                if not results:
-                    return "No se encontraron resultados para la búsqueda."
-                lines = []
-                for r in results:
-                    lines.append(f"**{r.get('title','')}**\n{r.get('body','')}\nFuente: {r.get('href','')}")
-                return "\n\n---\n\n".join(lines)
-            except Exception as e:
-                return f"Error en búsqueda web: {e}"
+            return _web_search(query)
 
         orch = get_orchestrator(redis_client=redis_client)
         initial_context = user_memory_context  # Memory Agent v1: inyectar perfil del usuario
