@@ -864,9 +864,9 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
             async with httpx.AsyncClient() as client:
                 response = await client.post(
                     f"{PRODUCTIVITY_SERVICE_URL}/organize",
-                    json={"user_email": effective_user}, # Pasamos el email del usuario
+                    params={"user_email": effective_user},
                     headers=headers,
-                    timeout=60.0 # La operación puede tardar
+                    timeout=60.0
                 )
                 response.raise_for_status() # Lanza un error si la petición falló (ej. 500)
                 
@@ -1048,7 +1048,7 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
             headers = {"Authorization": f"Bearer {INTERNAL_API_SECRET}"}
             response = _http_client.post(
                 f"{PRODUCTIVITY_SERVICE_URL}/organize",
-                json={"user_email": effective_user},
+                params={"user_email": effective_user},
                 headers=headers,
                 timeout=60.0
             )
@@ -1330,7 +1330,7 @@ async def chat_stream(request: ChatRequest, user: str = Depends(get_current_user
             TOOL_CALLS_TOTAL.labels(tool="productivity").inc()
             r = _http_client.post(
                 f"{PRODUCTIVITY_SERVICE_URL}/organize",
-                json={"user_email": effective_user},
+                params={"user_email": effective_user},
                 headers={"Authorization": f"Bearer {INTERNAL_API_SECRET}"},
                 timeout=60.0,
             )
@@ -1829,8 +1829,8 @@ async def _get_calendar_brief(user_id: str) -> str:
         r = await asyncio.to_thread(
             _http_client.post,
             f"{PRODUCTIVITY_SERVICE_URL}/organize",
-            json={"user_email": user_id},
             headers={"Authorization": f"Bearer {INTERNAL_API_SECRET}"},
+            params={"user_email": user_id},
             timeout=60.0,
         )
         data = r.json() if r.status_code == 200 else {}
