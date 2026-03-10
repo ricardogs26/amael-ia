@@ -1970,12 +1970,14 @@ Genera su briefing ejecutivo matutino. Hoy es {today}.
 
 {f"📰 NOTICIAS DEL DÍA:{chr(10)}{news_text}" if news_text else ""}
 
+REGLA CRÍTICA: USA ÚNICAMENTE la información proporcionada arriba. NUNCA inventes eventos, reuniones, citas ni datos que no estén en el contexto. Si una sección dice "Sin eventos" o "Sin datos", repórtalo tal cual.
+
 Genera el briefing ejecutivo con este formato WhatsApp (*negritas*, emojis, saltos de línea):
 1. 🌅 Saludo ejecutivo personalizado con el día y fecha
-2. 📅 Agenda: eventos importantes del día (máximo 3)
-3. 🖥️ Infraestructura: estado del clúster (✅ OK o ⚠️ alertas)
-4. 🎯 Prioridad del día: el objetivo más relevante con una acción concreta
-5. 📰 Una noticia relevante del sector (la más estratégica)
+2. 📅 Agenda: si hay eventos en AGENDA DE HOY, lista máximo 3; si dice "Sin eventos", escribe "📅 *Agenda limpia* — sin reuniones programadas hoy."
+3. 🖥️ Infraestructura: estado real del clúster según ESTADO DEL CLÚSTER (✅ OK o ⚠️ alertas)
+4. 🎯 Prioridad del día: solo si hay objetivos en OBJETIVOS ACTIVOS; si no hay, omite esta sección
+5. 📰 Una noticia del sector si está disponible en NOTICIAS DEL DÍA
 6. 💡 Una pregunta de reflexión estratégica para el día
 
 Tono: ejecutivo, conciso, orientado a la acción. Máximo 350 palabras."""
