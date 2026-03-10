@@ -160,6 +160,10 @@ _embeddings = OllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_BASE_URL)
 # P5-4: Persistent httpx client with connection pooling for internal service calls
 _http_client = httpx.Client(timeout=120.0)
 
+# Module-level LLM for document generation (longer context, higher quality)
+from langchain_ollama import OllamaLLM as _OllamaLLM
+_llm_doc = _OllamaLLM(model=LLM_MODEL, base_url=OLLAMA_BASE_URL, num_predict=2000)
+
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "postgres-service")
 POSTGRES_DB = os.getenv("POSTGRES_DB", "amael_db")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "amael_user")
@@ -1079,11 +1083,32 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
             TOOL_CALLS_TOTAL.labels(tool="web_search").inc()
             return _web_search(query)
 
+        def document_tool(query: str) -> str:
+            TOOL_CALLS_TOTAL.labels(tool="document").inc()
+            user_ctx = get_user_context(effective_user)
+            import datetime as _dt
+            today_str = _dt.date.today().strftime("%d de %B de %Y")
+            doc_prompt = (
+                f"Eres un redactor experto en documentos institucionales formales en español mexicano.\n"
+                f"Fecha de hoy: {today_str}\n"
+                f"{f'Perfil del autor: {user_ctx}' if user_ctx else ''}\n\n"
+                f"Redacta el siguiente documento institucional: {query}\n\n"
+                f"REGLAS:\n"
+                f"1. Usa formato institucional formal con: encabezado, destinatario, cuerpo, conclusión y firma.\n"
+                f"2. Usa markdown: # para título, ## para secciones, **negrita** para campos clave.\n"
+                f"3. Incluye fecha, cargo del firmante y espacio para firma al final.\n"
+                f"4. El documento debe estar listo para usar sin edición adicional.\n"
+                f"5. Responde ÚNICAMENTE con el documento, sin comentarios previos ni posteriores."
+            )
+            content = _llm_doc.invoke(doc_prompt)
+            return f"[DOCUMENT_START]\n{content}\n[DOCUMENT_END]"
+
         tools_map = {
             "rag": rag_tool,
             "productivity": productivity_tool,
             "k8s": k8s_tool,
             "web_search": web_search_tool,
+            "document": document_tool,
         }
 
         # P5-2: Reuse cached compiled orchestrator (compiled once at first request)
@@ -1356,6 +1381,26 @@ async def chat_stream(request: ChatRequest, user: str = Depends(get_current_user
             TOOL_CALLS_TOTAL.labels(tool="web_search").inc()
             return _web_search(query)
 
+        def document_tool(query: str) -> str:
+            TOOL_CALLS_TOTAL.labels(tool="document").inc()
+            user_ctx = get_user_context(effective_user)
+            import datetime as _dt
+            today_str = _dt.date.today().strftime("%d de %B de %Y")
+            doc_prompt = (
+                f"Eres un redactor experto en documentos institucionales formales en español mexicano.\n"
+                f"Fecha de hoy: {today_str}\n"
+                f"{f'Perfil del autor: {user_ctx}' if user_ctx else ''}\n\n"
+                f"Redacta el siguiente documento institucional: {query}\n\n"
+                f"REGLAS:\n"
+                f"1. Usa formato institucional formal con: encabezado, destinatario, cuerpo, conclusión y firma.\n"
+                f"2. Usa markdown: # para título, ## para secciones, **negrita** para campos clave.\n"
+                f"3. Incluye fecha, cargo del firmante y espacio para firma al final.\n"
+                f"4. El documento debe estar listo para usar sin edición adicional.\n"
+                f"5. Responde ÚNICAMENTE con el documento, sin comentarios previos ni posteriores."
+            )
+            content = _llm_doc.invoke(doc_prompt)
+            return f"[DOCUMENT_START]\n{content}\n[DOCUMENT_END]"
+
         orch = get_orchestrator(redis_client=redis_client)
         initial_context = user_memory_context  # Memory Agent v1: inyectar perfil del usuario
         state = {
@@ -1365,7 +1410,7 @@ async def chat_stream(request: ChatRequest, user: str = Depends(get_current_user
             "user_id": effective_user, "retry_count": 0,
             "supervisor_score": 0, "supervisor_reason": "",
             "tools_map": {"rag": rag_tool, "productivity": productivity_tool,
-                          "k8s": k8s_tool, "web_search": web_search_tool},
+                          "k8s": k8s_tool, "web_search": web_search_tool, "document": document_tool},
         }
         final_state = orch.invoke(state)
         answer = final_state.get("final_answer") or "Lo siento, no pude generar una respuesta."
@@ -1811,6 +1856,26 @@ async def create_goal(body: GoalCreate, user: str = Depends(get_current_user)):
 # TAREA #5 — Day Planner matutino
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def _get_daily_news() -> str:
+    """Obtiene 3 noticias relevantes del día sobre AI, infraestructura y gobierno digital."""
+    topics = [
+        "inteligencia artificial gobierno digital Mexico 2025",
+        "Kubernetes infraestructura cloud noticias",
+        "transformacion digital instituciones publicas",
+    ]
+    news_parts = []
+    for topic in topics:
+        try:
+            result = await asyncio.to_thread(_web_search, topic)
+            # Take first 300 chars of the result as a headline summary
+            first_line = result.strip().split('\n')[0][:280]
+            if first_line and "Error" not in first_line:
+                news_parts.append(f"• {first_line}")
+        except Exception:
+            pass
+    return "\n".join(news_parts) if news_parts else ""
+
+
 async def _get_k8s_health_brief(user_id: str) -> str:
     """Obtiene un resumen breve del estado del cluster via k8s-agent."""
     try:
@@ -1883,32 +1948,37 @@ async def daily_planner(request: Request):
     import datetime as _dt
     today = _dt.date.today().strftime("%A %d de %B de %Y")
 
-    # Recopilar contexto en paralelo
-    k8s_health, calendar_summary, goals_text, user_ctx = await asyncio.gather(
+    # Recopilar todo el contexto en paralelo
+    k8s_health, calendar_summary, goals_text, user_ctx, news_text = await asyncio.gather(
         _get_k8s_health_brief(user_id),
         _get_calendar_brief(user_id),
         _get_active_goals_text(user_id),
         asyncio.to_thread(get_user_context, user_id),
+        _get_daily_news(),
     )
 
-    plan_prompt = f"""Genera un plan del día conciso para el usuario. Hoy es {today}.
+    plan_prompt = f"""Eres el asistente ejecutivo personal de un Subdirector de Infraestructura Digital.
+Genera su briefing ejecutivo matutino. Hoy es {today}.
 
-{f"Perfil del usuario:{chr(10)}{user_ctx}" if user_ctx else ""}
+{f"Perfil:{chr(10)}{user_ctx}" if user_ctx else ""}
 
-{f"Estado del cluster Kubernetes:{chr(10)}{k8s_health}" if k8s_health else ""}
+{f"📅 AGENDA DE HOY:{chr(10)}{calendar_summary}" if calendar_summary else "📅 Sin eventos registrados en el calendario."}
 
-{f"Agenda de hoy:{chr(10)}{calendar_summary}" if calendar_summary else ""}
+{f"🖥️ ESTADO DEL CLÚSTER:{chr(10)}{k8s_health}" if k8s_health else "🖥️ Clúster: Sin datos disponibles."}
 
-{f"Objetivos activos:{chr(10)}{goals_text}" if goals_text else ""}
+{f"🎯 OBJETIVOS ACTIVOS:{chr(10)}{goals_text}" if goals_text else "🎯 Sin objetivos activos registrados."}
 
-Genera un mensaje de buenos días con:
-1. Saludo breve personalizado
-2. Resumen del calendario del día (si hay eventos)
-3. Alertas del cluster (si hay problemas, si no: ✅ Cluster OK)
-4. Un objetivo del día (el más relevante de los activos)
-5. Una pregunta de confirmación corta al final
+{f"📰 NOTICIAS DEL DÍA:{chr(10)}{news_text}" if news_text else ""}
 
-Formato WhatsApp: usa *negritas*, emojis y saltos de línea. Máximo 300 palabras."""
+Genera el briefing ejecutivo con este formato WhatsApp (*negritas*, emojis, saltos de línea):
+1. 🌅 Saludo ejecutivo personalizado con el día y fecha
+2. 📅 Agenda: eventos importantes del día (máximo 3)
+3. 🖥️ Infraestructura: estado del clúster (✅ OK o ⚠️ alertas)
+4. 🎯 Prioridad del día: el objetivo más relevante con una acción concreta
+5. 📰 Una noticia relevante del sector (la más estratégica)
+6. 💡 Una pregunta de reflexión estratégica para el día
+
+Tono: ejecutivo, conciso, orientado a la acción. Máximo 350 palabras."""
 
     try:
         from langchain_ollama import ChatOllama as _CO

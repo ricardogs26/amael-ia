@@ -102,6 +102,15 @@ def _run_tool_step(step: str, state: AgentState, tools_map: Dict[str, Any]) -> s
                     EXECUTOR_ERRORS_TOTAL.labels(step_type="WEB_SEARCH").inc()
                     result = "Error: Herramienta de búsqueda web no disponible."
 
+            elif step.startswith("DOCUMENT_TOOL:"):
+                query = step[len("DOCUMENT_TOOL:"):].strip()
+                doc_func = tools_map.get("document")
+                if doc_func:
+                    result = doc_func(query)
+                else:
+                    EXECUTOR_ERRORS_TOTAL.labels(step_type="DOCUMENT_TOOL").inc()
+                    result = "Error: Herramienta de documentos no disponible."
+
         except Exception as exc:
             EXECUTOR_ERRORS_TOTAL.labels(step_type=stype).inc()
             logger.error(f"[EXECUTOR] Error en {stype}: {exc}", exc_info=True)

@@ -105,6 +105,130 @@ function IcoHamburger() {
   )
 }
 
+// ── Profile Modal ─────────────────────────────────────────────────────────────
+function ProfileModal({ token, onClose }: { token: string; onClose: () => void }) {
+  const [name,        setName]        = useState('')
+  const [role,        setRole]        = useState('')
+  const [institution, setInstitution] = useState('')
+  const [timezone,    setTimezone]    = useState('America/Mexico_City')
+  const [saving,      setSaving]      = useState(false)
+  const [saved,       setSaved]       = useState(false)
+
+  useEffect(() => {
+    fetch(`${BACKEND}/memory/profile`, { headers: { Authorization: `Bearer ${token}` } })
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        if (!d) return
+        setName(d.display_name || '')
+        setTimezone(d.timezone || 'America/Mexico_City')
+        setRole(d.preferences?.role || '')
+        setInstitution(d.preferences?.institution || '')
+      })
+      .catch(() => {})
+  }, [token])
+
+  const save = async () => {
+    setSaving(true)
+    await fetch(`${BACKEND}/memory/profile`, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ display_name: name, timezone, preferences: { role, institution } }),
+    })
+    setSaving(false)
+    setSaved(true)
+    setTimeout(() => { setSaved(false); onClose() }, 1200)
+  }
+
+  const fieldStyle: React.CSSProperties = {
+    width: '100%', background: 'var(--input-bg)', border: '1px solid var(--border)',
+    borderRadius: '8px', padding: '10px 14px', fontSize: '14px',
+    color: 'var(--text-primary)', outline: 'none', boxSizing: 'border-box',
+    fontFamily: 'Inter, sans-serif',
+  }
+  const labelStyle: React.CSSProperties = {
+    fontSize: '12px', fontWeight: 600, color: 'var(--text-secondary)',
+    textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '6px', display: 'block',
+  }
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 500,
+      background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(6px)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px',
+    }} onClick={e => { if (e.target === e.currentTarget) onClose() }}>
+      <div style={{
+        background: 'var(--bg-surface)', border: '1px solid var(--border)',
+        borderRadius: '16px', padding: '28px', width: '100%', maxWidth: '460px',
+        boxShadow: '0 24px 64px rgba(0,0,0,0.4)',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '24px' }}>
+          <div>
+            <h2 style={{ fontSize: '18px', fontWeight: 700, color: 'var(--text-primary)', margin: 0 }}>Mi perfil</h2>
+            <p style={{ fontSize: '13px', color: 'var(--text-secondary)', margin: '4px 0 0' }}>
+              Esta información personaliza tus documentos y el briefing diario
+            </p>
+          </div>
+          <button onClick={onClose} style={{
+            background: 'none', border: 'none', cursor: 'pointer',
+            color: 'var(--text-disabled)', fontSize: '20px', lineHeight: 1, padding: '4px',
+          }}>✕</button>
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+          <div>
+            <label style={labelStyle}>Nombre completo</label>
+            <input value={name} onChange={e => setName(e.target.value)} placeholder="Ej. Ricardo Guzmán"
+              style={fieldStyle}
+              onFocus={e => (e.currentTarget.style.borderColor = 'var(--border-focus)')}
+              onBlur={e => (e.currentTarget.style.borderColor = 'var(--border)')} />
+          </div>
+          <div>
+            <label style={labelStyle}>Cargo</label>
+            <input value={role} onChange={e => setRole(e.target.value)}
+              placeholder="Ej. Subdirector de Infraestructura Digital"
+              style={fieldStyle}
+              onFocus={e => (e.currentTarget.style.borderColor = 'var(--border-focus)')}
+              onBlur={e => (e.currentTarget.style.borderColor = 'var(--border)')} />
+          </div>
+          <div>
+            <label style={labelStyle}>Institución</label>
+            <input value={institution} onChange={e => setInstitution(e.target.value)}
+              placeholder="Ej. Secretaría de Hacienda"
+              style={fieldStyle}
+              onFocus={e => (e.currentTarget.style.borderColor = 'var(--border-focus)')}
+              onBlur={e => (e.currentTarget.style.borderColor = 'var(--border)')} />
+          </div>
+          <div>
+            <label style={labelStyle}>Zona horaria</label>
+            <select value={timezone} onChange={e => setTimezone(e.target.value)} style={fieldStyle}>
+              <option value="America/Mexico_City">Ciudad de México (CST/CDT)</option>
+              <option value="America/Monterrey">Monterrey (CST/CDT)</option>
+              <option value="America/Tijuana">Tijuana (PST/PDT)</option>
+              <option value="America/Cancun">Cancún (EST)</option>
+            </select>
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', gap: '10px', marginTop: '24px' }}>
+          <button onClick={onClose} style={{
+            flex: 1, padding: '11px', borderRadius: '8px',
+            background: 'none', border: '1px solid var(--border)',
+            color: 'var(--text-secondary)', cursor: 'pointer', fontSize: '14px',
+          }}>Cancelar</button>
+          <button onClick={save} disabled={saving} style={{
+            flex: 2, padding: '11px', borderRadius: '8px',
+            background: saved ? '#22c55e' : 'var(--primary)',
+            border: 'none', color: '#fff', cursor: saving ? 'wait' : 'pointer',
+            fontSize: '14px', fontWeight: 600, transition: 'background .2s',
+          }}>
+            {saved ? '✓ Guardado' : saving ? 'Guardando…' : 'Guardar perfil'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function Chat({ token, userName, userPicture, onLogout }: Props) {
   const [messages,        setMessages]        = useState<Msg[]>([])
   const [conversations,   setConversations]   = useState<Conv[]>([])
@@ -116,6 +240,7 @@ export default function Chat({ token, userName, userPicture, onLogout }: Props) 
   const [feedback,        setFeedback]        = useState<Record<number, 'positive' | 'negative'>>({})
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [isMobile, setIsMobile] = useState(false)
+  const [showProfile, setShowProfile] = useState(false)
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [uploadStatus, setUploadStatus] = useState<'idle' | 'uploading' | 'done' | 'error'>('idle')
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -404,7 +529,13 @@ export default function Chat({ token, userName, userPicture, onLogout }: Props) 
         onRename={renameConversation}
         onDelete={deleteConversation}
         onLogout={onLogout}
+        onProfile={() => setShowProfile(true)}
       />
+
+      {/* Profile modal */}
+      {showProfile && (
+        <ProfileModal token={token} onClose={() => setShowProfile(false)} />
+      )}
 
       {/* Main chat column */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', minWidth: 0 }}>

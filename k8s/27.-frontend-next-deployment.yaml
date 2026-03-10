@@ -16,7 +16,7 @@ spec:
       imagePullSecrets: []
       containers:
       - name: frontend-next-container
-        image: registry.richardx.dev/frontend-next:1.0.8
+        image: registry.richardx.dev/frontend-next:1.1.0
         imagePullPolicy: Always
         ports:
         - containerPort: 3000

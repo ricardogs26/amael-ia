@@ -14,10 +14,25 @@ interface Props {
 type Block =
   | { kind: 'text';       text: string }
   | { kind: 'code';       lang: string; code: string }
+  | { kind: 'document';   content: string }
   | { kind: 'image-b64'; data: string }
   | { kind: 'image-url'; url:  string }
 
 const TERMINAL_LANGS = new Set(['bash', 'sh', 'zsh', 'shell', 'kubectl', 'terminal', 'console', ''])
+
+/** Split text into text/code/document blocks */
+function splitDocuments(text: string): Block[] {
+  const out: Block[] = []
+  const re = /\[DOCUMENT_START\]\n?([\s\S]*?)\n?\[DOCUMENT_END\]/g
+  let last = 0; let m: RegExpExecArray | null
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) out.push({ kind: 'text', text: text.slice(last, m.index) })
+    out.push({ kind: 'document', content: m[1].trim() })
+    last = m.index + m[0].length
+  }
+  if (last < text.length) out.push({ kind: 'text', text: text.slice(last) })
+  return out
+}
 
 /** Split text into text/code blocks on ``` fences */
 function splitCodeFences(text: string): Block[] {
@@ -62,7 +77,17 @@ function parseContent(raw: string): Block[] {
   const tail = remaining.slice(last)
   if (tail) out.push(...splitCodeFences(tail))
 
-  return out.filter(b => !(b.kind === 'text' && !b.text.trim()))
+  // Expand document markers within text blocks
+  const expanded: Block[] = []
+  for (const b of out) {
+    if (b.kind === 'text') {
+      expanded.push(...splitDocuments(b.text))
+    } else {
+      expanded.push(b)
+    }
+  }
+
+  return expanded.filter(b => !(b.kind === 'text' && !b.text.trim()))
 }
 
 // ── CodeBlock — terminal-style for bash/sh/kubectl, editor-style for yaml/json ─
@@ -155,6 +180,81 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
   )
 }
 
+// ── DocumentBlock — renders institutional documents with download button ──────
+function DocumentBlock({ content }: { content: string }) {
+  const [copied, setCopied] = useState(false)
+
+  const download = () => {
+    const blob = new Blob([content], { type: 'text/markdown' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `documento-${new Date().toISOString().slice(0, 10)}.md`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const copy = () => {
+    navigator.clipboard.writeText(content)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
+
+  return (
+    <div style={{
+      margin: '14px 0',
+      border: '1px solid var(--border)',
+      borderRadius: '12px',
+      overflow: 'hidden',
+      boxShadow: '0 2px 16px rgba(0,0,0,0.18)',
+    }}>
+      {/* Header */}
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        padding: '10px 16px',
+        background: 'var(--bg-elevated)',
+        borderBottom: '1px solid var(--border)',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <span style={{ fontSize: '16px' }}>📄</span>
+          <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-secondary)', letterSpacing: '0.03em' }}>
+            DOCUMENTO INSTITUCIONAL
+          </span>
+        </div>
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <button onClick={copy} style={{
+            background: copied ? 'rgba(34,197,94,0.12)' : 'rgba(255,255,255,0.06)',
+            border: '1px solid var(--border)', borderRadius: '6px',
+            color: copied ? '#22c55e' : 'var(--text-secondary)',
+            cursor: 'pointer', fontSize: '12px', padding: '4px 12px',
+            transition: 'all .15s', fontFamily: 'Inter, sans-serif',
+          }}>
+            {copied ? '✓ Copiado' : '⧉ Copiar'}
+          </button>
+          <button onClick={download} style={{
+            background: 'var(--primary)', border: 'none', borderRadius: '6px',
+            color: '#fff', cursor: 'pointer', fontSize: '12px', padding: '4px 12px',
+            transition: 'background .15s', fontFamily: 'Inter, sans-serif', fontWeight: 500,
+          }}
+          onMouseEnter={e => (e.currentTarget.style.background = 'var(--primary-hover)')}
+          onMouseLeave={e => (e.currentTarget.style.background = 'var(--primary)')}
+          >
+            ⬇ Descargar .md
+          </button>
+        </div>
+      </div>
+      {/* Document body — paper look */}
+      <div style={{
+        background: 'var(--bg-surface)',
+        padding: '28px 32px',
+        lineHeight: '1.8',
+      }}>
+        <MarkdownContent text={content} />
+      </div>
+    </div>
+  )
+}
+
 // ── MarkdownContent — plain text + inline markdown (no code fences, handled above) ──
 function MarkdownContent({ text }: { text: string }) {
   return (
@@ -217,6 +317,9 @@ export default function Message({ role, content, ts, isStreaming, feedback, onFe
       }
       if (block.kind === 'code') {
         return <CodeBlock key={i} lang={block.lang} code={block.code} />
+      }
+      if (block.kind === 'document') {
+        return <DocumentBlock key={i} content={block.content} />
       }
       return <MarkdownContent key={i} text={block.text} />
     })
