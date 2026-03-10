@@ -7,3 +7,8 @@ pydantic
 kubernetes
 prometheus-fastapi-instrumentator
 prometheus-client
+# P7: OpenTelemetry for service map tracing
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-grpc
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-requests

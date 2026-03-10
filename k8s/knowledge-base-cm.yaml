@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amael-troubleshooting-guides
+  namespace: amael-ia
+data:
+  whatsapp-bridge-stuck: |
+    # Problema: Whatsapp Bridge "inicializando" o bloqueado
+    
+    ## Síntomas
+    - El pod está en estado 'Running' pero el cliente no avanza.
+    - Los logs muestran "Intentando inicializar el cliente de WhatsApp..." sin éxito.
+    - El estado HTTP (/status) reporta "initializing" por mucho tiempo.
+    
+    ## Causa Raíz
+    Ficheros de bloqueo huérfanos de Chromium (`SingletonLock` y `SingletonSocket`) en el volumen persistente `.wwebjs_auth`.
+    
+    ## Solución Automática
+    1. Ejecutar comando en el pod: `rm /usr/src/app/.wwebjs_auth/session/SingletonLock /usr/src/app/.wwebjs_auth/session/SingletonSocket`
+    2. Reiniciar el pod (borrar el pod para que el Deployment lo recree).
+    
+    ## Comandos para el Agente
+    - `Ejecutar_Comando_Contenedor(pod_name, "rm /usr/src/app/.wwebjs_auth/session/SingletonLock /usr/src/app/.wwebjs_auth/session/SingletonSocket")`
+    - `Eliminar_Pod(pod_name)`
+
+  pod-crash-loop: |
+    # Problema: Pod en CrashLoopBackOff
+    
+    ## Solución
+    1. Obtener logs: `Obtener_Logs_Pod(pod_name)`
+    2. Si es error de conexión a DB, verificar disponibilidad de `postgres-service`.
+    3. Si es OOMKilled, el pod necesita más memoria (notificar al admin).

@@ -6,6 +6,10 @@ from app.models.schemas import OrganizeDayResponse
 
 app = FastAPI(title="Productivity Microservice")
 
+# P7: OpenTelemetry — server-side spans for service map (tracing.py at PYTHONPATH=/app)
+from tracing import instrument_app
+instrument_app(app)
+
 # --- Seguridad para comunicación interna ---
 security = HTTPBearer()
 

@@ -57,42 +57,58 @@ async def create_chat_completion(request: ChatCompletionRequest):
 
     ollama_url = f"{OLLAMA_BASE_URL}/api/chat"
 
+    client = httpx.AsyncClient(timeout=120.0)
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            if request.stream:
-                # Manejo de Streaming (SSE)
-                async def stream_generator():
+        if request.stream:
+            # Manejo de Streaming (SSE)
+            async def stream_generator():
+                start_time = time.time()
+                try:
                     async with client.stream("POST", ollama_url, json=ollama_payload) as response:
                         response.raise_for_status()
                         async for line in response.aiter_lines():
-                            # Ollama devuelve JSON por línea, hay que transformarlo a formato OpenAI SSE
+                            if not line:
+                                continue
+                            
                             import json
                             try:
                                 data = json.loads(line)
-                                # Estructura simulada de respuesta OpenAI stream chunk
+                                if data.get("done"):
+                                    prompt_tokens = data.get("prompt_eval_count", 0)
+                                    completion_tokens = data.get("eval_count", 0)
+                                    latency = time.time() - start_time
+                                    
+                                    LLM_LATENCY_SECONDS.labels(model=target_model).observe(latency)
+                                    LLM_TOKENS_TOTAL.labels(model=target_model, type="prompt").inc(prompt_tokens)
+                                    LLM_TOKENS_TOTAL.labels(model=target_model, type="completion").inc(completion_tokens)
+                                    print(f"[METRICS] Stream finalizado: {prompt_tokens} prompt, {completion_tokens} completion tokens, {latency:.2f}s latency")
+                                
+                                content = data.get("message", {}).get("content", "")
                                 chunk = {
                                     "id": "chatcmpl-local",
                                     "object": "chat.completion.chunk",
-                                    "created": 1234567890,
+                                    "created": int(time.time()),
                                     "model": target_model,
                                     "choices": [{
                                         "index": 0,
-                                        "delta": {
-                                            "content": data.get("message", {}).get("content", "")
-                                        },
-                                        "finish_reason": None
+                                        "delta": { "content": content },
+                                        "finish_reason": "stop" if data.get("done") else None
                                     }]
                                 }
                                 yield f"data: {json.dumps(chunk)}\n\n"
-                            except Exception:
+                            except Exception as e:
+                                print(f"Error parseando linea de Ollama: {e}")
                                 continue
                     yield "data: [DONE]\n\n"
+                finally:
+                    await client.aclose()
 
-                return StreamingResponse(stream_generator(), media_type="text/event-stream")
+            return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
-            else:
-                # Petición síncrona (No streaming)
-                start_time = time.time()
+        else:
+            # Petición síncrona (No streaming)
+            start_time = time.time()
+            async with client:
                 response = await client.post(ollama_url, json=ollama_payload)
                 latency = time.time() - start_time
                 response.raise_for_status()
@@ -109,7 +125,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 openai_response = {
                     "id": "chatcmpl-local",
                     "object": "chat.completion",
-                    "created": 1234567890,
+                    "created": int(time.time()),
                     "model": target_model,
                     "choices": [{
                         "index": 0,
@@ -119,17 +135,19 @@ async def create_chat_completion(request: ChatCompletionRequest):
                         },
                         "finish_reason": "stop"
                     }],
-                    "usage": { # Valores simulados, Ollama a veces devuelve esto en otro nivel
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "total_tokens": 0
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens
                     }
                 }
                 return JSONResponse(content=openai_response)
 
     except httpx.RequestError as exc:
+        await client.aclose()
         raise HTTPException(status_code=503, detail=f"Error conectando con Ollama: {str(exc)}")
     except Exception as e:
+        await client.aclose()
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/llm/health")

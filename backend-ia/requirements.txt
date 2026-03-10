@@ -32,3 +32,9 @@ numpy
 python-magic
 prometheus-fastapi-instrumentator
 prometheus-client
+
+# OpenTelemetry — distributed tracing (spans → otel-collector → Tempo → Grafana)
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-grpc
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-httpx

@@ -15,6 +15,9 @@ rules:
 - apiGroups: [""]
   resources: ["pods/log"]
   verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create", "get"]
 - apiGroups: ["metrics.k8s.io"]
   resources: ["pods", "nodes"]
   verbs: ["get", "list"]
@@ -50,14 +53,23 @@ spec:
       serviceAccountName: k8s-agent-sa
       containers:
       - name: k8s-agent
-        image: registry.richardx.dev/k8s-agent:1.0.5
+        image: registry.richardx.dev/k8s-agent:1.6.0
         imagePullPolicy: Always
         ports:
         - containerPort: 8002
         envFrom:
         - configMapRef:
             name: k8s-agent-configmap
+        - configMapRef:
+            name: allowed-users-configmap
         env:
+        - name: INTERNAL_API_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: google-auth-secret
+              key: internal_api_secret
+        - name: BACKEND_SRE_URL
+          value: "http://backend-service:8000/api/sre/query"
         - name: NEW_RELIC_ACCOUNT_ID
           valueFrom:
             secretKeyRef:

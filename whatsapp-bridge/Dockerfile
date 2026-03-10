@@ -34,5 +34,5 @@ COPY . .
 # Expone el puerto en el que corre la app
 EXPOSE 3000
 
-# Eliminar el SingletonLock en caso de crash anterior y arrancar
-CMD [ "sh", "-c", "rm -f .wwebjs_auth/session/SingletonLock || true && node index.js" ]
+# Eliminar archivos de bloqueo de Chromium antes de arrancar
+CMD [ "sh", "-c", "rm -rf /tmp/.org.chromium.Chromium.* /tmp/.com.google.Chrome.* && find .wwebjs_auth -name 'SingletonLock' -exec rm -f {} \\; || true && node index.js" ]

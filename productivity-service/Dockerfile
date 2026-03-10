@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir --upgrade -r /app/requirements.txt
 # Ahora copiamos el resto del código de la aplicación al directorio de trabajo.
 # Esta capa se reconstruirá solo si el código fuente cambia.
 COPY ./app /app/app
-
+COPY ./tracing.py /app/
 
 ENV PYTHONPATH=/app
 

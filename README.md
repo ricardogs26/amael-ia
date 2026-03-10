@@ -7,81 +7,42 @@
 
 > **Amael IA** es una plataforma avanzada de Inteligencia Artificial Autónoma y Multi-Agente enfocada en la asistencia conversacional y la administración automatizada de infraestructuras (DevOps).
 
-Desplegada completamente sobre Kubernetes, Amael IA no solo responde a preguntas generales integrando capacidades **RAG (Retrieval-Augmented Generation)** aisladas por usuario, sino que actúa activamente sobre tu entorno mediante una capa de **Orquestación de Agentes (Planner + Executor)** basada en **LangGraph**. Esto le permite descomponer tareas complejas en pasos accionables, utilizando herramientas expertas y memoria contextual de forma dinámica.
+Desplegada completamente sobre Kubernetes, Amael IA utiliza una arquitectura de orquestación basada en **LangGraph** siguiendo el patrón **Planner → Grouper → Batch Executor → Supervisor**. Esto le permite descomponer tareas complejas, ejecutar herramientas en paralelo y auto-corregirse mediante una capa de retroalimentación de calidad.
 
 ---
 
 ## ✨ Características Principales
 
-*   💬 **Interfaz Conversacional:** Acceso mediante un frontend web moderno en **Streamlit** y conectividad nativa vía **WhatsApp** (`whatsapp-bridge`), manteniendo los historiales y límites de consumo **aislados estrictamente por número de teléfono (`user_id`)**.
-*   🔒 **Autenticación y Seguridad Estricta:** Soporte para **Google OAuth**, encriptado con JWT. Además, cuenta con un sistema de **Listas Blancas (Whitelists)**, separando a los usuarios regulares de los administradores de infraestructura.
-*   🧠 **RAG Multiusuario:** Ingesta de PDFs y TXTs con vectorización en **ChromaDB**. Cada usuario tiene su propio espacio de memoria y contexto aislado en un volumen persistente.
-*   🛠️ **DevOps Autónomo (K8s Native Agent):** Amael administra tu clúster en tiempo real mediante el **SDK nativo de Kubernetes para Python**. Puede listar pods, revisar logs, consultar métricas (`New Relic`) e incluso **eliminar pods anómalos** directamente desde el chat usando agentes estructurados.
-*   📅 **Productividad Integrada:** Analiza correos y requerimientos para programar tareas directamente en tu calendario mediante su módulo especializado `productivity-service`.
-*   👁️ **Visión Artificial:** Interacción con modelos de Deep Learning alojados en **TensorFlow Serving** para análisis y clasificación de imágenes subidas en el chat.
+*   💬 **Interfaz Conversacional:** Acceso mediante un frontend web moderno en **Streamlit** y conectividad nativa vía **WhatsApp** (`whatsapp-bridge` v1.2.4), con historiales y RAG **aislados por usuario**.
+*   🔒 **Seguridad & Hardening:** Autenticación **Google OAuth**, encriptado con Vault, validación de prompts anti-inyección, rate limiting mediante Redis y sanitización de outputs.
+*   🧠 **RAG Multiusuario:** Ingesta de documentos con vectorización en **Qdrant**. Cada usuario cuenta con memoria contextual aislada.
+*   🛠️ **DevOps Autónomo (K8s SRE Agent):** Administra el clúster en tiempo real. Lista pods, revisa logs, consulta PromQL/Grafana y ejecuta acciones correctivas (`Eliminar_Pod`).
+*   📅 **Productividad Integrada:** Automatización de agenda mediante integración con **Google Calendar** y **Gmail API** (`productivity-service`).
+*   📊 **Observabilidad Full-Stack:** Monitoreo con **Prometheus, Grafana y Tempo**. Incluye un **Service Map** en tiempo real y dashboards especializados de seguridad y performance.
 
 ---
 
-## 🏗️ Arquitectura de Microservicios Detallada
+## 🏗️ Arquitectura de Microservicios
 
-Amael IA sigue un enfoque de diseño modular nativo de la nube, orquestado por **Kubernetes (MicroK8s)**. Cada componente está especializado y aislado.
+Amael IA orquestado por **Kubernetes (MicroK8s)** con imágenes en registro privado `registry.richardx.dev`.
 
-### 🧠 Modelos de IA Utilizados
-*   **LLM Principal:** `qwen2.5:14b` (alojado en Ollama). Utilizado por el Backend, K8s Agent y Productivity Service para razonamiento y generación de texto.
-*   **Embeddings:** `nomic-embed-text` (alojado en Ollama). Utilizado para la vectorización RAG con una dimensión de **768**.
-*   **Visión:** `MobileNetV2` / `ImageNet` (alojado en TensorFlow Serving).
-*   **TTS (Voz):** `CosyVoice-300M` (alojado en `cosyvoice-service`).
+### 🧠 Capa de Inferencia (Single NVIDIA RTX 5070)
+*   **LLM Principal:** `qwen2.5:14b` (alojado en Ollama).
+*   **Embeddings:** `nomic-embed-text` (alojado en Ollama) - 768 dim.
+*   **Voz (TTS):** `CosyVoice-300M` (alojado en `cosyvoice-service`).
 
-### Componentes y Conectividad:
+### Componentes Core:
 
-1.  **`frontend-ia` (Python/Streamlit)**
-    *   **Interfaz:** Web rich-UI.
-    *   **Conectividad:** API REST hacia el Backend.
-    *   **Auth:** Maneja el flujo de login con Google OAuth.
+| Servicio | Versión | Descripción |
+|---------|---------|-------------|
+| `backend-ia` | `2.11.0` | Orquestador LangGraph, FastAPI. |
+| `k8s-agent` | `1.6.0` | SRE Expert, automatización K8s + Vault. |
+| `productivity-service` | `1.2.0` | Integración Google Workspace. |
+| `frontend-ia` | `2.0.0` | Streamlit Rich-UI, system-token theming. |
+| `whatsapp-bridge` | `1.2.4` | Puppeteer bridge con reintentos y timeout extendido. |
+| `llm-adapter` | `1.0.0` | Proxy OpenAI-compatible hacia Ollama. |
 
-2.  **`backend-ia` (FastAPI) - El Cerebro Central y Orquestador**
-    *   **Orquestación:** Implementa un flujo **LangGraph** (StateGraph) con nodos de **Planner** y **Executor** para razonamiento multi-paso.
-    *   **Modelos:** `qwen2.5:14b`, `nomic-embed-text`.
-    *   **Almacenamiento:**
-        *   **PostgreSQL:** Persistencia de historiales de chat y metadatos.
-        *   **Redis:** Caché de respuestas rápidas y estado de sesión.
-        *   **Qdrant:** Base de datos vectorial para RAG (aislada por usuario).
-        *   **MinIO:** Almacenamiento de archivos originales (PDF/TXT).
-    *   **Seguridad:** Validación de JWT y Listas Blancas (`K8S_ALLOWED_USERS_CSV`).
-
-3.  **`k8s-agent` (LangChain Agent - Zero Shot React)**
-    *   **Modelo:** `qwen2.5:14b`.
-    *   **Herramientas (Tools):**
-        *   `Listar_Namespaces`: Visualización completa del clúster.
-        *   `Detalle_Namespace`: Inspección de estados y metadata.
-        *   `Listar_Pods`: Reporte de salud y detección de fallos (`CrashLoopBackOff`, `OOMKilled`).
-        *   `Obtener_Logs_Pod`: Depuración profunda de errores en tiempo real.
-        *   `Eliminar_Pod`: Capacidad de ejecución para forzar reinicios de pods anómalos.
-        *   `Prometheus_Query`: Consultas métricas personalizadas directamente al clúster (CPU, Memoria, Tráfico).
-        *   `Listar_Grafana_Dashboards`: Descubrimiento de dashboards de monitoreo disponibles vía Kubernetes ConfigMaps.
-        *   `New_Relic_Query`: Consultas NRQL predefinidas (`cpu_cluster`, `ram_pods`, etc.) vía GraphQL API.
-    *   **Conectividad:** SDK oficial de Kubernetes (RBAC in-cluster), Prometheus API y New Relic Platform.
-
-4.  **`productivity-service` (FastAPI)**
-    *   **Modelo:** `qwen2.5:14b`.
-    *   **Conectividad:** Integración directa con **Google Calendar API** y **Gmail API**.
-    *   **Función:** Automatización de agenda basada en el análisis de correos electrónicos no leídos y eventos del día.
-
-5.  **`whatsapp-bridge` (Node.js/Express)**
-    *   **Motor:** Puppeteer + WhatsApp Web.
-    *   **Aislamiento:** Mapea números de teléfono a IDs de sesión únicos en el Backend, permitir historiales RAG dedicados por usuario de WhatsApp.
-
-6.  **`llm-adapter` (FastAPI)**
-    *   **Función:** Proxy de compatibilidad con OpenAI API.
-    *   **Conectividad:** Expone un endpoint `/llm/v1/chat/completions` que traduce peticiones al formato nativo de Ollama. Permite integrar herramientas externas que esperan el estándar de OpenAI.
-
-7.  **`cosyvoice-service` (FastAPI / CosyVoice)**
-    *   **Modelo:** `CosyVoice-300M`.
-    *   **Función:** Generación de voz sintética (Text-to-Speech) de alta fidelidad.
-    *   **Infraestructura:** Optimizado para ejecución en CPU en entorno Kubernetes.
-
-8.  **`ollama-service` & `tf-serving`**
-    *   Capa de infraestructura de inferencia que provee los modelos de lenguaje y visión a todo el ecosistema.
+---
 
 ### Diagrama de Flujo y Conectividad
 
@@ -96,67 +57,53 @@ graph TD
         BE[Backend IA - FastAPI]
         DB[(PostgreSQL / Redis)]
         VS[(Qdrant Vector DB)]
-        OBJ[(MinIO Storage)]
+        VA[(HashiCorp Vault)]
+    end
+
+    subgraph "Agent Orchestrator (LangGraph)"
+        BE --> PLAN[Planner]
+        PLAN --> GRP[Grouper]
+        GRP --> EXEC[Batch Executor]
+        EXEC --> SUP[Supervisor]
+        SUP -- REPLAN --> PLAN
     end
 
     subgraph "Expert Agents"
-        K8S[K8s Agent - SRE Expert]
-        PROD[Productivity - Google API]
+        K8S[K8s Agent - SRE]
+        PROD[Productivity - Google]
     end
 
     subgraph "Inference Providers"
         OL[Ollama - qwen2.5:14b]
-        TF[TF Serving - Computer Vision]
+        TF[TF Serving]
         CV[CosyVoice - TTS]
-        LA[LLM Adapter - OpenAI Proxy]
-    end
-
-    subgraph "External Platforms"
-        KUBE[K8s API / RBAC]
-        NR[New Relic GraphQL]
-        GAPI[Google Calendar/Gmail]
-        EXT[External OpenAI Tools]
     end
 
     %% Connectivity
     UI & WA <--> BE
-    subgraph "Agent Orchestrator (LangGraph)"
-        BE --> PLAN[Planner - Task Decomposition]
-        PLAN --> EXEC[Executor - Tool Dispatcher]
-        EXEC --> PLAN
-    end
-    BE <--> DB & VS & OBJ
+    BE <--> DB & VS & VA
     BE <--> OL & TF
-    EXEC -->|K8s Query| K8S
-    EXEC -->|Planning Task| PROD
-    EXEC -->|Search| VS
-    BE -.->|Voice Gen| CV
-    K8S <--> OL
-    K8S -->|Action| KUBE
-    K8S -->|Metrics| NR
-    PROD -->|Sync| GAPI
-    EXT <--> LA
-    LA <--> OL
+    EXEC --> K8S & PROD
+    K8S -->|Action| KUBE[K8s API]
+    K8S -->|Metrics| PROM[Prometheus / Grafana]
+    PROD -->|Sync| GAPI[Google API]
 ```
 
 ---
 
-## 🚀 Despliegue y Desarrollo
+## 🚀 Despliegue (Manual CI/CD)
 
-### Flujo de CI/CD Manual:
-1.  **Build:** `docker build -t registry.richardx.dev/<service>:<tag> .`
-2.  **Push:** `docker push registry.richardx.dev/<service>:<tag>`
-3.  **Apply:** `kubectl apply -f k8s/<manifest>.yaml`
-4.  **Restart:** `kubectl rollout restart deployment <service-name> -n amael-ia`
+```bash
+# 1. Build & Push
+docker build -t registry.richardx.dev/<service>:<tag> ./<service>/
+docker push registry.richardx.dev/<service>:<tag>
 
-### Registro de Versiones Relevantes:
-*   **Backend IA:** `2.3.2` (Orquestación LangGraph: Nodo Planner + Nodo Executor, resolución de fugas de contexto RAG).
-*   **WhatsApp Bridge:** `1.1.0`.
-*   **K8s Agent:** `1.0.5` (Integración Observabilidad: Prometheus + Grafana nativo vía ConfigMaps, fix de prompt ReAct).
+# 2. Deploy
+kubectl apply -f k8s/<manifest>.yaml -n amael-ia
+kubectl rollout restart deployment <service> -n amael-ia
+```
 
----
-
-## 🔐 Seguridad
-*   **RBAC strico:** El `k8s-agent` solo tiene permisos sobre el namespace `amael-ia`.
-*   **Whitelist:** Doble validación en Backend para comandos de infraestructura.
-*   **Secretos:** Gestión centralizada vía Kubernetes Secrets (`amael-secrets`).
+## 🔐 Seguridad y Privacidad
+*   **Vault Integration:** Tokens de Google OAuth se almacenan cifrados por usuario.
+*   **RBAC strico:** El agente de K8s está restringido al namespace `amael-ia`.
+*   **Output Sanitization:** Redacción automática de tokens `hvs.*`, JWTs y passwords en las respuestas del bot.

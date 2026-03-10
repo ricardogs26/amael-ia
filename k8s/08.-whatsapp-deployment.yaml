@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: whatsapp-bridge
-        image: registry.richardx.dev/whatsapp-bridge:1.1.5
+        image: registry.richardx.dev/whatsapp-bridge:1.2.4
         imagePullPolicy: Always
         ports:
         - containerPort: 3000
@@ -33,6 +33,9 @@ spec:
             secretKeyRef:
               name: amael-secrets
               key: jwt-token
+        envFrom:
+        - configMapRef:
+            name: allowed-users-configmap
         resources:
           requests:
             memory: "768Mi"

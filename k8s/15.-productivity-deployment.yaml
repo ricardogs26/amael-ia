@@ -15,13 +15,18 @@ spec:
       labels:
         app: productivity-service
     spec:
+      serviceAccountName: productivity-service-sa
       containers:
       - name: productivity-service
-        # Reemplaza con la ruta a tu imagen en tu registro de contenedores
-        image: registry.richardx.dev/productivity-service:1.0.0
+        image: registry.richardx.dev/productivity-service:1.2.0
         imagePullPolicy: Always
         ports:
         - containerPort: 8001
+        env:
+        - name: VAULT_ADDR
+          value: "http://vault.vault.svc.cluster.local:8200"
+        - name: VAULT_ROLE
+          value: "amael-productivity"
         envFrom:
         - configMapRef:
             name: productivity-service-config

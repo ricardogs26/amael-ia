@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     # --- Seguridad para Comunicación Interna ---
     internal_api_secret: str = Field(..., env="INTERNAL_API_SECRET")
 
+    # --- Vault para almacenamiento de tokens OAuth ---
+    vault_addr: str = Field("http://vault.vault.svc.cluster.local:8200", env="VAULT_ADDR")
+    vault_role: str = Field("amael-productivity", env="VAULT_ROLE")
+
     # La clase Config ya no es necesaria con pydantic-settings v2
     # La configuración se hace automáticamente a través de Field(env="...")
     

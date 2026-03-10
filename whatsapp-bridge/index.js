@@ -1,8 +1,9 @@
 // index.js
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const express = require('express');
 const axios = require('axios');
 const qrcode = require('qrcode-terminal');
+const puppeteer = require('puppeteer-core');
 
 const app = express();
 app.use(express.json());
@@ -35,7 +36,7 @@ const client = new Client({
     puppeteer: {
         headless: true,
         executablePath: CHROMIUM_PATH,
-        protocolTimeout: 600000, // 10 minutes
+        protocolTimeout: 0,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -43,13 +44,25 @@ const client = new Client({
             '--disable-gpu',
             '--disable-extensions',
             '--disable-software-rasterizer',
-            '--disable-background-timer-throttling',
-            '--disable-backgrounding-occluded-windows',
-            '--disable-renderer-backgrounding',
+            '--disable-setuid-sandbox',
             '--no-zygote',
-            '--single-process',
+            '--disable-background-networking',
+            '--disable-default-apps',
+            '--disable-sync',
+            '--disable-translate',
+            '--hide-scrollbars',
+            '--metrics-recording-only',
+            '--mute-audio',
+            '--safebrowsing-disable-auto-update',
+            '--ignore-certificate-errors',
+            '--ignore-ssl-errors',
+            '--ignore-certificate-errors-spki-list',
+            '--font-render-hinting=none',
+            '--disable-web-security',
+            '--disable-features=IsolateOrigins,site-per-process',
         ]
     },
+    authTimeoutMs: 300000, // 5 minutos de timeout para el QR
 });
 
 // --- EVENTOS DE WHATSAPP ---
@@ -105,8 +118,21 @@ client.on('message', async message => {
     }
 
     // --- CAMBIO CLAVE: Extraer el número de teléfono del remitente ---
-    // El formato de 'message.from' es 'phoneNumber@c.us'
-    const phoneNumber = message.from.split('@')[0];
+    // El formato de 'message.from' puede ser 'phoneNumber@c.us' o 'phoneNumber:1@c.us' (multi-device)
+    const phoneNumber = message.from.split('@')[0].split(':')[0];
+
+    // --- VALIDACIÓN DE WHITELIST INICIAL (Bridge Level) ---
+    const allowedNumbersCsv = process.env.ALLOWED_NUMBERS_CSV || "";
+    const allowedNumbers = allowedNumbersCsv.split(',').map(n => n.trim()).filter(n => n !== "");
+    
+    console.log(`[DEBUG] Validando número: "${phoneNumber}" contra whitelist: [${allowedNumbers.join(', ')}]`);
+
+    if (!allowedNumbers.includes(phoneNumber)) {
+        console.log(`BLOQUEO BRIDGE: Mensaje ignorado de número no autorizado: ${phoneNumber}`);
+        // Solo responder si no es un número de sistema o algo similar
+        await message.reply('Lo siento, este número no está autorizado para usar mis servicios.');
+        return;
+    }
 
     console.log(`Mensaje recibido de ${message.from} (Número: ${phoneNumber}): ${message.body}`);
 
@@ -141,12 +167,147 @@ client.on('message', async message => {
         const botResponse = response.data.response;
         console.log(`Respuesta de amael-ia: ${botResponse}`);
 
-        // Envía la respuesta de vuelta a WhatsApp
-        await message.reply(botResponse);
+        // --- MANEJO DE MEDIA EN LA RESPUESTA ---
+        // Si el agente envía un formato [MEDIA:base64_data], lo extraemos y enviamos como imagen
+        const mediaRegex = /\[MEDIA:(.+?)\]/;
+        const match = botResponse.match(mediaRegex);
+        
+        if (match) {
+            const base64Data = match[1];
+            const cleanText = botResponse.replace(mediaRegex, '').trim();
+            
+            const media = new MessageMedia('image/png', base64Data, 'screenshot.png');
+            await client.sendMessage(message.from, media, { caption: cleanText || "Aquí tienes el consumo actual." });
+        } else {
+            // Envía la respuesta de texto normal
+            await message.reply(botResponse);
+        }
 
     } catch (error) {
         console.error('Error al contactar a la API de amael-ia:', error.message);
         await message.reply('Lo siento, tuve un problema al procesar tu mensaje. Inténtalo de nuevo.');
+    }
+});
+
+// --- NUEVOS ENDPOINTS PARA EL AGENTE ---
+
+// Endpoint para enviar media desde otros servicios (ej. k8s-agent -> backend -> bridge)
+app.post('/send-media', async (req, res) => {
+    const { phoneNumber, base64, caption, mimetype } = req.body;
+    if (!phoneNumber || !base64) {
+        return res.status(400).json({ error: 'Faltan parámetros: phoneNumber o base64' });
+    }
+
+    try {
+        const chatId = phoneNumber.includes('@c.us') ? phoneNumber : `${phoneNumber}@c.us`;
+        const media = new MessageMedia(mimetype || 'image/png', base64, 'image.png');
+        await client.sendMessage(chatId, media, { caption: caption || '' });
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Error enviando media:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Endpoint para tomar capturas de pantalla usando el navegador del Bridge
+app.post('/screenshot', async (req, res) => {
+    const { url, waitSelector, username, password } = req.body;
+    if (!url) return res.status(400).json({ error: 'Falta la URL' });
+
+    console.log(`[SCREENSHOT] Petición recibida para: ${url}`);
+
+    let browser;
+    try {
+        browser = await puppeteer.launch({
+            executablePath: CHROMIUM_PATH,
+            args: ['--no-sandbox', '--disable-setuid-sandbox']
+        });
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1280, height: 800 });
+        
+        // Autenticación proactiva para Grafana si se proporcionan credenciales
+        if (url.includes('grafana')) {
+            const user = username || 'admin';
+            const pass = password || 'admin';
+            console.log(`[SCREENSHOT] Aplicando autenticación proactiva para Grafana: ${user}`);
+            
+            // Inyectar cabecera de autenticación básica proactivamente
+            const authHeader = `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`;
+            await page.setExtraHTTPHeaders({
+                'Authorization': authHeader
+            });
+            
+            // También autenticar de la forma tradicional por si acaso (fallback)
+            await page.authenticate({ username: user, password: pass });
+        }
+
+        console.log(`[SCREENSHOT] Navegando a: ${url}`);
+        await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+        
+        // Verificar si caímos en la página de login a pesar de la auth
+        const isLoginPage = await page.evaluate(() => {
+            return document.title.toLowerCase().includes('login') || 
+                   !!document.querySelector('input[name="user"]') ||
+                   !!document.querySelector('form[name="login"]');
+        });
+
+        if (isLoginPage && url.includes('grafana')) {
+            const user = username || 'admin';
+            const pass = password || 'admin';
+            console.log(`[SCREENSHOT] Detectada página de login. Intentando login automático para: ${user}`);
+            
+            try {
+                // Intentar encontrar los selectores de login de Grafana
+                await page.waitForSelector('input[name="user"]', { timeout: 10000 });
+                await page.type('input[name="user"]', user);
+                await page.type('input[name="password"]', pass);
+                
+                // Hacer clic en el botón de login
+                console.log('[SCREENSHOT] Buscando botón de login...');
+                await page.waitForSelector('button[type="submit"]', { timeout: 5000 });
+                await page.click('button[type="submit"]');
+                
+                // En Grafana (SPA), la navegación puede no disparar waitForNavigation de forma estándar
+                // Esperamos a que el formulario de login desaparezca o aparezca el dashboard
+                console.log('[SCREENSHOT] Login enviado, esperando carga del dashboard...');
+                await new Promise(r => setTimeout(r, 5000)); // Espera inicial
+                
+                console.log('[SCREENSHOT] Login parece haber sido enviado.');
+            } catch (loginError) {
+                console.warn('[SCREENSHOT] Error o timeout durante el login automático:', loginError.message);
+            }
+        }
+
+        if (waitSelector) {
+            console.log(`[SCREENSHOT] Esperando selector: ${waitSelector}`);
+            try {
+                await page.waitForSelector(waitSelector, { timeout: 15000 });
+            } catch (e) {
+                console.warn(`[SCREENSHOT] Aviso: No se encontró el selector ${waitSelector}, continuando...`);
+            }
+        } else {
+            // Delay de seguridad más largo para asegurar que los gráficos de Grafana carguen (son dinámicos)
+            console.log('[SCREENSHOT] Esperando 7s para carga de gráficos dinámicos...');
+            await new Promise(r => setTimeout(r, 7000));
+        }
+
+        // Si es Grafana, ocultar elementos innecesarios para la captura
+        if (url.includes('grafana')) {
+            await page.addStyleTag({ content: '.sidemenu-canvas, .navbar-page-btn, .search-container { display: none !important; }' });
+        }
+
+        console.log('[SCREENSHOT] Capturando pantalla...');
+        const screenshot = await page.screenshot({ encoding: 'base64' });
+        console.log('[SCREENSHOT] Captura completada con éxito.');
+        res.json({ base64: screenshot });
+    } catch (error) {
+        console.error('[SCREENSHOT] Error:', error);
+        res.status(500).json({ error: error.message });
+    } finally {
+        if (browser) {
+            await browser.close();
+            console.log('[SCREENSHOT] Navegador cerrado.');
+        }
     }
 });
 
@@ -194,16 +355,25 @@ app.get('/status', (req, res) => {
     });
 });
 
-// Inicializa el cliente de WhatsApp (solo una vez)
-console.log("Intentando inicializar el cliente de WhatsApp...");
-client.initialize().catch(err => {
-    console.error('ERROR FATAL al inicializar el cliente de WhatsApp:', err);
-    clientStatus = 'error';
-});
-
+// --- START SERVER ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Servidor web corriendo en http://localhost:${PORT}`);
     console.log(`QR disponible en: http://localhost:${PORT}/qr`);
     console.log(`Estado en: http://localhost:${PORT}/status`);
 });
+
+// Inicializa el cliente de WhatsApp con reintentos
+const initializeClient = () => {
+    console.log("Intentando inicializar el cliente de WhatsApp...");
+    clientStatus = 'initializing';
+    client.initialize().catch(err => {
+        console.error('ERROR al inicializar el cliente de WhatsApp:', err);
+        clientStatus = 'error';
+        qrCodeData = null;
+        console.log('Reintentando inicialización completa en 30 segundos...');
+        setTimeout(initializeClient, 30000);
+    });
+};
+
+initializeClient();

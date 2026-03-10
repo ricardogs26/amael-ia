@@ -18,6 +18,10 @@ __pycache__/
 token.json
 *jwt_token*
 *service_account*
+vault.root
+*.root
+unseal_keys*
+vault_token*
 
 # VSCode and IDEs
 .vscode/
