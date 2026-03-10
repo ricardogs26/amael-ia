@@ -1312,6 +1312,21 @@ async def chat_stream(request: ChatRequest, user: str = Depends(get_current_user
             )
             return r.json().get("response", "K8s info.") if r.status_code == 200 else "Error."
 
+        def web_search_tool(query: str) -> str:
+            TOOL_CALLS_TOTAL.labels(tool="web_search").inc()
+            try:
+                from duckduckgo_search import DDGS
+                with DDGS() as ddgs:
+                    results = list(ddgs.text(query, max_results=5))
+                if not results:
+                    return "No se encontraron resultados para la búsqueda."
+                lines = []
+                for r in results:
+                    lines.append(f"**{r.get('title','')}**\n{r.get('body','')}\nFuente: {r.get('href','')}")
+                return "\n\n---\n\n".join(lines)
+            except Exception as e:
+                return f"Error en búsqueda web: {e}"
+
         orch = get_orchestrator(redis_client=redis_client)
         initial_context = user_memory_context  # Memory Agent v1: inyectar perfil del usuario
         state = {
@@ -1320,7 +1335,8 @@ async def chat_stream(request: ChatRequest, user: str = Depends(get_current_user
             "context": initial_context, "tool_results": [], "final_answer": None,
             "user_id": effective_user, "retry_count": 0,
             "supervisor_score": 0, "supervisor_reason": "",
-            "tools_map": {"rag": rag_tool, "productivity": productivity_tool, "k8s": k8s_tool},
+            "tools_map": {"rag": rag_tool, "productivity": productivity_tool,
+                          "k8s": k8s_tool, "web_search": web_search_tool},
         }
         final_state = orch.invoke(state)
         answer = final_state.get("final_answer") or "Lo siento, no pude generar una respuesta."
