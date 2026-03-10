@@ -617,75 +617,158 @@ async def auth_callback(request: Request):
         raise HTTPException(status_code=500, detail=f"Error en la autenticación con Google: {e}")
 
 # --- ENDPOINTS DE LA APLICACIÓN (ahora protegidos y multiusuario) ---
+def _extract_docx_text(content: bytes) -> str:
+    """Extrae texto plano de un archivo DOCX."""
+    from docx import Document as DocxDocument
+    doc = DocxDocument(io.BytesIO(content))
+    return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+
+
 @app.post("/api/ingest")
 async def ingest_data(file: UploadFile = File(...), user: str = Depends(get_current_user)):
-    """Endpoint para subir y procesar documentos (PDF, TXT) para un usuario específico."""
+    """Sube y procesa documentos (PDF, TXT, DOCX) — indexa en Qdrant y guarda metadata en DB."""
     temp_file_path = f"/tmp/{uuid.uuid4()}-{file.filename}"
     try:
-        # 1. Leer el contenido del archivo en memoria primero
         content = await file.read()
-        
-        # 2. Determinar el tipo de archivo (MIME type) desde su contenido
-        #    Esto es mucho más seguro que fiarse de la extensión.
+
+        # Detectar MIME type
         try:
-            # Usamos la librería 'python-magic' para inspeccionar los bytes
             mime = magic.from_buffer(content, mime=True)
-        except Exception as e:
-            # Si magic falla, lanzamos un error genérico de tipo de archivo
-            raise HTTPException(status_code=400, detail="No se pudo determinar el tipo de archivo. Asegúrate de que no esté corrupto.")
+        except Exception:
+            raise HTTPException(status_code=400, detail="No se pudo determinar el tipo de archivo.")
 
-        # 3. Guardar el archivo temporalmente
-        with open(temp_file_path, "wb") as buffer:
-            buffer.write(content)
+        # Soporte DOCX por extensión (magic lo detecta como zip)
+        fname_lower = (file.filename or "").lower()
+        if fname_lower.endswith(".docx"):
+            mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
-        # 4. Seleccionar el loader correcto basado en el MIME type detectado
+        # Extraer texto y chunks según tipo
+        full_text = ""
+        from langchain_core.documents import Document as LCDocument
+
         if mime == "application/pdf":
+            with open(temp_file_path, "wb") as buf:
+                buf.write(content)
             loader = PyPDFLoader(temp_file_path)
+            documents = loader.load()
+            full_text = "\n".join(d.page_content for d in documents)
         elif mime == "text/plain":
-            loader = TextLoader(temp_file_path)
+            full_text = content.decode("utf-8", errors="replace")
+            documents = [LCDocument(page_content=full_text)]
+        elif "wordprocessingml" in mime or fname_lower.endswith(".docx"):
+            full_text = _extract_docx_text(content)
+            documents = [LCDocument(page_content=full_text)]
         else:
-            # Si no es PDF ni TXT, devolvemos un error claro.
-            # Por ejemplo, si es una imagen (mime == 'image/jpeg'), caerá aquí.
             raise HTTPException(
-                status_code=400, 
-                detail=f"Tipo de archivo no soportado: '{mime}'. Solo se permiten archivos PDF y TXT."
+                status_code=400,
+                detail=f"Tipo de archivo no soportado: '{mime}'. Usa PDF, TXT o DOCX."
             )
-        
-        # 5. Procesar el documento
-        documents = loader.load()
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        texts = text_splitter.split_documents(documents)
 
-        # 6. Guardar en Qdrant
+        # Chunking + indexar en Qdrant
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        texts = splitter.split_documents(documents)
         user_vectorstore = get_user_vectorstore(user)
         user_vectorstore.add_documents(texts)
-        
-        # 7. Guardar el archivo original en MinIO para referencia futura
-        bucket_name = sanitize_email(user).replace("_", "-") # MinIO buckets prefer dashes
-        if not minio_client.bucket_exists(bucket_name):
-            minio_client.make_bucket(bucket_name)
-        
-        with open(temp_file_path, "rb") as f:
-            minio_client.put_object(
-                bucket_name, 
-                file.filename, 
-                f, 
-                length=os.path.getsize(temp_file_path),
-                content_type=mime
-            )
-        
-        return {"message": f"Archivo '{file.filename}' ingerido en Qdrant y respaldado en MinIO para el usuario {user}."}
 
-    except HTTPException as http_e:
-        # Si ya es un HTTPException, simplemente la volvemos a lanzar
-        raise http_e
+        # Generar resumen con LLM (primeros 3000 chars)
+        summary = ""
+        try:
+            llm_sum = OllamaLLM(model=os.environ.get("MODEL_NAME", "qwen2.5:14b"),
+                                base_url=os.environ.get("OLLAMA_BASE_URL", "http://ollama-service:11434"))
+            summary = llm_sum.invoke(
+                f"Resume el siguiente documento en 2-3 oraciones en español:\n\n{full_text[:3000]}"
+            ).strip()
+        except Exception as e:
+            summary = f"Documento procesado ({len(texts)} fragmentos)."
+            logger.warning(f"[INGEST] Error generando summary: {e}")
+
+        # Guardar metadata en user_documents
+        doc_id = None
+        if postgres_pool:
+            conn = postgres_pool.getconn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO user_documents (user_id, doc_type, summary, raw_analysis) "
+                        "VALUES (%s, %s, %s, %s) RETURNING id",
+                        (user, file.filename, summary, full_text[:10000])
+                    )
+                    doc_id = cur.fetchone()[0]
+                    conn.commit()
+            finally:
+                postgres_pool.putconn(conn)
+
+        # Backup en MinIO (best-effort)
+        try:
+            bucket_name = sanitize_email(user).replace("_", "-")
+            if not minio_client.bucket_exists(bucket_name):
+                minio_client.make_bucket(bucket_name)
+            with open(temp_file_path, "wb") as buf:
+                buf.write(content)
+            with open(temp_file_path, "rb") as f:
+                minio_client.put_object(bucket_name, file.filename, f,
+                                        length=len(content), content_type=mime)
+        except Exception as e:
+            logger.warning(f"[INGEST] MinIO backup falló (no crítico): {e}")
+
+        return {
+            "doc_id": doc_id,
+            "filename": file.filename,
+            "summary": summary,
+            "chunks": len(texts),
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
-        # Para cualquier otro error inesperado
         raise HTTPException(status_code=500, detail=f"Error procesando el archivo: {e}")
     finally:
-        # 6. Limpiar el archivo temporal
         if os.path.exists(temp_file_path):
             os.remove(temp_file_path)
+
+
+@app.get("/api/documents")
+async def list_documents(user: str = Depends(get_current_user)):
+    """Lista los documentos subidos por el usuario."""
+    if not postgres_pool:
+        return {"documents": []}
+    conn = postgres_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, doc_type, summary, timestamp FROM user_documents "
+                "WHERE user_id = %s ORDER BY timestamp DESC LIMIT 50",
+                (user,)
+            )
+            rows = cur.fetchall()
+        return {"documents": [
+            {"id": r[0], "filename": r[1], "summary": r[2],
+             "created_at": r[3].isoformat() if r[3] else None}
+            for r in rows
+        ]}
+    finally:
+        postgres_pool.putconn(conn)
+
+
+@app.delete("/api/documents/{doc_id}")
+async def delete_document(doc_id: int, user: str = Depends(get_current_user)):
+    """Elimina un documento del historial (DB). Los vectores en Qdrant se mantienen."""
+    if not postgres_pool:
+        raise HTTPException(status_code=503, detail="DB no disponible")
+    conn = postgres_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM user_documents WHERE id = %s AND user_id = %s RETURNING id",
+                (doc_id, user)
+            )
+            deleted = cur.fetchone()
+            conn.commit()
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Documento no encontrado")
+        return {"deleted": doc_id}
+    finally:
+        postgres_pool.putconn(conn)
 
 @app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(get_current_user)])
 async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_user)):
@@ -941,10 +1024,29 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
                 return response.json().get("response", "K8s info retrieved.")
             return "Error calling K8s agent."
 
+        def web_search_tool(query: str) -> str:
+            TOOL_CALLS_TOTAL.labels(tool="web_search").inc()
+            try:
+                from duckduckgo_search import DDGS
+                with DDGS() as ddgs:
+                    results = list(ddgs.text(query, max_results=5))
+                if not results:
+                    return "No se encontraron resultados para la búsqueda."
+                lines = []
+                for r in results:
+                    title = r.get("title", "")
+                    body = r.get("body", "")
+                    href = r.get("href", "")
+                    lines.append(f"**{title}**\n{body}\nFuente: {href}")
+                return "\n\n---\n\n".join(lines)
+            except Exception as e:
+                return f"Error en búsqueda web: {e}"
+
         tools_map = {
             "rag": rag_tool,
             "productivity": productivity_tool,
-            "k8s": k8s_tool
+            "k8s": k8s_tool,
+            "web_search": web_search_tool,
         }
 
         # P5-2: Reuse cached compiled orchestrator (compiled once at first request)

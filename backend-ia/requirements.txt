@@ -21,6 +21,8 @@ minio
 
 # Dependencias para procesamiento de documentos
 pypdf
+python-docx
+duckduckgo-search
 
 #Dependencias para OAuth
 authlib>=1.3.0

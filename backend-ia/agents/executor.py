@@ -93,6 +93,15 @@ def _run_tool_step(step: str, state: AgentState, tools_map: Dict[str, Any]) -> s
                     EXECUTOR_ERRORS_TOTAL.labels(step_type="PRODUCTIVITY_TOOL").inc()
                     result = "Error: Herramienta de productividad no disponible."
 
+            elif step.startswith("WEB_SEARCH:"):
+                query = step[len("WEB_SEARCH:"):].strip()
+                web_func = tools_map.get("web_search")
+                if web_func:
+                    result = web_func(query)
+                else:
+                    EXECUTOR_ERRORS_TOTAL.labels(step_type="WEB_SEARCH").inc()
+                    result = "Error: Herramienta de búsqueda web no disponible."
+
         except Exception as exc:
             EXECUTOR_ERRORS_TOTAL.labels(step_type=stype).inc()
             logger.error(f"[EXECUTOR] Error en {stype}: {exc}", exc_info=True)

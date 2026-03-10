@@ -85,6 +85,16 @@ function EmptyState({ name }: { name: string }) {
   )
 }
 
+// Paperclip icon
+function IcoPaperclip() {
+  return (
+    <svg width="17" height="17" viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66L9.41 17.41a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+    </svg>
+  )
+}
+
 // Hamburger icon for mobile header
 function IcoHamburger() {
   return (
@@ -106,6 +116,9 @@ export default function Chat({ token, userName, userPicture, onLogout }: Props) 
   const [feedback,        setFeedback]        = useState<Record<number, 'positive' | 'negative'>>({})
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [isMobile, setIsMobile] = useState(false)
+  const [selectedFile, setSelectedFile] = useState<File | null>(null)
+  const [uploadStatus, setUploadStatus] = useState<'idle' | 'uploading' | 'done' | 'error'>('idle')
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   const bottomRef  = useRef<HTMLDivElement>(null)
   const inputRef   = useRef<HTMLTextAreaElement>(null)
@@ -212,10 +225,34 @@ export default function Chat({ token, userName, userPicture, onLogout }: Props) 
     }).catch(() => {})
   }
 
+  // ── File upload helper ───────────────────────────────────────────────────────
+  const uploadFile = async (file: File): Promise<{ summary: string; filename: string } | null> => {
+    setUploadStatus('uploading')
+    const formData = new FormData()
+    formData.append('file', file)
+    try {
+      const res = await fetch(`${BACKEND}/ingest`, {
+        method: 'POST',
+        headers: headers(),
+        body: formData,
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }))
+        throw new Error(err.detail)
+      }
+      const data = await res.json()
+      setUploadStatus('done')
+      return { summary: data.summary, filename: data.filename }
+    } catch (e) {
+      setUploadStatus('error')
+      return null
+    }
+  }
+
   // ── Main send with streaming SSE ─────────────────────────────────────────────
   const send = async () => {
     const prompt = input.trim()
-    if (!prompt || loading) return
+    if ((!prompt && !selectedFile) || loading) return
 
     abortRef.current?.abort()
     const abort = new AbortController()
@@ -223,6 +260,33 @@ export default function Chat({ token, userName, userPicture, onLogout }: Props) 
 
     setInput('')
     const ts = new Date().toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit' })
+
+    // If file attached, upload first
+    let docContext = ''
+    if (selectedFile) {
+      const fileToUpload = selectedFile
+      setSelectedFile(null)
+      const uploaded = await uploadFile(fileToUpload)
+      if (uploaded) {
+        docContext = `[Documento subido: ${uploaded.filename}]\nResumen: ${uploaded.summary}`
+        const docMsg: Msg = {
+          role: 'assistant',
+          content: `📄 **${uploaded.filename}** indexado correctamente.\n\n${uploaded.summary}`,
+          ts,
+        }
+        setMessages(prev => [...prev, docMsg])
+      } else {
+        const errMsg: Msg = { role: 'assistant', content: '⚠️ Error al subir el documento.', ts }
+        setMessages(prev => [...prev, errMsg])
+        setLoading(false)
+        setUploadStatus('idle')
+        return
+      }
+      setUploadStatus('idle')
+      if (!prompt) { setLoading(false); return }
+    }
+
+    const effectivePrompt = docContext ? `${prompt}\n\n${docContext}` : prompt
     const userMsg: Msg = { role: 'user', content: prompt, ts }
     setMessages(prev => [...prev, userMsg])
     setLoading(true)
@@ -235,7 +299,7 @@ export default function Chat({ token, userName, userPicture, onLogout }: Props) 
       const res = await fetch(`${BACKEND}/chat/stream`, {
         method:  'POST',
         headers: { ...headers(), 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ prompt, history: currentMessages, conversation_id: convId }),
+        body:    JSON.stringify({ prompt: effectivePrompt, history: currentMessages, conversation_id: convId }),
         signal:  abort.signal,
       })
 
@@ -413,6 +477,61 @@ export default function Chat({ token, userName, userPicture, onLogout }: Props) 
           background: 'linear-gradient(to top, var(--bg-base) 80%, transparent)',
         }}>
           <div style={{ maxWidth: '720px', margin: '0 auto', position: 'relative' }}>
+
+            {/* Hidden file input */}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".pdf,.txt,.docx,.md"
+              style={{ display: 'none' }}
+              onChange={e => {
+                const f = e.target.files?.[0] ?? null
+                setSelectedFile(f)
+                setUploadStatus('idle')
+                e.target.value = ''
+              }}
+            />
+
+            {/* Selected file badge */}
+            {selectedFile && (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: '8px',
+                marginBottom: '8px', padding: '6px 12px',
+                background: 'var(--primary-subtle)', border: '1px solid rgba(99,102,241,0.25)',
+                borderRadius: '8px', fontSize: '13px', color: 'var(--text-secondary)',
+              }}>
+                <span style={{ fontSize: '15px' }}>📄</span>
+                <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {selectedFile.name}
+                </span>
+                <button
+                  onClick={() => setSelectedFile(null)}
+                  style={{
+                    background: 'none', border: 'none', cursor: 'pointer',
+                    color: 'var(--text-disabled)', fontSize: '16px', lineHeight: 1,
+                    padding: '0 2px',
+                  }}
+                >×</button>
+              </div>
+            )}
+
+            {/* Clip button (left of textarea) */}
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={loading}
+              title="Subir documento (PDF, TXT, DOCX)"
+              style={{
+                position: 'absolute', left: '9px', bottom: '9px',
+                width: '44px', height: '44px', borderRadius: '12px',
+                background: 'none', border: 'none', cursor: loading ? 'not-allowed' : 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                color: selectedFile ? 'var(--primary)' : 'var(--text-disabled)',
+                transition: 'color .15s',
+              }}
+            >
+              <IcoPaperclip />
+            </button>
+
             <textarea
               ref={inputRef}
               value={input}
@@ -426,7 +545,7 @@ export default function Chat({ token, userName, userPicture, onLogout }: Props) 
               style={{
                 width: '100%', background: 'var(--input-bg)',
                 border: `1px solid ${input ? 'var(--border-focus)' : 'var(--border)'}`,
-                borderRadius: '14px', padding: '14px 62px 14px 18px',
+                borderRadius: '14px', padding: '14px 62px 14px 56px',
                 color: 'var(--text-primary)', fontSize: '16px', resize: 'none',
                 outline: 'none', lineHeight: '1.5', fontFamily: 'inherit',
                 boxShadow: input ? '0 0 0 3px var(--primary-subtle)' : 'none',

@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 MAX_PLAN_STEPS = 8
-VALID_STEP_TYPES = {"K8S_TOOL", "RAG_RETRIEVAL", "PRODUCTIVITY_TOOL", "REASONING"}
+VALID_STEP_TYPES = {"K8S_TOOL", "RAG_RETRIEVAL", "PRODUCTIVITY_TOOL", "REASONING", "WEB_SEARCH"}
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://ollama-service:11434")
 MODEL_NAME = os.environ.get("MODEL_NAME", "qwen2.5:14b")
@@ -32,7 +32,7 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "qwen2.5:14b")
 _chat_llm = ChatOllama(model=MODEL_NAME, base_url=OLLAMA_BASE_URL)
 
 # ── Pydantic schema ───────────────────────────────────────────────────────────
-StepType = Literal["K8S_TOOL", "RAG_RETRIEVAL", "PRODUCTIVITY_TOOL", "REASONING"]
+StepType = Literal["K8S_TOOL", "RAG_RETRIEVAL", "PRODUCTIVITY_TOOL", "REASONING", "WEB_SEARCH"]
 
 
 class PlanStep(BaseModel):
@@ -65,11 +65,13 @@ class PlanStep(BaseModel):
 PLANNER_SYSTEM_PROMPT = """Eres un planificador de tareas para Amael-IA. Tu objetivo es descomponer la solicitud del usuario en un plan de ejecución paso a paso.
 Cada paso debe ser claro y accionable. Los pasos pueden involucrar:
 1. K8S_TOOL: Úsala para CUALQUIER pregunta relacionada con Kubernetes, pods, logs, latencia, métricas de Prometheus o dashboards de Grafana.
-2. RAG_RETRIEVAL: Úsala ÚNICAMENTE si la pregunta es específicamente sobre lógica de negocio privada, horarios o contenido de documentos subidos (PDFs/TXTs).
+2. RAG_RETRIEVAL: Úsala ÚNICAMENTE si la pregunta es específicamente sobre contenido de documentos subidos por el usuario (PDFs/TXTs/DOCX) o lógica de negocio privada.
 3. PRODUCTIVITY_TOOL: Para gestión de calendario y agenda del día.
-4. REASONING: Responder basado en conocimiento general o procesar resultados previos.
+4. WEB_SEARCH: Úsala cuando el usuario pregunta sobre eventos actuales, noticias, precios, información reciente, o cualquier dato que requiera búsqueda en internet.
+5. REASONING: Responder basado en conocimiento general o procesar resultados previos.
 
 REGLA ESTRICTA: No uses RAG_RETRIEVAL para preguntas de DevOps/K8s/Infraestructura a menos que el usuario mencione explícitamente un documento.
+REGLA ESTRICTA 6: Usa WEB_SEARCH solo cuando la pregunta requiera información actualizada o externa; no la uses para conversación general.
 REGLA ESTRICTA 2: Para saludos simples como "hola", "buenos días", usa ÚNICAMENTE "REASONING".
 REGLA ESTRICTA 3: Toda la planificación y razonamiento debe ser en ESPAÑOL.
 REGLA ESTRICTA 4: Genera un máximo de 8 pasos.
