@@ -146,12 +146,13 @@ def _run_reasoning_step(
         f"Contexto previo:\n{context_for_llm}\n\n"
         f"Tarea a realizar: {reasoning_task}\n\n"
         f"Instrucción: Genera una respuesta en ESPAÑOL basada en el contexto anterior.\n"
-        f"REGLAS DE FORMATO ESTRICTAS:\n"
-        f"1. Si el contexto contiene bloques delimitados por triple backtick (```bash, ```yaml, etc.), "
-        f"DEBES copiarlos EXACTAMENTE en tu respuesta sin reformatearlos ni convertirlos a tablas.\n"
-        f"2. Si generas scripts bash, comandos kubectl o manifiestos YAML, envuélvelos en el bloque correspondiente.\n"
-        f"3. NO conviertas datos tabulares de kubectl en tablas markdown; usa ```bash para preservarlos.\n"
-        f"4. El texto explicativo va fuera de los bloques, en prosa normal."
+        f"REGLAS DE FORMATO — SIGUE ESTAS REGLAS AL PIE DE LA LETRA:\n"
+        f"1. Si el contexto contiene un bloque ```bash o ```yaml, CÓPIALO EXACTAMENTE en tu respuesta sin modificarlo.\n"
+        f"2. NUNCA pongas análisis, recomendaciones, texto en español ni markdown dentro de un bloque ```bash o ```yaml. "
+        f"Los bloques de código contienen ÚNICAMENTE salida raw de comandos o código fuente.\n"
+        f"3. Tu análisis, explicaciones y recomendaciones van FUERA de los bloques, como texto normal.\n"
+        f"4. NO conviertas datos tabulares de kubectl en tablas markdown; preserva el bloque ```bash original.\n"
+        f"5. Si generas scripts bash o manifiestos YAML nuevos, envuélvelos en ```bash o ```yaml respectivamente."
     )
 
     estimated_tokens = len(prompt) // 4
