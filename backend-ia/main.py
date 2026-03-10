@@ -8,8 +8,10 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from prometheus_client import Counter, Histogram, Gauge
 from starlette.middleware.sessions import SessionMiddleware
 import time
+import asyncio
 import logging
 from pydantic import BaseModel
+from typing import Optional
 import requests
 import os
 import uuid
@@ -49,9 +51,11 @@ import numpy as np
 import io
 
 # --- CONFIGURACIÓN DEL SERVICIO DE PRODUCTIVIDAD ---
-PRODUCTIVITY_SERVICE_URL = "http://productivity-service:8001" # URL del nuevo servicio en la red de Docker/K8s
-# Seguridad: Leído desde Kubernetes Secrets para cumplimiento de buenas prácticas
-INTERNAL_API_SECRET = os.environ.get("INTERNAL_API_SECRET")
+PRODUCTIVITY_SERVICE_URL  = "http://productivity-service:8001"
+K8S_AGENT_URL             = "http://k8s-agent-service:8002"
+WHATSAPP_BRIDGE_URL       = os.getenv("WHATSAPP_BRIDGE_URL", "http://whatsapp-bridge-service:3000")
+ADMIN_PHONE               = os.getenv("ADMIN_PHONE", "5219993437008")
+INTERNAL_API_SECRET       = os.environ.get("INTERNAL_API_SECRET")
 
 if not INTERNAL_API_SECRET:
     raise ValueError("Falta la variable de entorno 'INTERNAL_API_SECRET' montada en el Pod.")
@@ -303,59 +307,176 @@ def init_db():
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE INDEX IF NOT EXISTS idx_user_docs_user_id ON user_documents(user_id);
+
+                CREATE TABLE IF NOT EXISTS conversations (
+                    id SERIAL PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    title TEXT DEFAULT 'Nueva conversación',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_active_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_conv_user_id ON conversations(user_id);
+
+                CREATE TABLE IF NOT EXISTS message_feedback (
+                    id SERIAL PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    conversation_id INTEGER,
+                    message_index INTEGER,
+                    sentiment TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_profile (
+                    user_id TEXT PRIMARY KEY,
+                    display_name TEXT,
+                    timezone TEXT DEFAULT 'America/Mexico_City',
+                    preferences JSONB DEFAULT '{}',
+                    context_data JSONB DEFAULT '{}',
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS user_facts (
+                    id SERIAL PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    fact TEXT NOT NULL,
+                    category TEXT DEFAULT 'general',
+                    source_conv_id INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_user_facts_uid ON user_facts(user_id);
+
+                CREATE TABLE IF NOT EXISTS user_goals (
+                    id SERIAL PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    category TEXT DEFAULT 'personal',
+                    status TEXT DEFAULT 'active',
+                    progress INTEGER DEFAULT 0,
+                    deadline DATE,
+                    milestones JSONB DEFAULT '[]',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_user_goals_uid ON user_goals(user_id);
+            """)
+            # Add conversation_id column to chat_history if it doesn't exist yet
+            cur.execute("""
+                ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS conversation_id INTEGER;
             """)
             conn.commit()
     finally:
         postgres_pool.putconn(conn)
 
 
-def save_chat_message(user_id: str, role: str, content: str):
+def save_chat_message(user_id: str, role: str, content: str, conversation_id: Optional[int] = None):
     """Guarda un mensaje en Redis (caché) y Postgres (persistente)."""
-    # Evitar nulos que rompan la base de datos
     if content is None:
         content = ""
-    
-    # 1. Guardar en Redis (Lista de los últimos 10 mensajes)
-    redis_key = f"chat_history:{user_id}"
+
+    redis_key = f"chat_history:{user_id}:{conversation_id}" if conversation_id else f"chat_history:{user_id}"
     message_json = json.dumps({"role": role, "content": content})
     redis_client.lpush(redis_key, message_json)
-    redis_client.ltrim(redis_key, 0, 9) # Mantener solo los últimos 10
-    
-    # 2. Guardar en Postgres
+    redis_client.ltrim(redis_key, 0, 19)
+
     if postgres_pool:
         conn = postgres_pool.getconn()
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO chat_history (user_id, role, content) VALUES (%s, %s, %s)",
-                    (user_id, role, content)
+                    "INSERT INTO chat_history (user_id, role, content, conversation_id) VALUES (%s, %s, %s, %s)",
+                    (user_id, role, content, conversation_id)
                 )
                 conn.commit()
         finally:
             postgres_pool.putconn(conn)
 
-def get_chat_history(user_id: str, limit: int = 10) -> list:
+    if conversation_id:
+        _touch_conversation(conversation_id)
+
+
+def _touch_conversation(conversation_id: int):
+    if not postgres_pool: return
+    conn = postgres_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE conversations SET last_active_at = NOW() WHERE id = %s", (conversation_id,))
+            conn.commit()
+    finally:
+        postgres_pool.putconn(conn)
+
+
+def create_conversation(user_id: str, title: str = "Nueva conversación") -> Optional[int]:
+    if not postgres_pool: return None
+    conn = postgres_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO conversations (user_id, title) VALUES (%s, %s) RETURNING id",
+                (user_id, title)
+            )
+            conv_id = cur.fetchone()[0]
+            conn.commit()
+            return conv_id
+    finally:
+        postgres_pool.putconn(conn)
+
+
+def get_user_conversations(user_id: str, limit: int = 30) -> list:
+    if not postgres_pool: return []
+    conn = postgres_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, title, created_at, last_active_at FROM conversations WHERE user_id = %s ORDER BY last_active_at DESC LIMIT %s",
+                (user_id, limit)
+            )
+            rows = cur.fetchall()
+            return [{"id": r[0], "title": r[1], "created_at": r[2].isoformat(), "last_active_at": r[3].isoformat()} for r in rows]
+    finally:
+        postgres_pool.putconn(conn)
+
+
+def get_conversation_messages(conversation_id: int, user_id: str) -> list:
+    if not postgres_pool: return []
+    conn = postgres_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT role, content, timestamp FROM chat_history WHERE conversation_id = %s AND user_id = %s ORDER BY timestamp ASC",
+                (conversation_id, user_id)
+            )
+            rows = cur.fetchall()
+            return [{"role": r[0], "content": r[1], "ts": r[2].strftime("%H:%M")} for r in rows]
+    finally:
+        postgres_pool.putconn(conn)
+
+
+def get_chat_history(user_id: str, limit: int = 20, conversation_id: Optional[int] = None) -> list:
     """Intenta obtener el historial de Redis, si falla va a Postgres."""
-    redis_key = f"chat_history:{user_id}"
+    redis_key = f"chat_history:{user_id}:{conversation_id}" if conversation_id else f"chat_history:{user_id}"
     try:
         history = redis_client.lrange(redis_key, 0, limit - 1)
         if history:
-            # Redis devuelve los más recientes primero, los invertimos para el prompt
             return [json.loads(m) for m in reversed(history)]
     except Exception as e:
         print(f"Redis error: {e}")
 
-    # Fallback a Postgres
     if postgres_pool:
         conn = postgres_pool.getconn()
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT role, content FROM chat_history WHERE user_id = %s ORDER BY timestamp DESC LIMIT %s",
-                    (user_id, limit)
-                )
+                if conversation_id:
+                    cur.execute(
+                        "SELECT role, content FROM chat_history WHERE user_id = %s AND conversation_id = %s ORDER BY timestamp DESC LIMIT %s",
+                        (user_id, conversation_id, limit)
+                    )
+                else:
+                    cur.execute(
+                        "SELECT role, content FROM chat_history WHERE user_id = %s AND conversation_id IS NULL ORDER BY timestamp DESC LIMIT %s",
+                        (user_id, limit)
+                    )
                 rows = cur.fetchall()
-                # Voltear para orden cronológico
                 return [{"role": r, "content": c} for r, c in reversed(rows)]
         finally:
             postgres_pool.putconn(conn)
@@ -406,12 +527,21 @@ def get_history_path_for_id(identifier: str) -> str:
 # --- MODELOS DE DATOS ---
 class ChatRequest(BaseModel):
     prompt: str
-    history: list[dict] = [] 
-    user_id: str = None     
-    image: str = None  # Base64 string
+    history: list[dict] = []
+    user_id: str = None
+    image: str = None
+    conversation_id: Optional[int] = None
 
 class ChatResponse(BaseModel):
     response: str
+
+class ConversationCreate(BaseModel):
+    title: str = "Nueva conversación"
+
+class FeedbackRequest(BaseModel):
+    conversation_id: Optional[int] = None
+    message_index: int
+    sentiment: str  # 'positive' or 'negative'
 
 class SREKnowledgeRequest(BaseModel):
     key: str
@@ -655,9 +785,10 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
 
     # Determinar qué ID usar para el historial
     history_id = effective_user
-    
+    conv_id = request.conversation_id  # None → legacy flat history
+
     # --- MIGRACIÓN DE HISTORIAL (JSON -> DB) ---
-    history = get_chat_history(history_id)
+    history = get_chat_history(history_id, conversation_id=conv_id)
     if not history:
         history_path = get_history_path_for_id(history_id)
         if os.path.exists(history_path):
@@ -756,8 +887,8 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
                 print(f"[DEBUG] El modelo no marcó la imagen como ticket.")
 
             # Guardar en historial
-            save_chat_message(history_id, "user", request.prompt + " [Imagen enviada]")
-            save_chat_message(history_id, "assistant", final_response)
+            save_chat_message(history_id, "user", request.prompt + " [Imagen enviada]", conv_id)
+            save_chat_message(history_id, "assistant", final_response, conv_id)
 
             return ChatResponse(response=final_response)
 
@@ -860,8 +991,23 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
         )
 
         # Save to history
-        save_chat_message(history_id, "user", request.prompt)
-        save_chat_message(history_id, "assistant", final_response)
+        save_chat_message(history_id, "user", request.prompt, conv_id)
+        save_chat_message(history_id, "assistant", final_response, conv_id)
+
+        # Auto-title conversation from first user message
+        if conv_id and len(history) == 0:
+            title = request.prompt[:50].strip()
+            if len(request.prompt) > 50:
+                title += "…"
+            _touch_conversation(conv_id)
+            if postgres_pool:
+                _c = postgres_pool.getconn()
+                try:
+                    with _c.cursor() as cur:
+                        cur.execute("UPDATE conversations SET title = %s WHERE id = %s AND title = 'Nueva conversación'", (title, conv_id))
+                        _c.commit()
+                finally:
+                    postgres_pool.putconn(_c)
 
         return ChatResponse(response=final_response)
 
@@ -998,6 +1144,641 @@ async def analyze_image(file: UploadFile = File(...), user: str = Depends(get_cu
             raise HTTPException(status_code=500, detail="Error en TensorFlow Serving")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error procesando la imagen: {e}")
+
+@app.post("/api/chat/stream", dependencies=[Depends(get_current_user)])
+async def chat_stream(request: ChatRequest, user: str = Depends(get_current_user)):
+    """Streaming SSE version of /api/chat. Emits status events then streams tokens."""
+    from fastapi.responses import StreamingResponse as SR
+
+    effective_user = request.user_id if request.user_id else user
+
+    # Rate limit
+    allowed, _ = _check_rate_limit(effective_user)
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Demasiadas solicitudes.")
+
+    # Input validation
+    is_valid, prompt_or_error = validate_prompt(request.prompt)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=prompt_or_error)
+
+    prompt    = prompt_or_error
+    conv_id   = request.conversation_id
+    history_id = effective_user
+    history   = get_chat_history(history_id, conversation_id=conv_id)
+
+    conversation_history = ""
+    if history:
+        conversation_history = "\n".join(
+            f"Human: {m['content']}" if m['role'] == 'user' else f"Assistant: {m['content']}"
+            for m in history
+        )
+
+    # Memory Agent v1: cargar contexto del usuario
+    user_memory_context = get_user_context(effective_user)
+
+    def _run_agent_sync():
+        """Synchronous agent execution — runs in thread pool."""
+        def rag_tool(query: str):
+            vs = get_user_vectorstore(effective_user)
+            docs = vs.similarity_search(query, k=3)
+            if docs:
+                RAG_HITS_TOTAL.inc()
+                return "\n".join(d.page_content for d in docs)
+            RAG_MISS_TOTAL.inc()
+            return "No relevant documents found."
+
+        def productivity_tool(query: str):
+            TOOL_CALLS_TOTAL.labels(tool="productivity").inc()
+            r = _http_client.post(
+                f"{PRODUCTIVITY_SERVICE_URL}/organize",
+                json={"user_email": effective_user},
+                headers={"Authorization": f"Bearer {INTERNAL_API_SECRET}"},
+                timeout=60.0,
+            )
+            return r.json().get("summary", "Organized.") if r.status_code == 200 else "Error."
+
+        def k8s_tool(query: str):
+            if effective_user not in K8S_ALLOWED_USERS:
+                return "Sin privilegios de administrador para esta operación."
+            TOOL_CALLS_TOTAL.labels(tool="k8s").inc()
+            r = _http_client.post(
+                "http://k8s-agent-service:8002/api/k8s-agent",
+                json={"query": query, "user_email": effective_user},
+                headers={"Authorization": f"Bearer {INTERNAL_API_SECRET}"},
+                timeout=120.0,
+            )
+            return r.json().get("response", "K8s info.") if r.status_code == 200 else "Error."
+
+        orch = get_orchestrator(redis_client=redis_client)
+        initial_context = user_memory_context  # Memory Agent v1: inyectar perfil del usuario
+        state = {
+            "question": prompt,
+            "plan": [], "batches": [], "current_batch": 0, "current_step": 0,
+            "context": initial_context, "tool_results": [], "final_answer": None,
+            "user_id": effective_user, "retry_count": 0,
+            "supervisor_score": 0, "supervisor_reason": "",
+            "tools_map": {"rag": rag_tool, "productivity": productivity_tool, "k8s": k8s_tool},
+        }
+        final_state = orch.invoke(state)
+        answer = final_state.get("final_answer") or "Lo siento, no pude generar una respuesta."
+        return sanitize_output(answer), final_state
+
+    def _sse(event_type: str, payload: dict) -> str:
+        return f"data: {json.dumps({'type': event_type, **payload})}\n\n"
+
+    async def generate():
+        yield _sse("status", {"msg": "🧠 Analizando consulta…"})
+
+        # Run orchestrator in thread pool; poll with status updates
+        loop = asyncio.get_event_loop()
+        future = loop.run_in_executor(None, _run_agent_sync)
+
+        status_schedule = [
+            (2.0,  "📋 Creando plan de ejecución…"),
+            (5.0,  "⚡ Ejecutando herramientas…"),
+            (10.0, "✍️ Sintetizando respuesta…"),
+            (20.0, "⏳ Procesando consulta compleja…"),
+        ]
+        elapsed = 0.0
+        poll    = 0.25
+        si      = 0
+
+        while not future.done():
+            await asyncio.sleep(poll)
+            elapsed += poll
+            if si < len(status_schedule) and elapsed >= status_schedule[si][0]:
+                yield _sse("status", {"msg": status_schedule[si][1]})
+                si += 1
+
+        try:
+            final_answer, final_state = future.result()
+        except Exception as e:
+            yield _sse("error", {"msg": str(e)})
+            return
+
+        # Persist
+        save_chat_message(history_id, "user",      prompt,       conv_id)
+        save_chat_message(history_id, "assistant", final_answer, conv_id)
+        if conv_id and len(history) == 0:
+            title = prompt[:50].strip() + ("…" if len(prompt) > 50 else "")
+            _touch_conversation(conv_id)
+            if postgres_pool:
+                _c = postgres_pool.getconn()
+                try:
+                    with _c.cursor() as cur:
+                        cur.execute(
+                            "UPDATE conversations SET title=%s WHERE id=%s AND title='Nueva conversación'",
+                            (title, conv_id),
+                        )
+                        _c.commit()
+                finally:
+                    postgres_pool.putconn(_c)
+
+        # Memory Agent v1: extraer hechos en background (no bloquea el stream)
+        asyncio.create_task(extract_facts_background(effective_user, prompt, final_answer, conv_id))
+
+        # Stream tokens word-by-word
+        words = final_answer.split(" ")
+        for i, word in enumerate(words):
+            chunk = word + (" " if i < len(words) - 1 else "")
+            yield _sse("token", {"content": chunk})
+            await asyncio.sleep(0.018)
+
+        yield _sse("done", {"conv_id": conv_id})
+
+    return SR(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/conversations", dependencies=[Depends(get_current_user)])
+async def list_conversations(user: str = Depends(get_current_user)):
+    return {"conversations": get_user_conversations(user)}
+
+
+@app.post("/api/conversations", dependencies=[Depends(get_current_user)])
+async def new_conversation(body: ConversationCreate, user: str = Depends(get_current_user)):
+    conv_id = create_conversation(user, body.title)
+    if conv_id is None:
+        raise HTTPException(status_code=503, detail="Base de datos no disponible")
+    return {"id": conv_id, "title": body.title}
+
+
+@app.get("/api/conversations/{conv_id}/messages", dependencies=[Depends(get_current_user)])
+async def conversation_messages(conv_id: int, user: str = Depends(get_current_user)):
+    return {"messages": get_conversation_messages(conv_id, user)}
+
+
+class ConversationUpdateRequest(BaseModel):
+    title: str
+
+@app.patch("/api/conversations/{conv_id}", dependencies=[Depends(get_current_user)])
+async def update_conversation(conv_id: int, body: ConversationUpdateRequest, user: str = Depends(get_current_user)):
+    if not postgres_pool:
+        return {"ok": True}
+    conn = postgres_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE conversations SET title=%s WHERE id=%s AND user_id=%s",
+                (body.title[:100], conv_id, user)
+            )
+        conn.commit()
+        return {"ok": True}
+    finally:
+        postgres_pool.putconn(conn)
+
+
+@app.delete("/api/conversations/{conv_id}", dependencies=[Depends(get_current_user)])
+async def delete_conversation(conv_id: int, user: str = Depends(get_current_user)):
+    if not postgres_pool:
+        return {"ok": True}
+    conn = postgres_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM chat_history WHERE conversation_id=%s AND user_id=%s", (conv_id, user))
+            cur.execute("DELETE FROM message_feedback WHERE conversation_id=%s AND user_id=%s", (conv_id, user))
+            cur.execute("DELETE FROM conversations WHERE id=%s AND user_id=%s", (conv_id, user))
+        conn.commit()
+        return {"ok": True}
+    finally:
+        postgres_pool.putconn(conn)
+
+
+@app.post("/api/feedback", dependencies=[Depends(get_current_user)])
+async def save_feedback(body: FeedbackRequest, user: str = Depends(get_current_user)):
+    if not postgres_pool:
+        return {"ok": True}
+    conn = postgres_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO message_feedback (user_id, conversation_id, message_index, sentiment) VALUES (%s, %s, %s, %s)",
+                (user, body.conversation_id, body.message_index, body.sentiment)
+            )
+            conn.commit()
+    finally:
+        postgres_pool.putconn(conn)
+    return {"ok": True}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MEMORY AGENT v1 — Perfil + Hechos del usuario
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_user_context(user_id: str) -> str:
+    """Carga el perfil y hechos recientes del usuario para inyectar en el agente."""
+    if not postgres_pool:
+        return ""
+    conn = postgres_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            # Perfil básico
+            cur.execute("SELECT display_name, preferences, context_data FROM user_profile WHERE user_id=%s", (user_id,))
+            row = cur.fetchone()
+            profile_lines = []
+            if row:
+                name, prefs, ctx = row
+                if name:
+                    profile_lines.append(f"Nombre del usuario: {name}")
+                if prefs:
+                    for k, v in prefs.items():
+                        profile_lines.append(f"Preferencia — {k}: {v}")
+                if ctx:
+                    for k, v in ctx.items():
+                        profile_lines.append(f"Contexto — {k}: {v}")
+
+            # Hechos recientes (últimos 15)
+            cur.execute(
+                "SELECT fact, category FROM user_facts WHERE user_id=%s ORDER BY created_at DESC LIMIT 15",
+                (user_id,)
+            )
+            facts = cur.fetchall()
+            fact_lines = [f"- [{cat}] {fact}" for fact, cat in facts] if facts else []
+
+        if not profile_lines and not fact_lines:
+            return ""
+
+        parts = []
+        if profile_lines:
+            parts.append("Perfil del usuario:\n" + "\n".join(profile_lines))
+        if fact_lines:
+            parts.append("Hechos conocidos sobre el usuario:\n" + "\n".join(fact_lines))
+        return "\n\n".join(parts)
+    except Exception as e:
+        logging.warning(f"[MEMORY] Error cargando contexto de {user_id}: {e}")
+        return ""
+    finally:
+        postgres_pool.putconn(conn)
+
+
+def save_user_fact(user_id: str, fact: str, category: str = "general", conv_id: Optional[int] = None):
+    """Persiste un hecho extraído sobre el usuario."""
+    if not postgres_pool or not fact.strip():
+        return
+    conn = postgres_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            # Evitar duplicados exactos
+            cur.execute(
+                "SELECT id FROM user_facts WHERE user_id=%s AND fact=%s",
+                (user_id, fact.strip())
+            )
+            if cur.fetchone():
+                return
+            cur.execute(
+                "INSERT INTO user_facts (user_id, fact, category, source_conv_id) VALUES (%s, %s, %s, %s)",
+                (user_id, fact.strip()[:500], category, conv_id)
+            )
+        conn.commit()
+    except Exception as e:
+        logging.warning(f"[MEMORY] Error guardando hecho: {e}")
+    finally:
+        postgres_pool.putconn(conn)
+
+
+async def extract_facts_background(user_id: str, question: str, answer: str, conv_id: Optional[int] = None):
+    """Extrae hechos relevantes de la conversación y los guarda. Falla silenciosamente."""
+    try:
+        extract_prompt = f"""Analiza este intercambio y extrae hechos *duraderos* sobre el usuario (máx 3).
+Solo extrae: preferencias, proyectos activos, objetivos, contexto personal/laboral, herramientas que usa.
+NO extraigas: preguntas puntuales, respuestas técnicas temporales, saludos.
+
+Usuario preguntó: {question[:400]}
+Respuesta del asistente: {answer[:600]}
+
+Responde ÚNICAMENTE con JSON válido:
+{{"facts": [{{"text": "hecho 1", "category": "preferencia|proyecto|objetivo|contexto"}}, ...]}}
+Si no hay hechos relevantes: {{"facts": []}}"""
+
+        from langchain_ollama import ChatOllama as _CO
+        from langchain_core.messages import HumanMessage as _HM
+        _llm = _CO(model=LLM_MODEL, base_url=OLLAMA_BASE_URL, temperature=0, num_predict=200)
+        response = await asyncio.to_thread(_llm.invoke, [_HM(content=extract_prompt)])
+        raw = response.content.strip()
+        # Extraer JSON aunque tenga texto alrededor
+        import re as _re
+        m = _re.search(r'\{.*\}', raw, _re.DOTALL)
+        if m:
+            data = json.loads(m.group())
+            for item in data.get("facts", [])[:3]:
+                save_user_fact(user_id, item.get("text", ""), item.get("category", "general"), conv_id)
+    except Exception as e:
+        logging.debug(f"[MEMORY] extract_facts_background error (non-critical): {e}")
+
+
+def upsert_user_profile(user_id: str, display_name: Optional[str] = None,
+                         preferences: Optional[dict] = None, context_data: Optional[dict] = None):
+    """Crea o actualiza el perfil del usuario."""
+    if not postgres_pool:
+        return
+    conn = postgres_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_id FROM user_profile WHERE user_id=%s", (user_id,))
+            if cur.fetchone():
+                updates, vals = [], []
+                if display_name:
+                    updates.append("display_name=%s"); vals.append(display_name)
+                if preferences:
+                    updates.append("preferences=preferences || %s::jsonb"); vals.append(json.dumps(preferences))
+                if context_data:
+                    updates.append("context_data=context_data || %s::jsonb"); vals.append(json.dumps(context_data))
+                if updates:
+                    updates.append("updated_at=NOW()")
+                    vals.append(user_id)
+                    cur.execute(f"UPDATE user_profile SET {', '.join(updates)} WHERE user_id=%s", vals)
+            else:
+                cur.execute(
+                    "INSERT INTO user_profile (user_id, display_name, preferences, context_data) VALUES (%s,%s,%s,%s)",
+                    (user_id, display_name, json.dumps(preferences or {}), json.dumps(context_data or {}))
+                )
+        conn.commit()
+    except Exception as e:
+        logging.warning(f"[MEMORY] upsert_user_profile error: {e}")
+    finally:
+        postgres_pool.putconn(conn)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WHATSAPP HELPER — Envío proactivo de mensajes
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def send_whatsapp_message(phone: str, text: str) -> bool:
+    """Envía un mensaje de texto por WhatsApp via el bridge. Retorna True si tuvo éxito."""
+    try:
+        r = await asyncio.to_thread(
+            _http_client.post,
+            f"{WHATSAPP_BRIDGE_URL}/send",
+            json={"phoneNumber": phone, "text": text},
+            timeout=15.0,
+        )
+        return r.status_code == 200
+    except Exception as e:
+        logging.warning(f"[WA] Error enviando mensaje a {phone}: {e}")
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAREA #2 — Reporte de calidad del supervisor
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/admin/quality-report")
+async def quality_report(user: str = Depends(get_current_user)):
+    """Analiza los scores del supervisor y devuelve estadísticas de calidad."""
+    if user not in K8S_ALLOWED_USERS:
+        raise HTTPException(status_code=403, detail="Solo administradores.")
+
+    all_entries = []
+    try:
+        keys = redis_client.keys("agent_feedback:*")
+        for key in keys:
+            entries = redis_client.lrange(key, 0, -1)
+            for e in entries:
+                try:
+                    all_entries.append(json.loads(e))
+                except Exception:
+                    pass
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Redis no disponible: {e}")
+
+    if not all_entries:
+        return {"total": 0, "message": "No hay datos de feedback aún."}
+
+    scores   = [e.get("score", 0) for e in all_entries if "score" in e]
+    decisions = [e.get("decision", "") for e in all_entries]
+    replans  = decisions.count("REPLAN")
+    accepts  = decisions.count("ACCEPT")
+
+    # Distribución de scores
+    dist = {str(i): 0 for i in range(11)}
+    for s in scores:
+        dist[str(min(int(s), 10))] += 1
+
+    # Sesiones con score bajo (< 6)
+    low_sessions = [e for e in all_entries if e.get("score", 10) < 6]
+    low_questions = [e.get("question", "")[:100] for e in low_sessions[:10]]
+
+    avg = round(sum(scores) / len(scores), 2) if scores else 0
+
+    return {
+        "total_evaluaciones": len(all_entries),
+        "score_promedio": avg,
+        "score_min": min(scores) if scores else 0,
+        "score_max": max(scores) if scores else 0,
+        "distribución_scores": dist,
+        "total_accept": accepts,
+        "total_replan": replans,
+        "tasa_replan_pct": round(replans / len(decisions) * 100, 1) if decisions else 0,
+        "sesiones_baja_calidad": len(low_sessions),
+        "ejemplos_baja_calidad": low_questions,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAREA #4 — Memory Agent: endpoints de perfil y hechos
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class UserProfileUpdate(BaseModel):
+    display_name: Optional[str] = None
+    preferences: Optional[dict] = None
+    context_data: Optional[dict] = None
+
+@app.get("/api/memory/profile", dependencies=[Depends(get_current_user)])
+async def get_profile(user: str = Depends(get_current_user)):
+    """Devuelve el perfil y hechos del usuario autenticado."""
+    context = get_user_context(user)
+    if not postgres_pool:
+        return {"profile": None, "facts": [], "context_text": ""}
+    conn = postgres_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT display_name, preferences, context_data, updated_at FROM user_profile WHERE user_id=%s", (user,))
+            row = cur.fetchone()
+            profile = {"display_name": row[0], "preferences": row[1], "context_data": row[2], "updated_at": str(row[3])} if row else None
+            cur.execute("SELECT fact, category, created_at FROM user_facts WHERE user_id=%s ORDER BY created_at DESC LIMIT 50", (user,))
+            facts = [{"fact": r[0], "category": r[1], "date": str(r[2])} for r in cur.fetchall()]
+        return {"profile": profile, "facts": facts, "context_text": context}
+    finally:
+        postgres_pool.putconn(conn)
+
+
+@app.patch("/api/memory/profile", dependencies=[Depends(get_current_user)])
+async def update_profile(body: UserProfileUpdate, user: str = Depends(get_current_user)):
+    """Actualiza el perfil del usuario."""
+    upsert_user_profile(user, body.display_name, body.preferences, body.context_data)
+    return {"ok": True}
+
+
+@app.get("/api/memory/goals", dependencies=[Depends(get_current_user)])
+async def list_goals(user: str = Depends(get_current_user)):
+    """Lista los objetivos activos del usuario."""
+    if not postgres_pool:
+        return {"goals": []}
+    conn = postgres_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, title, category, status, progress, deadline, milestones, created_at FROM user_goals WHERE user_id=%s AND status='active' ORDER BY created_at DESC",
+                (user,)
+            )
+            goals = [
+                {"id": r[0], "title": r[1], "category": r[2], "status": r[3],
+                 "progress": r[4], "deadline": str(r[5]) if r[5] else None,
+                 "milestones": r[6], "created_at": str(r[7])}
+                for r in cur.fetchall()
+            ]
+        return {"goals": goals}
+    finally:
+        postgres_pool.putconn(conn)
+
+
+class GoalCreate(BaseModel):
+    title: str
+    category: str = "personal"
+    deadline: Optional[str] = None
+
+@app.post("/api/memory/goals", dependencies=[Depends(get_current_user)])
+async def create_goal(body: GoalCreate, user: str = Depends(get_current_user)):
+    """Crea un nuevo objetivo."""
+    if not postgres_pool:
+        raise HTTPException(status_code=503, detail="DB no disponible")
+    conn = postgres_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO user_goals (user_id, title, category, deadline) VALUES (%s,%s,%s,%s) RETURNING id",
+                (user, body.title[:200], body.category, body.deadline)
+            )
+            goal_id = cur.fetchone()[0]
+        conn.commit()
+        return {"id": goal_id, "title": body.title}
+    finally:
+        postgres_pool.putconn(conn)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAREA #5 — Day Planner matutino
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _get_k8s_health_brief(user_id: str) -> str:
+    """Obtiene un resumen breve del estado del cluster via k8s-agent."""
+    try:
+        r = await asyncio.to_thread(
+            _http_client.post,
+            f"{K8S_AGENT_URL}/api/k8s-agent",
+            json={"query": "Dame un resumen breve del estado del cluster: pods con problemas, uso de recursos.", "user_email": user_id},
+            headers={"Authorization": f"Bearer {INTERNAL_API_SECRET}"},
+            timeout=60.0,
+        )
+        return r.json().get("response", "") if r.status_code == 200 else ""
+    except Exception as e:
+        logging.warning(f"[PLANNER] Error k8s health: {e}")
+        return ""
+
+
+async def _get_calendar_brief(user_id: str) -> str:
+    """Obtiene eventos de hoy via productivity-service."""
+    try:
+        r = await asyncio.to_thread(
+            _http_client.post,
+            f"{PRODUCTIVITY_SERVICE_URL}/organize",
+            json={"user_email": user_id},
+            headers={"Authorization": f"Bearer {INTERNAL_API_SECRET}"},
+            timeout=60.0,
+        )
+        data = r.json() if r.status_code == 200 else {}
+        return data.get("summary", "") if data else ""
+    except Exception as e:
+        logging.warning(f"[PLANNER] Error calendar: {e}")
+        return ""
+
+
+async def _get_active_goals_text(user_id: str) -> str:
+    """Obtiene objetivos activos como texto."""
+    if not postgres_pool:
+        return ""
+    conn = postgres_pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT title, progress, category FROM user_goals WHERE user_id=%s AND status='active' ORDER BY updated_at DESC LIMIT 5",
+                (user_id,)
+            )
+            rows = cur.fetchall()
+        if not rows:
+            return ""
+        return "\n".join([f"- {r[0]} ({r[2]}, {r[1]}% completado)" for r in rows])
+    except Exception:
+        return ""
+    finally:
+        postgres_pool.putconn(conn)
+
+
+@app.post("/api/planner/daily")
+async def daily_planner(request: Request):
+    """
+    Genera y envía el plan del día por WhatsApp.
+    Llamado por el CronJob de Kubernetes cada mañana.
+    Autenticado via INTERNAL_API_SECRET en el header.
+    """
+    auth = request.headers.get("Authorization", "")
+    if auth.removeprefix("Bearer ").strip() != INTERNAL_API_SECRET:
+        raise HTTPException(status_code=403, detail="No autorizado.")
+
+    body = await request.json()
+    user_id = body.get("user_id", ADMIN_PHONE)
+    phone   = body.get("phone",   ADMIN_PHONE)
+
+    import datetime as _dt
+    today = _dt.date.today().strftime("%A %d de %B de %Y")
+
+    # Recopilar contexto en paralelo
+    k8s_health, calendar_summary, goals_text, user_ctx = await asyncio.gather(
+        _get_k8s_health_brief(user_id),
+        _get_calendar_brief(user_id),
+        _get_active_goals_text(user_id),
+        asyncio.to_thread(get_user_context, user_id),
+    )
+
+    plan_prompt = f"""Genera un plan del día conciso para el usuario. Hoy es {today}.
+
+{f"Perfil del usuario:{chr(10)}{user_ctx}" if user_ctx else ""}
+
+{f"Estado del cluster Kubernetes:{chr(10)}{k8s_health}" if k8s_health else ""}
+
+{f"Agenda de hoy:{chr(10)}{calendar_summary}" if calendar_summary else ""}
+
+{f"Objetivos activos:{chr(10)}{goals_text}" if goals_text else ""}
+
+Genera un mensaje de buenos días con:
+1. Saludo breve personalizado
+2. Resumen del calendario del día (si hay eventos)
+3. Alertas del cluster (si hay problemas, si no: ✅ Cluster OK)
+4. Un objetivo del día (el más relevante de los activos)
+5. Una pregunta de confirmación corta al final
+
+Formato WhatsApp: usa *negritas*, emojis y saltos de línea. Máximo 300 palabras."""
+
+    try:
+        from langchain_ollama import ChatOllama as _CO
+        from langchain_core.messages import HumanMessage as _HM
+        _llm = _CO(model=LLM_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.4, num_predict=600)
+        response = await asyncio.to_thread(_llm.invoke, [_HM(content=plan_prompt)])
+        plan_text = response.content.strip()
+    except Exception as e:
+        logging.error(f"[PLANNER] Error generando plan: {e}")
+        plan_text = f"🌅 Buenos días! Son las {_dt.datetime.now().strftime('%H:%M')}. No pude generar el plan completo hoy, pero estoy disponible para ayudarte."
+
+    # Enviar por WhatsApp
+    sent = await send_whatsapp_message(phone, plan_text)
+    logging.info(f"[PLANNER] Plan enviado a {phone}: {sent}")
+
+    return {"ok": True, "sent": sent, "plan": plan_text}
+
 
 @app.get("/api/health")
 async def health_check():

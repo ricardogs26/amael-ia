@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: whatsapp-bridge
-        image: registry.richardx.dev/whatsapp-bridge:1.2.4
+        image: registry.richardx.dev/whatsapp-bridge:1.3.0
         imagePullPolicy: Always
         ports:
         - containerPort: 3000
@@ -26,6 +26,8 @@ spec:
         - name: shm
           mountPath: /dev/shm
         env:
+        - name: AMAEL_BASE_URL
+          value: "http://backend-service:8000"
         - name: AMAEL_API_URL
           value: "http://backend-service:8000/api/chat"
         - name: AMAEL_JWT_TOKEN
