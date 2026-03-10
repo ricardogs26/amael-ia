@@ -144,7 +144,8 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
         fontSize: '13px',
         lineHeight: '1.65',
         color: isTerminal ? '#a8ff78' : '#e2e8f0',
-        whiteSpace: 'pre',
+        whiteSpace: 'pre-wrap',
+        wordBreak: 'break-word',
       }}>
         <code style={{ fontFamily: 'inherit', background: 'none', color: 'inherit', padding: 0 }}>
           {code}
