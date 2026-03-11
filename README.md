@@ -2,6 +2,7 @@
 ![Kubernetes](https://img.shields.io/badge/kubernetes-%23326ce5.svg?logo=kubernetes&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-005571?style=flat&logo=fastapi)
 ![LangChain](https://img.shields.io/badge/LangChain-1C3C3C?style=flat&logo=langchain)
+![Next.js](https://img.shields.io/badge/Next.js-000000?style=flat&logo=next.js&logoColor=white)
 
 # Amael IA 🧠🤖
 
@@ -13,12 +14,12 @@ Desplegada completamente sobre Kubernetes, Amael IA utiliza una arquitectura de 
 
 ## ✨ Características Principales
 
-*   💬 **Interfaz Conversacional:** Acceso mediante un frontend web moderno en **Streamlit** y conectividad nativa vía **WhatsApp** (`whatsapp-bridge` v1.2.4), con historiales y RAG **aislados por usuario**.
-*   🔒 **Seguridad & Hardening:** Autenticación **Google OAuth**, encriptado con Vault, validación de prompts anti-inyección, rate limiting mediante Redis y sanitización de outputs.
-*   🧠 **RAG Multiusuario:** Ingesta de documentos con vectorización en **Qdrant**. Cada usuario cuenta con memoria contextual aislada.
-*   🛠️ **DevOps Autónomo (K8s SRE Agent):** Administra el clúster en tiempo real. Lista pods, revisa logs, consulta PromQL/Grafana y ejecuta acciones correctivas (`Eliminar_Pod`).
+*   💬 **Interfaz Conversacional:** Acceso mediante **Next.js 14** (principal) y **Streamlit** (standby), con conectividad nativa vía **WhatsApp** (`whatsapp-bridge` v1.3.0).
+*   🔒 **Seguridad & Hardening (P4):** Autenticación **Google OAuth**, encriptado con **Vault**, validación de prompts anti-inyección, rate limiting mediante Redis y sanitización de outputs.
+*   🧠 **Memoria & Objetivos (v2.15.0):** Perfiles persistentes, extracción automática de hechos (facts) y seguimiento de objetivos con progreso.
+*   🛠️ **DevOps Autónomo (K8s SRE Agent):** Administra el clúster en tiempo real. Lista pods, revisa logs, consulta PromQL/Grafana y ejecuta acciones correctivas.
 *   📅 **Productividad Integrada:** Automatización de agenda mediante integración con **Google Calendar** y **Gmail API** (`productivity-service`).
-*   📊 **Observabilidad Full-Stack:** Monitoreo con **Prometheus, Grafana y Tempo**. Incluye un **Service Map** en tiempo real y dashboards especializados de seguridad y performance.
+*   📊 **Observabilidad Full-Stack (P6/P7):** Monitoreo con **Prometheus, Grafana y Tempo**. Incluye un **Service Map** en tiempo real y 7 dashboards especializados.
 
 ---
 
@@ -35,21 +36,31 @@ Amael IA orquestado por **Kubernetes (MicroK8s)** con imágenes en registro priv
 
 | Servicio | Versión | Descripción |
 |---------|---------|-------------|
-| `backend-ia` | `2.11.0` | Orquestador LangGraph, FastAPI. |
+| `backend-ia` | `2.16.0` | Orquestador LangGraph, Memory Agent, Facts extraction. |
 | `k8s-agent` | `1.6.0` | SRE Expert, automatización K8s + Vault. |
-| `productivity-service` | `1.2.0` | Integración Google Workspace. |
-| `frontend-ia` | `2.0.0` | Streamlit Rich-UI, system-token theming. |
-| `whatsapp-bridge` | `1.2.4` | Puppeteer bridge con reintentos y timeout extendido. |
+| `productivity-service` | `1.2.0` | Integración Google Workspace + Vault integration. |
+| `frontend-next` | `1.0.4` | Web UI principal (Next.js 14, activo en `/`). |
+| `frontend-ia` | `2.0.4` | Streamlit UI (standby), system-token theming. |
+| `whatsapp-bridge` | `1.3.0` | Puppeteer bridge con historial y comandos rápidos. |
 | `llm-adapter` | `1.0.0` | Proxy OpenAI-compatible hacia Ollama. |
 
 ---
 
-### Diagrama de Flujo y Conectividad
+### Ingress Routing (`amael-ia.richardx.dev`)
+
+- `/api` → `backend-ia:8000`
+- `/llm` → `llm-adapter:80`
+- `/tts` → `cosyvoice-service:8000`
+- `/` → `frontend-next:3000`
+
+---
+
+### Diagrama de Flujo
 
 ```mermaid
 graph TD
     subgraph "Interfaces"
-        UI[Frontend Streamlit]
+        UI[Frontend Next.js]
         WA[WhatsApp App]
     end
 
@@ -75,19 +86,25 @@ graph TD
 
     subgraph "Inference Providers"
         OL[Ollama - qwen2.5:14b]
-        TF[TF Serving]
         CV[CosyVoice - TTS]
     end
 
     %% Connectivity
     UI & WA <--> BE
     BE <--> DB & VS & VA
-    BE <--> OL & TF
+    BE <--> OL & CV
     EXEC --> K8S & PROD
-    K8S -->|Action| KUBE[K8s API]
-    K8S -->|Metrics| PROM[Prometheus / Grafana]
-    PROD -->|Sync| GAPI[Google API]
 ```
+
+---
+
+## 📊 Observabilidad & Métricas
+
+Amael incluye un stack de observabilidad profundo para telemetría y seguridad:
+
+*   **Dashboards:** 7 paneles en Grafana (LLM, Pipeline, RAG, Infra, Supervisor, Seguridad, Service Map).
+*   **Tracing:** Implementación de OpenTelemetry en todos los microservicios con Tempo.
+*   **Service Map:** Visualización en tiempo real de la topología de llamadas inter-servicios.
 
 ---
 
@@ -100,10 +117,11 @@ docker push registry.richardx.dev/<service>:<tag>
 
 # 2. Deploy
 kubectl apply -f k8s/<manifest>.yaml -n amael-ia
-kubectl rollout restart deployment <service> -n amael-ia
+kubectl rollout status deployment/<service> -n amael-ia
 ```
 
 ## 🔐 Seguridad y Privacidad
-*   **Vault Integration:** Tokens de Google OAuth se almacenan cifrados por usuario.
-*   **RBAC strico:** El agente de K8s está restringido al namespace `amael-ia`.
-*   **Output Sanitization:** Redacción automática de tokens `hvs.*`, JWTs y passwords en las respuestas del bot.
+*   **Vault Integration:** Tokens de Google OAuth se almacenan cifrados por usuario usando Kubernetes Auth Method.
+*   **RBAC estricto:** El agente de K8s está restringido al namespace `amael-ia`.
+*   **Sanitización:** Redacción automática de tokens `hvs.*`, JWTs y passwords.
+*   **Rate Limiting:** Control de inundación mediante Redis (15 req/60s).
