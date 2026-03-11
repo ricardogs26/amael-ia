@@ -108,6 +108,63 @@ Amael incluye un stack de observabilidad profundo para telemetría y seguridad:
 
 ---
 
+## 🛠️ Detalle de Servicios y Comunicación
+
+Amael IA es un sistema distribuido donde cada microservicio tiene una responsabilidad única y se comunica mediante protocolos estándar (REST/gRPC/S3).
+
+### 1. `backend-ia` (El Orquestador)
+*   **Función:** Gestiona el grafo de agentes (**LangGraph**), maneja la memoria persistente del usuario y coordina la ejecución de herramientas.
+*   **Comunicación:**
+    *   **Expertos:** Llama a `k8s-agent` y `productivity-service` vía REST usando `INTERNAL_API_SECRET`.
+    *   **Inferencia:** Conecta con `ollama-service` (puerto 11434) para razonamiento y `cosyvoice-service` (puerto 8000) para TTS.
+    *   **Bases de Datos:** PostgreSQL (historia), Redis (rate limit), Qdrant (RAG).
+*   **Endpoints Clave:** `/api/chat/stream`, `/api/memory/profile`, `/api/conversations`.
+
+### 2. `k8s-agent` (El Experto SRE)
+*   **Función:** Agente especializado en la administración del clúster y seguridad de secretos.
+*   **Comunicación:**
+    *   **Clúster:** Consulta la API de Kubernetes para gestionar recursos.
+    *   **Métricas:** Realiza consultas PromQL a **Prometheus** y extrae dashboards de **Grafana**.
+    *   **Secretos:** Interactúa con HashiCorp Vault para troubleshooting de políticas.
+*   **Configuración:** Requiere `INTERNAL_API_SECRET` para autorizar peticiones del backend.
+
+### 3. `productivity-service` (Integración Workspace)
+*   **Función:** Gestiona calendarios (Google Calendar) y correos (Gmail).
+*   **Comunicación:**
+    *   **Vault:** Utiliza el método **Kubernetes Auth** para recuperar tokens de Google OAuth cifrados desde `secret/data/amael/google-tokens/*`.
+    *   **Timezone:** Sincronizado con `America/Mexico_City` para gestión de agendas.
+
+### 4. `whatsapp-bridge` (El Puente Móvil)
+*   **Función:** Expone la IA en WhatsApp usando Puppeteer y persistencia de sesión.
+*   **Comunicación:** Actúa como cliente proactivo del `backend-ia`, manteniendo el historial de conversación por número telefónico.
+
+---
+
+## ⚙️ Reglas de Configuración y Seguridad
+
+### Patrones de Autenticación
+*   **Interna:** Comunicación entre microservicios protegida por `INTERNAL_API_SECRET` (incluida en el header `Authorization: Bearer`).
+*   **Vault K8s Auth:** Los servicios (`productivity-service`) no almacenan credenciales de Vault; presentan su **ServiceAccount Token** a Vault, que lo valida contra la API de Kubernetes.
+
+### Variables de Entorno Críticas
+*   `VAULT_ADDR`: `http://vault.vault.svc.cluster.local:8200`
+*   `K8S_ALLOWED_USERS_CSV`: Lista blanca de emails y números telefónicos autorizados para interactuar con la IA.
+*   `RATE_LIMIT_MAX`: Máximo de 15 peticiones por ventana de 60 segundos (Redis).
+
+### Almacenamiento y RAG
+*   **VectorStore:** Todos los embeddings generados por `nomic-embed-text` se almacenan en la colección `amael_knowledge` de Qdrant.
+*   **Aislamiento:** La búsqueda semántica está filtrada por `user_id` en los metadatos de los puntos en Qdrant.
+
+---
+
+## 📊 Observabilidad Avanzada
+
+El sistema implementa el patrón **Observer Sidecar**:
+*   **Tracing:** Cada mensaje genera un `TraceId` que viaja desde el frontend hasta el agente de K8s, visualizable en el **Service Map** de Grafana/Tempo.
+*   **Alerting:** Métricas de seguridad (`amael_security_input_blocked_total`) disparan alertas cuando se detectan intentos de inyección de prompt.
+
+---
+
 ## 🚀 Despliegue (Manual CI/CD)
 
 ```bash
