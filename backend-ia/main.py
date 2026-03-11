@@ -54,6 +54,7 @@ import io
 PRODUCTIVITY_SERVICE_URL  = "http://productivity-service:8001"
 K8S_AGENT_URL             = "http://k8s-agent-service:8002"
 WHATSAPP_BRIDGE_URL       = os.getenv("WHATSAPP_BRIDGE_URL", "http://whatsapp-bridge-service:3000")
+WHATSAPP_PERSONAL_URL     = os.getenv("WHATSAPP_PERSONAL_URL", "http://whatsapp-personal-service:3001")
 ADMIN_PHONE               = os.getenv("ADMIN_PHONE", "5219993437008")
 INTERNAL_API_SECRET       = os.environ.get("INTERNAL_API_SECRET")
 
@@ -71,6 +72,19 @@ oauth.register(
     server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
     client_kwargs={
         'scope': 'openid email profile'
+    }
+)
+
+# OAuth para Google Calendar (offline access + Calendar + Gmail scopes)
+oauth.register(
+    name='google_calendar',
+    client_id=os.environ.get('GOOGLE_CLIENT_ID'),
+    client_secret=os.environ.get('GOOGLE_CLIENT_SECRET'),
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={
+        'scope': 'openid email https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/gmail.readonly',
+        'access_type': 'offline',
+        'prompt': 'consent',
     }
 )
 
@@ -170,17 +184,33 @@ POSTGRES_USER = os.getenv("POSTGRES_USER", "amael_user")
 POSTGRES_PASS = os.getenv("POSTGRES_PASSWORD", "amael_password_2026")
 
 # Pool de conexiones para Postgres
-try:
-    postgres_pool = psycopg2.pool.SimpleConnectionPool(1, 10,
-        user=POSTGRES_USER,
-        password=POSTGRES_PASS,
-        host=POSTGRES_HOST,
-        database=POSTGRES_DB
-    )
-    print("PostgreSQL connection pool created successfully")
-except Exception as e:
-    print(f"Error creating PostgreSQL pool: {e}")
-    postgres_pool = None
+_postgres_pool = None
+_last_pool_attempt = 0
+POOL_RETRY_INTERVAL = 30 # seconds
+
+def get_postgres_pool():
+    global _postgres_pool, _last_pool_attempt
+    now = time.time()
+    
+    if _postgres_pool is not None:
+        return _postgres_pool
+    
+    if now - _last_pool_attempt < POOL_RETRY_INTERVAL:
+        return None
+        
+    _last_pool_attempt = now
+    try:
+        _postgres_pool = psycopg2.pool.SimpleConnectionPool(1, 10,
+            user=POSTGRES_USER,
+            password=POSTGRES_PASS,
+            host=POSTGRES_HOST,
+            database=POSTGRES_DB
+        )
+        print("PostgreSQL connection pool created successfully")
+        return _postgres_pool
+    except Exception as e:
+        print(f"Error creating PostgreSQL pool: {e}")
+        return None
 
 MINIO_URL = os.getenv("MINIO_URL", "minio-service:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "amael_admin")
@@ -287,8 +317,9 @@ def get_user_vectorstore(user_email: str):
 
 def init_db():
     """Inicializa las tablas necesarias en PostgreSQL."""
-    if not postgres_pool: return
-    conn = postgres_pool.getconn()
+    pool = get_postgres_pool()
+    if not pool: return
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute("""
@@ -368,10 +399,140 @@ def init_db():
             cur.execute("""
                 ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS conversation_id INTEGER;
             """)
+            # Add role + status to user_profile
+            cur.execute("""
+                ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS role VARCHAR DEFAULT 'user';
+                ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS status VARCHAR DEFAULT 'active';
+                ALTER TABLE user_profile ADD COLUMN IF NOT EXISTS timezone TEXT DEFAULT 'America/Mexico_City';
+            """)
+            # User identities: maps phone/email → canonical user_id
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_identities (
+                    id SERIAL PRIMARY KEY,
+                    canonical_user_id TEXT NOT NULL,
+                    identity_type TEXT NOT NULL,
+                    identity_value TEXT UNIQUE NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_identity_value ON user_identities(identity_value);
+            """)
+            # WhatsApp Personal: settings por usuario (horarios, reglas)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS whatsapp_personal_settings (
+                    user_id       TEXT PRIMARY KEY,
+                    auto_reply    BOOLEAN     DEFAULT TRUE,
+                    quiet_start   INTEGER     DEFAULT 22,
+                    quiet_end     INTEGER     DEFAULT 8,
+                    active_days   INTEGER[]   DEFAULT '{1,2,3,4,5}',
+                    reply_scope   TEXT        DEFAULT 'all',
+                    ai_assist     BOOLEAN     DEFAULT TRUE,
+                    offline_msg       TEXT        DEFAULT NULL,
+                    updated_at        TIMESTAMP   DEFAULT NOW()
+                );
+                ALTER TABLE whatsapp_personal_settings
+                    ADD COLUMN IF NOT EXISTS quiet_enabled    BOOLEAN DEFAULT TRUE;
+                ALTER TABLE whatsapp_personal_settings
+                    ADD COLUMN IF NOT EXISTS allowed_contacts JSONB   DEFAULT '[]';
+            """)
+            # Platform-wide settings (key/value)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS platform_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO platform_settings (key, value) VALUES ('allow_access_requests', 'false')
+                ON CONFLICT (key) DO NOTHING;
+            """)
+            # Seed admin user + identities
+            _admin_email = os.environ.get('ADMIN_EMAIL', 'ricardogs26@gmail.com')
+            _admin_phone = os.environ.get('ADMIN_PHONE', '5219993437008')
+            cur.execute("""
+                INSERT INTO user_profile (user_id, role, status)
+                VALUES (%s, 'admin', 'active')
+                ON CONFLICT (user_id) DO UPDATE SET role = 'admin', status = 'active'
+                WHERE user_profile.role != 'admin';
+            """, (_admin_email,))
+            cur.execute("""
+                INSERT INTO user_identities (canonical_user_id, identity_type, identity_value)
+                VALUES (%s, 'email', %s) ON CONFLICT (identity_value) DO NOTHING;
+            """, (_admin_email, _admin_email))
+            if _admin_phone:
+                cur.execute("""
+                    INSERT INTO user_identities (canonical_user_id, identity_type, identity_value)
+                    VALUES (%s, 'whatsapp', %s) ON CONFLICT (identity_value) DO NOTHING;
+                """, (_admin_email, _admin_phone))
             conn.commit()
     finally:
-        postgres_pool.putconn(conn)
+        pool.putconn(conn)
 
+
+# ─── Identity helpers ──────────────────────────────────────────────────────────
+
+def resolve_user_id(identifier: str) -> str:
+    """Mapea cualquier identidad (teléfono/email) al user_id canónico (email)."""
+    if not postgres_pool or not identifier:
+        return identifier
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT canonical_user_id FROM user_identities WHERE identity_value = %s", (identifier,))
+            row = cur.fetchone()
+            return row[0] if row else identifier
+    finally:
+        pool.putconn(conn)
+
+
+def get_user_role(user_id: str) -> str:
+    """Devuelve el rol del usuario: 'admin', 'user' o 'readonly'."""
+    pool = get_postgres_pool()
+    if not pool:
+        return 'admin' if user_id == os.environ.get('ADMIN_EMAIL', 'ricardogs26@gmail.com') else 'user'
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT role FROM user_profile WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+            return row[0] if row else 'user'
+    finally:
+        pool.putconn(conn)
+
+
+def is_user_registered(identifier: str):
+    """Retorna (allowed: bool, canonical_user_id: str)."""
+    canonical = resolve_user_id(identifier)
+    if identifier in FULL_WHITELIST or canonical in FULL_WHITELIST:
+        return True, canonical
+    pool = get_postgres_pool()
+    if not pool:
+        return False, canonical
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT user_id FROM user_profile WHERE user_id = %s AND status = 'active'",
+                (canonical,)
+            )
+            return (cur.fetchone() is not None, canonical)
+    finally:
+        pool.putconn(conn)
+
+
+def get_platform_setting(key: str, default: str = '') -> str:
+    pool = get_postgres_pool()
+    if not pool:
+        return default
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM platform_settings WHERE key = %s", (key,))
+            row = cur.fetchone()
+            return row[0] if row else default
+    finally:
+        pool.putconn(conn)
+
+
+# ───────────────────────────────────────────────────────────────────────────────
 
 def save_chat_message(user_id: str, role: str, content: str, conversation_id: Optional[int] = None):
     """Guarda un mensaje en Redis (caché) y Postgres (persistente)."""
@@ -383,8 +544,9 @@ def save_chat_message(user_id: str, role: str, content: str, conversation_id: Op
     redis_client.lpush(redis_key, message_json)
     redis_client.ltrim(redis_key, 0, 19)
 
-    if postgres_pool:
-        conn = postgres_pool.getconn()
+    pool = get_postgres_pool()
+    if pool:
+        conn = pool.getconn()
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -393,26 +555,28 @@ def save_chat_message(user_id: str, role: str, content: str, conversation_id: Op
                 )
                 conn.commit()
         finally:
-            postgres_pool.putconn(conn)
+            pool.putconn(conn)
 
     if conversation_id:
         _touch_conversation(conversation_id)
 
 
 def _touch_conversation(conversation_id: int):
-    if not postgres_pool: return
-    conn = postgres_pool.getconn()
+    pool = get_postgres_pool()
+    if not pool: return
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute("UPDATE conversations SET last_active_at = NOW() WHERE id = %s", (conversation_id,))
             conn.commit()
     finally:
-        postgres_pool.putconn(conn)
+        pool.putconn(conn)
 
 
 def create_conversation(user_id: str, title: str = "Nueva conversación") -> Optional[int]:
-    if not postgres_pool: return None
-    conn = postgres_pool.getconn()
+    pool = get_postgres_pool()
+    if not pool: return None
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -423,12 +587,13 @@ def create_conversation(user_id: str, title: str = "Nueva conversación") -> Opt
             conn.commit()
             return conv_id
     finally:
-        postgres_pool.putconn(conn)
+        pool.putconn(conn)
 
 
 def get_user_conversations(user_id: str, limit: int = 30) -> list:
-    if not postgres_pool: return []
-    conn = postgres_pool.getconn()
+    pool = get_postgres_pool()
+    if not pool: return []
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -438,12 +603,13 @@ def get_user_conversations(user_id: str, limit: int = 30) -> list:
             rows = cur.fetchall()
             return [{"id": r[0], "title": r[1], "created_at": r[2].isoformat(), "last_active_at": r[3].isoformat()} for r in rows]
     finally:
-        postgres_pool.putconn(conn)
+        pool.putconn(conn)
 
 
 def get_conversation_messages(conversation_id: int, user_id: str) -> list:
-    if not postgres_pool: return []
-    conn = postgres_pool.getconn()
+    pool = get_postgres_pool()
+    if not pool: return []
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -453,7 +619,7 @@ def get_conversation_messages(conversation_id: int, user_id: str) -> list:
             rows = cur.fetchall()
             return [{"role": r[0], "content": r[1], "ts": r[2].strftime("%H:%M")} for r in rows]
     finally:
-        postgres_pool.putconn(conn)
+        pool.putconn(conn)
 
 
 def get_chat_history(user_id: str, limit: int = 20, conversation_id: Optional[int] = None) -> list:
@@ -466,8 +632,9 @@ def get_chat_history(user_id: str, limit: int = 20, conversation_id: Optional[in
     except Exception as e:
         print(f"Redis error: {e}")
 
-    if postgres_pool:
-        conn = postgres_pool.getconn()
+    pool = get_postgres_pool()
+    if pool:
+        conn = pool.getconn()
         try:
             with conn.cursor() as cur:
                 if conversation_id:
@@ -483,14 +650,15 @@ def get_chat_history(user_id: str, limit: int = 20, conversation_id: Optional[in
                 rows = cur.fetchall()
                 return [{"role": r, "content": c} for r, c in reversed(rows)]
         finally:
-            postgres_pool.putconn(conn)
+            pool.putconn(conn)
     
     return []
 
 def save_user_document(user_id: str, doc_type: str, summary: str, content: dict, raw_analysis: str):
     """Guarda un documento extraído (como un ticket) en Postgres."""
-    if postgres_pool:
-        conn = postgres_pool.getconn()
+    pool = get_postgres_pool()
+    if pool:
+        conn = pool.getconn()
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -499,12 +667,13 @@ def save_user_document(user_id: str, doc_type: str, summary: str, content: dict,
                 )
                 conn.commit()
         finally:
-            postgres_pool.putconn(conn)
+            pool.putconn(conn)
 
 def get_user_documents(user_id: str, query: str = None, limit: int = 5):
     """Recupera documentos guardados de un usuario."""
-    if postgres_pool:
-        conn = postgres_pool.getconn()
+    pool = get_postgres_pool()
+    if pool:
+        conn = pool.getconn()
         try:
             with conn.cursor() as cur:
                 if query:
@@ -519,7 +688,7 @@ def get_user_documents(user_id: str, query: str = None, limit: int = 5):
                     )
                 return cur.fetchall()
         finally:
-            postgres_pool.putconn(conn)
+            pool.putconn(conn)
     return []
 
 def get_history_path_for_id(identifier: str) -> str:
@@ -620,6 +789,88 @@ async def auth_callback(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error en la autenticación con Google: {e}")
 
+# --- GOOGLE CALENDAR OAUTH ---
+
+@app.get('/api/auth/calendar')
+async def calendar_auth(request: Request, token: Optional[str] = None):
+    """Inicia el flujo OAuth para autorizar acceso a Google Calendar y Gmail.
+    Acepta el JWT como query param ?token= (navegación directa del browser)."""
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if not email or email not in FULL_WHITELIST:
+            raise HTTPException(status_code=403, detail="Usuario no autorizado")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    redirect_uri = "https://amael-ia.richardx.dev/api/auth/calendar/callback"
+    request.session['calendar_user'] = email
+    return await oauth.google_calendar.authorize_redirect(
+        request, redirect_uri,
+        access_type='offline',
+        prompt='consent',
+    )
+
+
+@app.get('/api/auth/calendar/callback')
+async def calendar_callback(request: Request):
+    """Recibe el código OAuth, obtiene los tokens y los guarda en Vault via productivity-service."""
+    try:
+        token = await oauth.google_calendar.authorize_access_token(request)
+        user_email = request.session.get('calendar_user')
+        if not user_email:
+            user_info = token.get('userinfo', {})
+            user_email = user_info.get('email', '')
+
+        if not user_email:
+            raise HTTPException(status_code=400, detail="No se pudo identificar el usuario.")
+
+        refresh_token = token.get('refresh_token')
+        if not refresh_token:
+            logging.error(f"[CALENDAR] Google no devolvió refresh_token para {user_email}. Token keys: {list(token.keys())}")
+            return Response(status_code=302, headers={"location": "https://amael-ia.richardx.dev?calendar_error=1"})
+
+        # Guardar tokens en Vault via productivity-service
+        payload = {
+            "user_email": user_email,
+            "token": token.get('access_token'),
+            "refresh_token": refresh_token,
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_id": os.environ.get('GOOGLE_CLIENT_ID'),
+            "client_secret": os.environ.get('GOOGLE_CLIENT_SECRET'),
+            "scopes": ["https://www.googleapis.com/auth/calendar", "https://www.googleapis.com/auth/gmail.readonly"],
+        }
+        r = _http_client.post(
+            f"{PRODUCTIVITY_SERVICE_URL}/credentials",
+            json=payload,
+            headers={"Authorization": f"Bearer {INTERNAL_API_SECRET}"},
+            timeout=30.0,
+        )
+        if r.status_code != 200:
+            logging.error(f"[CALENDAR] Error guardando credenciales: {r.text}")
+            return Response(status_code=302, headers={"location": "https://amael-ia.richardx.dev?calendar_error=1"})
+
+        logging.info(f"[CALENDAR] Credenciales guardadas para {user_email}")
+        return Response(status_code=302, headers={"location": "https://amael-ia.richardx.dev?calendar_connected=1"})
+
+    except Exception as e:
+        logging.error(f"[CALENDAR] Error en callback: {e}")
+        return Response(status_code=302, headers={"location": "https://amael-ia.richardx.dev?calendar_error=1"})
+
+
+@app.get('/api/auth/calendar/status')
+async def calendar_status(user: str = Depends(get_current_user)):
+    """Verifica si el usuario tiene Google Calendar conectado."""
+    r = _http_client.get(
+        f"{PRODUCTIVITY_SERVICE_URL}/credentials/status",
+        params={"user_email": user},
+        headers={"Authorization": f"Bearer {INTERNAL_API_SECRET}"},
+        timeout=10.0,
+    )
+    return r.json() if r.status_code == 200 else {"connected": False}
+
+
 # --- ENDPOINTS DE LA APLICACIÓN (ahora protegidos y multiusuario) ---
 
 # Currencies/tickers detected → use exchange rate API instead of DDG
@@ -681,6 +932,8 @@ def _extract_docx_text(content: bytes) -> str:
 @app.post("/api/ingest")
 async def ingest_data(file: UploadFile = File(...), user: str = Depends(get_current_user)):
     """Sube y procesa documentos (PDF, TXT, DOCX) — indexa en Qdrant y guarda metadata en DB."""
+    if get_user_role(user) == 'readonly':
+        raise HTTPException(status_code=403, detail="Tu rol de solo lectura no permite subir documentos.")
     temp_file_path = f"/tmp/{uuid.uuid4()}-{file.filename}"
     try:
         content = await file.read()
@@ -738,8 +991,9 @@ async def ingest_data(file: UploadFile = File(...), user: str = Depends(get_curr
 
         # Guardar metadata en user_documents
         doc_id = None
-        if postgres_pool:
-            conn = postgres_pool.getconn()
+        pool = get_postgres_pool()
+    if pool:
+            conn = pool.getconn()
             try:
                 with conn.cursor() as cur:
                     cur.execute(
@@ -750,7 +1004,7 @@ async def ingest_data(file: UploadFile = File(...), user: str = Depends(get_curr
                     doc_id = cur.fetchone()[0]
                     conn.commit()
             finally:
-                postgres_pool.putconn(conn)
+                pool.putconn(conn)
 
         # Backup en MinIO (best-effort)
         try:
@@ -784,9 +1038,10 @@ async def ingest_data(file: UploadFile = File(...), user: str = Depends(get_curr
 @app.get("/api/documents")
 async def list_documents(user: str = Depends(get_current_user)):
     """Lista los documentos subidos por el usuario."""
-    if not postgres_pool:
+    pool = get_postgres_pool()
+    if not pool:
         return {"documents": []}
-    conn = postgres_pool.getconn()
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -801,15 +1056,16 @@ async def list_documents(user: str = Depends(get_current_user)):
             for r in rows
         ]}
     finally:
-        postgres_pool.putconn(conn)
+        pool.putconn(conn)
 
 
 @app.delete("/api/documents/{doc_id}")
 async def delete_document(doc_id: int, user: str = Depends(get_current_user)):
     """Elimina un documento del historial (DB). Los vectores en Qdrant se mantienen."""
-    if not postgres_pool:
+    pool = get_postgres_pool()
+    if not pool:
         raise HTTPException(status_code=503, detail="DB no disponible")
-    conn = postgres_pool.getconn()
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -822,7 +1078,7 @@ async def delete_document(doc_id: int, user: str = Depends(get_current_user)):
             raise HTTPException(status_code=404, detail="Documento no encontrado")
         return {"deleted": doc_id}
     finally:
-        postgres_pool.putconn(conn)
+        pool.putconn(conn)
 
 @app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(get_current_user)])
 async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_user)):
@@ -835,7 +1091,7 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
         return ChatResponse(response="¡Hola! como te encuentras, envía tu consulta.")
 
     # P4-2: Rate limiting por usuario
-    effective_user = request.user_id if request.user_id else user
+    effective_user = resolve_user_id(request.user_id) if request.user_id else user
     allowed, remaining = _check_rate_limit(effective_user)
     if not allowed:
         logging.warning(f"[SECURITY] Rate limit excedido para user={effective_user}")
@@ -1111,11 +1367,18 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
             "document": document_tool,
         }
 
+        # Restricción de solo lectura: sin K8S ni Productividad
+        _readonly_prefix = ""
+        if get_user_role(effective_user) == 'readonly':
+            tools_map.pop("k8s", None)
+            tools_map.pop("productivity", None)
+            _readonly_prefix = "[RESTRICCIÓN ACTIVA: Este usuario es de solo lectura. NO uses K8S_TOOL ni PRODUCTIVITY_TOOL en ningún paso del plan.]\n\n"
+
         # P5-2: Reuse cached compiled orchestrator (compiled once at first request)
         orchestrator_app = get_orchestrator(redis_client=redis_client)
 
         initial_state = {
-            "question": request.prompt,
+            "question": _readonly_prefix + request.prompt,
             "plan": [],
             "batches": [],
             "current_batch": 0,
@@ -1164,14 +1427,15 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
             if len(request.prompt) > 50:
                 title += "…"
             _touch_conversation(conv_id)
-            if postgres_pool:
-                _c = postgres_pool.getconn()
+            pool = get_postgres_pool()
+    if pool:
+                _c = pool.getconn()
                 try:
                     with _c.cursor() as cur:
                         cur.execute("UPDATE conversations SET title = %s WHERE id = %s AND title = 'Nueva conversación'", (title, conv_id))
                         _c.commit()
                 finally:
-                    postgres_pool.putconn(_c)
+                    pool.putconn(_c)
 
         return ChatResponse(response=final_response)
 
@@ -1314,7 +1578,7 @@ async def chat_stream(request: ChatRequest, user: str = Depends(get_current_user
     """Streaming SSE version of /api/chat. Emits status events then streams tokens."""
     from fastapi.responses import StreamingResponse as SR
 
-    effective_user = request.user_id if request.user_id else user
+    effective_user = resolve_user_id(request.user_id) if request.user_id else user
 
     # Rate limit
     allowed, _ = _check_rate_limit(effective_user)
@@ -1340,6 +1604,13 @@ async def chat_stream(request: ChatRequest, user: str = Depends(get_current_user
 
     # Memory Agent v1: cargar contexto del usuario
     user_memory_context = get_user_context(effective_user)
+
+    # Restricción de solo lectura para stream endpoint
+    _stream_is_readonly = get_user_role(effective_user) == 'readonly'
+    _stream_readonly_prefix = (
+        "[RESTRICCIÓN ACTIVA: Este usuario es de solo lectura. NO uses K8S_TOOL ni PRODUCTIVITY_TOOL en ningún paso del plan.]\n\n"
+        if _stream_is_readonly else ""
+    )
 
     def _run_agent_sync():
         """Synchronous agent execution — runs in thread pool."""
@@ -1401,16 +1672,22 @@ async def chat_stream(request: ChatRequest, user: str = Depends(get_current_user
             content = _llm_doc.invoke(doc_prompt)
             return f"[DOCUMENT_START]\n{content}\n[DOCUMENT_END]"
 
+        _stream_tools_map = {
+            "rag": rag_tool, "web_search": web_search_tool, "document": document_tool,
+        }
+        if not _stream_is_readonly:
+            _stream_tools_map["k8s"] = k8s_tool
+            _stream_tools_map["productivity"] = productivity_tool
+
         orch = get_orchestrator(redis_client=redis_client)
-        initial_context = user_memory_context  # Memory Agent v1: inyectar perfil del usuario
+        initial_context = user_memory_context
         state = {
-            "question": prompt,
+            "question": _stream_readonly_prefix + prompt,
             "plan": [], "batches": [], "current_batch": 0, "current_step": 0,
             "context": initial_context, "tool_results": [], "final_answer": None,
             "user_id": effective_user, "retry_count": 0,
             "supervisor_score": 0, "supervisor_reason": "",
-            "tools_map": {"rag": rag_tool, "productivity": productivity_tool,
-                          "k8s": k8s_tool, "web_search": web_search_tool, "document": document_tool},
+            "tools_map": _stream_tools_map,
         }
         final_state = orch.invoke(state)
         answer = final_state.get("final_answer") or "Lo siento, no pude generar una respuesta."
@@ -1455,8 +1732,9 @@ async def chat_stream(request: ChatRequest, user: str = Depends(get_current_user
         if conv_id and len(history) == 0:
             title = prompt[:50].strip() + ("…" if len(prompt) > 50 else "")
             _touch_conversation(conv_id)
-            if postgres_pool:
-                _c = postgres_pool.getconn()
+            pool = get_postgres_pool()
+    if pool:
+                _c = pool.getconn()
                 try:
                     with _c.cursor() as cur:
                         cur.execute(
@@ -1465,7 +1743,7 @@ async def chat_stream(request: ChatRequest, user: str = Depends(get_current_user
                         )
                         _c.commit()
                 finally:
-                    postgres_pool.putconn(_c)
+                    pool.putconn(_c)
 
         # Memory Agent v1: extraer hechos en background (no bloquea el stream)
         asyncio.create_task(extract_facts_background(effective_user, prompt, final_answer, conv_id))
@@ -1509,9 +1787,10 @@ class ConversationUpdateRequest(BaseModel):
 
 @app.patch("/api/conversations/{conv_id}", dependencies=[Depends(get_current_user)])
 async def update_conversation(conv_id: int, body: ConversationUpdateRequest, user: str = Depends(get_current_user)):
-    if not postgres_pool:
+    pool = get_postgres_pool()
+    if not pool:
         return {"ok": True}
-    conn = postgres_pool.getconn()
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -1521,14 +1800,15 @@ async def update_conversation(conv_id: int, body: ConversationUpdateRequest, use
         conn.commit()
         return {"ok": True}
     finally:
-        postgres_pool.putconn(conn)
+        pool.putconn(conn)
 
 
 @app.delete("/api/conversations/{conv_id}", dependencies=[Depends(get_current_user)])
 async def delete_conversation(conv_id: int, user: str = Depends(get_current_user)):
-    if not postgres_pool:
+    pool = get_postgres_pool()
+    if not pool:
         return {"ok": True}
-    conn = postgres_pool.getconn()
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM chat_history WHERE conversation_id=%s AND user_id=%s", (conv_id, user))
@@ -1537,14 +1817,15 @@ async def delete_conversation(conv_id: int, user: str = Depends(get_current_user
         conn.commit()
         return {"ok": True}
     finally:
-        postgres_pool.putconn(conn)
+        pool.putconn(conn)
 
 
 @app.post("/api/feedback", dependencies=[Depends(get_current_user)])
 async def save_feedback(body: FeedbackRequest, user: str = Depends(get_current_user)):
-    if not postgres_pool:
+    pool = get_postgres_pool()
+    if not pool:
         return {"ok": True}
-    conn = postgres_pool.getconn()
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -1553,7 +1834,7 @@ async def save_feedback(body: FeedbackRequest, user: str = Depends(get_current_u
             )
             conn.commit()
     finally:
-        postgres_pool.putconn(conn)
+        pool.putconn(conn)
     return {"ok": True}
 
 
@@ -1563,9 +1844,10 @@ async def save_feedback(body: FeedbackRequest, user: str = Depends(get_current_u
 
 def get_user_context(user_id: str) -> str:
     """Carga el perfil y hechos recientes del usuario para inyectar en el agente."""
-    if not postgres_pool:
+    pool = get_postgres_pool()
+    if not pool:
         return ""
-    conn = postgres_pool.getconn()
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             # Perfil básico
@@ -1604,14 +1886,14 @@ def get_user_context(user_id: str) -> str:
         logging.warning(f"[MEMORY] Error cargando contexto de {user_id}: {e}")
         return ""
     finally:
-        postgres_pool.putconn(conn)
+        pool.putconn(conn)
 
 
 def save_user_fact(user_id: str, fact: str, category: str = "general", conv_id: Optional[int] = None):
     """Persiste un hecho extraído sobre el usuario."""
     if not postgres_pool or not fact.strip():
         return
-    conn = postgres_pool.getconn()
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             # Evitar duplicados exactos
@@ -1629,7 +1911,7 @@ def save_user_fact(user_id: str, fact: str, category: str = "general", conv_id: 
     except Exception as e:
         logging.warning(f"[MEMORY] Error guardando hecho: {e}")
     finally:
-        postgres_pool.putconn(conn)
+        pool.putconn(conn)
 
 
 async def extract_facts_background(user_id: str, question: str, answer: str, conv_id: Optional[int] = None):
@@ -1665,9 +1947,10 @@ Si no hay hechos relevantes: {{"facts": []}}"""
 def upsert_user_profile(user_id: str, display_name: Optional[str] = None,
                          preferences: Optional[dict] = None, context_data: Optional[dict] = None):
     """Crea o actualiza el perfil del usuario."""
-    if not postgres_pool:
+    pool = get_postgres_pool()
+    if not pool:
         return
-    conn = postgres_pool.getconn()
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT user_id FROM user_profile WHERE user_id=%s", (user_id,))
@@ -1692,7 +1975,7 @@ def upsert_user_profile(user_id: str, display_name: Optional[str] = None,
     except Exception as e:
         logging.warning(f"[MEMORY] upsert_user_profile error: {e}")
     finally:
-        postgres_pool.putconn(conn)
+        pool.putconn(conn)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1776,6 +2059,7 @@ async def quality_report(user: str = Depends(get_current_user)):
 
 class UserProfileUpdate(BaseModel):
     display_name: Optional[str] = None
+    timezone: Optional[str] = None
     preferences: Optional[dict] = None
     context_data: Optional[dict] = None
 
@@ -1783,34 +2067,44 @@ class UserProfileUpdate(BaseModel):
 async def get_profile(user: str = Depends(get_current_user)):
     """Devuelve el perfil y hechos del usuario autenticado."""
     context = get_user_context(user)
-    if not postgres_pool:
+    pool = get_postgres_pool()
+    if not pool:
         return {"profile": None, "facts": [], "context_text": ""}
-    conn = postgres_pool.getconn()
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT display_name, preferences, context_data, updated_at FROM user_profile WHERE user_id=%s", (user,))
+            cur.execute("SELECT display_name, preferences, context_data, updated_at, role, timezone FROM user_profile WHERE user_id=%s", (user,))
             row = cur.fetchone()
-            profile = {"display_name": row[0], "preferences": row[1], "context_data": row[2], "updated_at": str(row[3])} if row else None
+            profile = {"display_name": row[0], "preferences": row[1], "context_data": row[2], "updated_at": str(row[3]), "role": row[4] or 'user', "timezone": row[5]} if row else None
             cur.execute("SELECT fact, category, created_at FROM user_facts WHERE user_id=%s ORDER BY created_at DESC LIMIT 50", (user,))
             facts = [{"fact": r[0], "category": r[1], "date": str(r[2])} for r in cur.fetchall()]
         return {"profile": profile, "facts": facts, "context_text": context}
     finally:
-        postgres_pool.putconn(conn)
+        pool.putconn(conn)
 
 
 @app.patch("/api/memory/profile", dependencies=[Depends(get_current_user)])
 async def update_profile(body: UserProfileUpdate, user: str = Depends(get_current_user)):
     """Actualiza el perfil del usuario."""
     upsert_user_profile(user, body.display_name, body.preferences, body.context_data)
+    if body.timezone and postgres_pool:
+        conn = pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE user_profile SET timezone = %s WHERE user_id = %s", (body.timezone, user))
+                conn.commit()
+        finally:
+            pool.putconn(conn)
     return {"ok": True}
 
 
 @app.get("/api/memory/goals", dependencies=[Depends(get_current_user)])
 async def list_goals(user: str = Depends(get_current_user)):
     """Lista los objetivos activos del usuario."""
-    if not postgres_pool:
+    pool = get_postgres_pool()
+    if not pool:
         return {"goals": []}
-    conn = postgres_pool.getconn()
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -1825,7 +2119,7 @@ async def list_goals(user: str = Depends(get_current_user)):
             ]
         return {"goals": goals}
     finally:
-        postgres_pool.putconn(conn)
+        pool.putconn(conn)
 
 
 class GoalCreate(BaseModel):
@@ -1836,9 +2130,10 @@ class GoalCreate(BaseModel):
 @app.post("/api/memory/goals", dependencies=[Depends(get_current_user)])
 async def create_goal(body: GoalCreate, user: str = Depends(get_current_user)):
     """Crea un nuevo objetivo."""
-    if not postgres_pool:
+    pool = get_postgres_pool()
+    if not pool:
         raise HTTPException(status_code=503, detail="DB no disponible")
-    conn = postgres_pool.getconn()
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -1849,7 +2144,7 @@ async def create_goal(body: GoalCreate, user: str = Depends(get_current_user)):
         conn.commit()
         return {"id": goal_id, "title": body.title}
     finally:
-        postgres_pool.putconn(conn)
+        pool.putconn(conn)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1911,9 +2206,10 @@ async def _get_calendar_brief(user_id: str) -> str:
 
 async def _get_active_goals_text(user_id: str) -> str:
     """Obtiene objetivos activos como texto."""
-    if not postgres_pool:
+    pool = get_postgres_pool()
+    if not pool:
         return ""
-    conn = postgres_pool.getconn()
+    conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -1927,8 +2223,238 @@ async def _get_active_goals_text(user_id: str) -> str:
     except Exception:
         return ""
     finally:
-        postgres_pool.putconn(conn)
+        pool.putconn(conn)
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADMIN — Gestión de usuarios, identidades y configuración de plataforma
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AdminUserCreate(BaseModel):
+    email: str
+    role: str = 'user'
+    phone: Optional[str] = None
+    display_name: Optional[str] = None
+
+class AdminUserUpdate(BaseModel):
+    role: Optional[str] = None
+    status: Optional[str] = None
+    display_name: Optional[str] = None
+
+class IdentityCreate(BaseModel):
+    identity_type: str   # 'whatsapp' | 'email' | 'telegram'
+    identity_value: str
+
+class AccessRequestCreate(BaseModel):
+    phone: str
+    name: Optional[str] = None
+
+def _require_admin(user: str):
+    if get_user_role(user) != 'admin':
+        raise HTTPException(status_code=403, detail="Solo administradores.")
+
+
+@app.get("/api/admin/users", dependencies=[Depends(get_current_user)])
+async def admin_list_users(user: str = Depends(get_current_user)):
+    _require_admin(user)
+    pool = get_postgres_pool()
+    if not pool:
+        return {"users": []}
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT p.user_id, p.display_name, p.role, p.status,
+                       array_agg(i.identity_value || '|' || i.identity_type)
+                           FILTER (WHERE i.id IS NOT NULL AND i.identity_type != 'email') as identities
+                FROM user_profile p
+                LEFT JOIN user_identities i ON i.canonical_user_id = p.user_id
+                GROUP BY p.user_id, p.display_name, p.role, p.status
+                ORDER BY CASE p.role WHEN 'admin' THEN 0 ELSE 1 END, p.user_id
+            """)
+            users = []
+            for r in cur.fetchall():
+                identities = []
+                if r[4]:
+                    for id_str in r[4]:
+                        val, typ = id_str.rsplit('|', 1)
+                        identities.append({"type": typ, "value": val})
+                users.append({
+                    "user_id": r[0], "display_name": r[1],
+                    "role": r[2] or 'user', "status": r[3] or 'active',
+                    "identities": identities,
+                })
+            return {"users": users}
+    finally:
+        pool.putconn(conn)
+
+
+@app.post("/api/admin/users", dependencies=[Depends(get_current_user)])
+async def admin_create_user(body: AdminUserCreate, user: str = Depends(get_current_user)):
+    _require_admin(user)
+    pool = get_postgres_pool()
+    if not pool:
+        raise HTTPException(status_code=503)
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO user_profile (user_id, display_name, role, status)
+                VALUES (%s, %s, %s, 'active')
+                ON CONFLICT (user_id) DO UPDATE
+                SET role = EXCLUDED.role, status = 'active',
+                    display_name = COALESCE(EXCLUDED.display_name, user_profile.display_name)
+            """, (body.email, body.display_name, body.role))
+            cur.execute("""
+                INSERT INTO user_identities (canonical_user_id, identity_type, identity_value)
+                VALUES (%s, 'email', %s) ON CONFLICT (identity_value) DO NOTHING
+            """, (body.email, body.email))
+            if body.phone:
+                cur.execute("""
+                    INSERT INTO user_identities (canonical_user_id, identity_type, identity_value)
+                    VALUES (%s, 'whatsapp', %s)
+                    ON CONFLICT (identity_value) DO UPDATE SET canonical_user_id = EXCLUDED.canonical_user_id
+                """, (body.email, body.phone))
+            conn.commit()
+        return {"ok": True, "user_id": body.email}
+    finally:
+        pool.putconn(conn)
+
+
+@app.patch("/api/admin/users/{target_uid:path}", dependencies=[Depends(get_current_user)])
+async def admin_update_user(target_uid: str, body: AdminUserUpdate, user: str = Depends(get_current_user)):
+    _require_admin(user)
+    pool = get_postgres_pool()
+    if not pool:
+        raise HTTPException(status_code=503)
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            if body.role:
+                cur.execute("UPDATE user_profile SET role = %s WHERE user_id = %s", (body.role, target_uid))
+            if body.status:
+                cur.execute("UPDATE user_profile SET status = %s WHERE user_id = %s", (body.status, target_uid))
+            if body.display_name is not None:
+                cur.execute("UPDATE user_profile SET display_name = %s WHERE user_id = %s", (body.display_name, target_uid))
+            conn.commit()
+        return {"ok": True}
+    finally:
+        pool.putconn(conn)
+
+
+@app.delete("/api/admin/users/{target_uid:path}", dependencies=[Depends(get_current_user)])
+async def admin_delete_user(target_uid: str, user: str = Depends(get_current_user)):
+    """Elimina permanentemente un usuario (hard delete)."""
+    _require_admin(user)
+    if target_uid == user:
+        raise HTTPException(status_code=400, detail="No puedes eliminarte a ti mismo.")
+    pool = get_postgres_pool()
+    if not pool:
+        raise HTTPException(status_code=503)
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM user_identities WHERE canonical_user_id = %s", (target_uid,))
+            cur.execute("DELETE FROM user_profile WHERE user_id = %s", (target_uid,))
+            conn.commit()
+        return {"ok": True}
+    finally:
+        pool.putconn(conn)
+
+
+@app.post("/api/admin/users/{target_uid:path}/identity", dependencies=[Depends(get_current_user)])
+async def admin_add_identity(target_uid: str, body: IdentityCreate, user: str = Depends(get_current_user)):
+    _require_admin(user)
+    pool = get_postgres_pool()
+    if not pool:
+        raise HTTPException(status_code=503)
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO user_identities (canonical_user_id, identity_type, identity_value)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (identity_value) DO UPDATE SET canonical_user_id = EXCLUDED.canonical_user_id
+            """, (target_uid, body.identity_type, body.identity_value))
+            conn.commit()
+        return {"ok": True}
+    finally:
+        pool.putconn(conn)
+
+
+@app.delete("/api/admin/users/{target_uid:path}/identity/{identity_value}", dependencies=[Depends(get_current_user)])
+async def admin_remove_identity(target_uid: str, identity_value: str, user: str = Depends(get_current_user)):
+    _require_admin(user)
+    pool = get_postgres_pool()
+    if not pool:
+        raise HTTPException(status_code=503)
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM user_identities WHERE canonical_user_id = %s AND identity_value = %s AND identity_type != 'email'",
+                (target_uid, identity_value)
+            )
+            conn.commit()
+        return {"ok": True}
+    finally:
+        pool.putconn(conn)
+
+
+@app.get("/api/admin/settings", dependencies=[Depends(get_current_user)])
+async def admin_get_settings(user: str = Depends(get_current_user)):
+    _require_admin(user)
+    return {
+        "allow_access_requests": get_platform_setting("allow_access_requests", "false") == "true",
+    }
+
+
+@app.patch("/api/admin/settings", dependencies=[Depends(get_current_user)])
+async def admin_update_settings(body: dict, user: str = Depends(get_current_user)):
+    _require_admin(user)
+    pool = get_postgres_pool()
+    if not pool:
+        raise HTTPException(status_code=503)
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            for key, value in body.items():
+                cur.execute("""
+                    INSERT INTO platform_settings (key, value) VALUES (%s, %s)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+                """, (key, str(value).lower()))
+            conn.commit()
+        return {"ok": True}
+    finally:
+        pool.putconn(conn)
+
+
+@app.get("/api/identity/check")
+async def identity_check(identifier: str, request: Request):
+    """Endpoint interno para que el WhatsApp bridge verifique acceso y resuelva usuario canónico."""
+    auth = request.headers.get("Authorization", "")
+    if auth.removeprefix("Bearer ").strip() != INTERNAL_API_SECRET:
+        raise HTTPException(status_code=403)
+    allowed, canonical = is_user_registered(identifier)
+    allow_requests = get_platform_setting("allow_access_requests", "false") == "true"
+    return {"allowed": allowed, "canonical_user_id": canonical, "allow_requests": allow_requests}
+
+
+@app.post("/api/auth/access-request")
+async def access_request(body: AccessRequestCreate):
+    """Solicitud de acceso de usuario no registrado."""
+    if get_platform_setting("allow_access_requests", "false") != "true":
+        raise HTTPException(status_code=403, detail="Las solicitudes de acceso están desactivadas.")
+    admin_phone = os.environ.get('ADMIN_PHONE', '5219993437008')
+    msg = f"🔔 *Solicitud de acceso a Amael-IA*\n\nNúmero: +{body.phone}"
+    if body.name:
+        msg += f"\nNombre: {body.name}"
+    msg += "\n\nAproba desde el Panel Admin en la app."
+    asyncio.create_task(send_whatsapp_message(admin_phone, msg))
+    return {"ok": True}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/planner/daily")
 async def daily_planner(request: Request):
@@ -1946,7 +2472,11 @@ async def daily_planner(request: Request):
     phone   = body.get("phone",   ADMIN_PHONE)
 
     import datetime as _dt
-    today = _dt.date.today().strftime("%A %d de %B de %Y")
+    _days_es   = ["lunes","martes","miércoles","jueves","viernes","sábado","domingo"]
+    _months_es = ["enero","febrero","marzo","abril","mayo","junio",
+                  "julio","agosto","septiembre","octubre","noviembre","diciembre"]
+    _now  = _dt.date.today()
+    today = f"{_days_es[_now.weekday()]} {_now.day} de {_months_es[_now.month-1]} de {_now.year}"
 
     # Recopilar todo el contexto en paralelo
     k8s_health, calendar_summary, goals_text, user_ctx, news_text = await asyncio.gather(
@@ -1997,6 +2527,174 @@ Tono: ejecutivo, conciso, orientado a la acción. Máximo 350 palabras."""
     logging.info(f"[PLANNER] Plan enviado a {phone}: {sent}")
 
     return {"ok": True, "sent": sent, "plan": plan_text}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WHATSAPP PERSONAL — Gestión de sesión y settings
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class WhatsappPersonalSettings(BaseModel):
+    auto_reply:        Optional[bool] = None
+    quiet_enabled:     Optional[bool] = None   # activa/desactiva el horario silencioso
+    quiet_start:       Optional[int]  = None   # hora 0-23
+    quiet_end:         Optional[int]  = None   # hora 0-23
+    active_days:       Optional[list] = None   # [1,2,3,4,5] = Lun-Vie (ISO: 1=Lun, 7=Dom)
+    reply_scope:       Optional[str]  = None   # 'all' | 'contacts_only' | 'no_groups' | 'custom'
+    allowed_contacts:  Optional[list] = None   # ["5219993437008", ...] solo para scope=custom
+    ai_assist:         Optional[bool] = None
+    offline_msg:       Optional[str]  = None
+
+
+def _get_wp_settings(user_id: str) -> dict:
+    """Lee settings de whatsapp_personal para un usuario."""
+    defaults = {
+        "auto_reply": True, "quiet_enabled": True, "quiet_start": 22, "quiet_end": 8,
+        "active_days": [1, 2, 3, 4, 5], "reply_scope": "all", "allowed_contacts": [],
+        "ai_assist": True, "offline_msg": None,
+    }
+    pool = get_postgres_pool()
+    if not pool:
+        return defaults
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT auto_reply, quiet_enabled, quiet_start, quiet_end, active_days, "
+                "reply_scope, allowed_contacts, ai_assist, offline_msg "
+                "FROM whatsapp_personal_settings WHERE user_id=%s", (user_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                return defaults
+            return {
+                "auto_reply":       row[0],
+                "quiet_enabled":    row[1] if row[1] is not None else True,
+                "quiet_start":      row[2], "quiet_end":       row[3],
+                "active_days":      list(row[4]) if row[4] else defaults["active_days"],
+                "reply_scope":      row[5],
+                "allowed_contacts": list(row[6]) if row[6] else [],
+                "ai_assist":        row[7], "offline_msg":     row[8],
+            }
+    finally:
+        pool.putconn(conn)
+
+
+def _is_in_quiet_hours(s: dict) -> bool:
+    """Determina si el momento actual está en horario silencioso."""
+    # Si el horario silencioso está desactivado, nunca es hora silenciosa
+    if not s.get("quiet_enabled", True):
+        return False
+    import datetime as _dt2
+    now_h = _dt2.datetime.now().hour
+    now_d = _dt2.datetime.now().isoweekday()   # 1=Lun .. 7=Dom
+    # Verificar día activo (si hoy no está en active_days → quiet)
+    if now_d not in (s.get("active_days") or [1, 2, 3, 4, 5]):
+        return True
+    qs, qe = s.get("quiet_start", 22), s.get("quiet_end", 8)
+    if qs > qe:   # cruza medianoche  (ej: 22-8)
+        return now_h >= qs or now_h < qe
+    return qs <= now_h < qe
+
+
+@app.get("/api/whatsapp-personal/status")
+async def wp_status(user: str = Depends(get_current_user)):
+    """Estado del servicio + settings del usuario."""
+    try:
+        r = _http_client.get(f"{WHATSAPP_PERSONAL_URL}/status", timeout=5)
+        bridge_data = r.json()
+    except Exception:
+        bridge_data = {"status": "unreachable", "phone": None, "hasQR": False}
+    settings = _get_wp_settings(user)
+    return {**bridge_data, "settings": settings}
+
+
+@app.get("/api/whatsapp-personal/qr")
+async def wp_qr(user: str = Depends(get_current_user)):
+    """Devuelve el QR actual del servicio personal."""
+    try:
+        r = _http_client.get(f"{WHATSAPP_PERSONAL_URL}/qr-json", timeout=5)
+        return r.json()
+    except Exception as e:
+        return {"status": "unreachable", "qr": None, "phone": None, "error": str(e)}
+
+
+@app.get("/api/whatsapp-personal/settings")
+async def wp_get_settings(user: str = Depends(get_current_user)):
+    """Lee settings del usuario."""
+    return _get_wp_settings(user)
+
+
+@app.patch("/api/whatsapp-personal/settings")
+async def wp_patch_settings(body: WhatsappPersonalSettings, user: str = Depends(get_current_user)):
+    """Actualiza settings del usuario."""
+    pool = get_postgres_pool()
+    if not pool:
+        raise HTTPException(503, "DB no disponible")
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            # Upsert
+            cur.execute(
+                "INSERT INTO whatsapp_personal_settings (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING",
+                (user,)
+            )
+            updates, vals = [], []
+            if body.auto_reply        is not None: updates.append("auto_reply=%s");        vals.append(body.auto_reply)
+            if body.quiet_enabled     is not None: updates.append("quiet_enabled=%s");     vals.append(body.quiet_enabled)
+            if body.quiet_start       is not None: updates.append("quiet_start=%s");       vals.append(body.quiet_start)
+            if body.quiet_end         is not None: updates.append("quiet_end=%s");         vals.append(body.quiet_end)
+            if body.active_days       is not None: updates.append("active_days=%s");       vals.append(body.active_days)
+            if body.reply_scope       is not None: updates.append("reply_scope=%s");       vals.append(body.reply_scope)
+            if body.allowed_contacts  is not None: updates.append("allowed_contacts=%s");  vals.append(json.dumps(body.allowed_contacts))
+            if body.ai_assist         is not None: updates.append("ai_assist=%s");         vals.append(body.ai_assist)
+            if body.offline_msg       is not None: updates.append("offline_msg=%s");       vals.append(body.offline_msg)
+            if updates:
+                updates.append("updated_at=NOW()")
+                vals.append(user)
+                cur.execute(f"UPDATE whatsapp_personal_settings SET {', '.join(updates)} WHERE user_id=%s", vals)
+            conn.commit()
+    finally:
+        pool.putconn(conn)
+    return _get_wp_settings(user)
+
+
+@app.post("/api/whatsapp-personal/disconnect")
+async def wp_disconnect(user: str = Depends(get_current_user)):
+    """Desconecta la sesión WhatsApp personal."""
+    try:
+        r = _http_client.post(f"{WHATSAPP_PERSONAL_URL}/logout", timeout=10)
+        return r.json()
+    except Exception as e:
+        raise HTTPException(503, f"No se pudo desconectar: {e}")
+
+
+@app.post("/api/whatsapp-personal/connected")
+async def wp_connected(request: Request):
+    """Callback interno: el servicio personal avisa que se conectó."""
+    secret = request.headers.get("X-Internal-Secret")
+    if secret != INTERNAL_API_SECRET:
+        raise HTTPException(403)
+    data = await request.json()
+    logging.info(f"[WA-PERSONAL] Conectado como: {data.get('phone')}")
+    return {"ok": True}
+
+
+@app.get("/api/whatsapp-personal/check-settings")
+async def wp_check_settings(request: Request):
+    """Endpoint interno: el servicio personal consulta settings antes de responder."""
+    secret = request.headers.get("X-Internal-Secret")
+    if secret != INTERNAL_API_SECRET:
+        raise HTTPException(403)
+    owner = os.environ.get("ADMIN_EMAIL", "ricardogs26@gmail.com")
+    s = _get_wp_settings(owner)
+    return {
+        "auto_reply":        s["auto_reply"],
+        "in_quiet_hours":    _is_in_quiet_hours(s),
+        "reply_scope":       s["reply_scope"],
+        "allowed_contacts":  s["allowed_contacts"],
+        "ai_assist":         s["ai_assist"],
+        "offline_msg":       s["offline_msg"],
+    }
 
 
 @app.get("/api/health")
