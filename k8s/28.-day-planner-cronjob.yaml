@@ -1,0 +1,40 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: day-planner-cronjob
+  namespace: amael-ia
+spec:
+  # 7:00am hora México — timeZone interpreta el schedule directamente en la zona local
+  # Lunes a Viernes
+  schedule: "0 7 * * 1-5"
+  timeZone: "America/Mexico_City"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+          - name: day-planner
+            image: curlimages/curl:latest
+            env:
+            - name: INTERNAL_API_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: google-auth-secret
+                  key: internal_api_secret
+            - name: ADMIN_PHONE
+              value: "5219993437008"
+            - name: ADMIN_EMAIL
+              value: "ricardogs26@gmail.com"
+            command:
+            - /bin/sh
+            - -c
+            - |
+              curl -s -X POST http://backend-service:8000/api/planner/daily \
+                -H "Content-Type: application/json" \
+                -H "Authorization: Bearer ${INTERNAL_API_SECRET}" \
+                -d "{\"user_id\": \"${ADMIN_EMAIL}\", \"phone\": \"${ADMIN_PHONE}\"}" \
+                && echo "Day planner ejecutado exitosamente"

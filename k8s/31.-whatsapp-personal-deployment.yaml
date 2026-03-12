@@ -1,0 +1,99 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: whatsapp-personal-pvc
+  namespace: amael-ia
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whatsapp-personal-deployment
+  namespace: amael-ia
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: whatsapp-personal
+  strategy:
+    type: Recreate   # Solo 1 réplica activa — sesión WhatsApp no admite concurrencia
+  template:
+    metadata:
+      labels:
+        app: whatsapp-personal
+    spec:
+      containers:
+      - name: whatsapp-personal
+        image: registry.richardx.dev/whatsapp-personal:1.0.1
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3001
+        volumeMounts:
+        - name: whatsapp-personal-session
+          mountPath: /usr/src/app/.wwebjs_auth
+        - name: shm
+          mountPath: /dev/shm
+        env:
+        - name: PORT
+          value: "3001"
+        - name: AMAEL_BASE_URL
+          value: "http://backend-service:8000"
+        - name: AMAEL_INTERNAL_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: google-auth-secret
+              key: internal_api_secret
+        - name: WHATSAPP_OWNER_JWT
+          valueFrom:
+            secretKeyRef:
+              name: amael-secrets
+              key: jwt-token
+        - name: OWNER_USER_ID
+          value: "ricardogs26@gmail.com"
+        resources:
+          requests:
+            memory: "768Mi"
+            cpu: "250m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3001
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3001
+          initialDelaySeconds: 30
+          periodSeconds: 15
+      volumes:
+      - name: whatsapp-personal-session
+        persistentVolumeClaim:
+          claimName: whatsapp-personal-pvc
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: whatsapp-personal-service
+  namespace: amael-ia
+spec:
+  selector:
+    app: whatsapp-personal
+  ports:
+  - protocol: TCP
+    port: 3001
+    targetPort: 3001
+  type: ClusterIP

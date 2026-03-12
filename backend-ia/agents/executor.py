@@ -93,6 +93,24 @@ def _run_tool_step(step: str, state: AgentState, tools_map: Dict[str, Any]) -> s
                     EXECUTOR_ERRORS_TOTAL.labels(step_type="PRODUCTIVITY_TOOL").inc()
                     result = "Error: Herramienta de productividad no disponible."
 
+            elif step.startswith("WEB_SEARCH:"):
+                query = step[len("WEB_SEARCH:"):].strip()
+                web_func = tools_map.get("web_search")
+                if web_func:
+                    result = web_func(query)
+                else:
+                    EXECUTOR_ERRORS_TOTAL.labels(step_type="WEB_SEARCH").inc()
+                    result = "Error: Herramienta de búsqueda web no disponible."
+
+            elif step.startswith("DOCUMENT_TOOL:"):
+                query = step[len("DOCUMENT_TOOL:"):].strip()
+                doc_func = tools_map.get("document")
+                if doc_func:
+                    result = doc_func(query)
+                else:
+                    EXECUTOR_ERRORS_TOTAL.labels(step_type="DOCUMENT_TOOL").inc()
+                    result = "Error: Herramienta de documentos no disponible."
+
         except Exception as exc:
             EXECUTOR_ERRORS_TOTAL.labels(step_type=stype).inc()
             logger.error(f"[EXECUTOR] Error en {stype}: {exc}", exc_info=True)
@@ -134,9 +152,16 @@ def _run_reasoning_step(
     context_for_llm = _truncate(current_answer, MAX_ANSWER_CHARS, "final_answer")
 
     prompt = (
-        f"Contexto previo: {context_for_llm}\n"
+        f"Contexto previo:\n{context_for_llm}\n\n"
         f"Tarea a realizar: {reasoning_task}\n\n"
-        f"Instrucción: Genera una respuesta en ESPAÑOL basada en el contexto anterior."
+        f"Instrucción: Genera una respuesta en ESPAÑOL basada en el contexto anterior.\n"
+        f"REGLAS DE FORMATO — SIGUE ESTAS REGLAS AL PIE DE LA LETRA:\n"
+        f"1. Si el contexto contiene un bloque ```bash o ```yaml, CÓPIALO EXACTAMENTE en tu respuesta sin modificarlo.\n"
+        f"2. NUNCA pongas análisis, recomendaciones, texto en español ni markdown dentro de un bloque ```bash o ```yaml. "
+        f"Los bloques de código contienen ÚNICAMENTE salida raw de comandos o código fuente.\n"
+        f"3. Tu análisis, explicaciones y recomendaciones van FUERA de los bloques, como texto normal.\n"
+        f"4. NO conviertas datos tabulares de kubectl en tablas markdown; preserva el bloque ```bash original.\n"
+        f"5. Si generas scripts bash o manifiestos YAML nuevos, envuélvelos en ```bash o ```yaml respectivamente."
     )
 
     estimated_tokens = len(prompt) // 4

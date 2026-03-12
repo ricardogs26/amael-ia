@@ -4,3 +4,7 @@ httpx==0.26.0
 pydantic==2.5.3
 prometheus-fastapi-instrumentator
 prometheus-client
+hvac
+pytest
+pytest-asyncio
+respx

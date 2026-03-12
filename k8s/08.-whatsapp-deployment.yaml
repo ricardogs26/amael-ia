@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: whatsapp-bridge
-        image: registry.richardx.dev/whatsapp-bridge:1.2.4
+        image: registry.richardx.dev/whatsapp-bridge:1.5.0
         imagePullPolicy: Always
         ports:
         - containerPort: 3000
@@ -26,6 +26,8 @@ spec:
         - name: shm
           mountPath: /dev/shm
         env:
+        - name: AMAEL_BASE_URL
+          value: "http://backend-service:8000"
         - name: AMAEL_API_URL
           value: "http://backend-service:8000/api/chat"
         - name: AMAEL_JWT_TOKEN
@@ -33,9 +35,13 @@ spec:
             secretKeyRef:
               name: amael-secrets
               key: jwt-token
-        envFrom:
-        - configMapRef:
-            name: allowed-users-configmap
+        - name: AMAEL_INTERNAL_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: google-auth-secret
+              key: internal_api_secret
+        - name: K8S_AGENT_URL
+          value: "http://k8s-agent-service:8002"
         resources:
           requests:
             memory: "768Mi"

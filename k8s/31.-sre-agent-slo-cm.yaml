@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sre-agent-slo
+  namespace: amael-ia
+data:
+  # P5-C: SLO targets consumed by k8s-agent at startup via SLO_TARGETS_JSON env var.
+  # Each entry:
+  #   handler      — regex matched against http_requests_total{handler=~"..."}
+  #   service      — human-readable service name for alerts
+  #   availability — target (e.g. 0.995 = 99.5%)
+  #   window_h     — rolling window in hours for error budget calculation
+  SLO_TARGETS_JSON: |
+    [
+      {
+        "handler":      "/api/chat",
+        "service":      "backend-ia (chat)",
+        "availability": 0.995,
+        "window_h":     24
+      },
+      {
+        "handler":      "/api/k8s-agent",
+        "service":      "k8s-agent",
+        "availability": 0.990,
+        "window_h":     24
+      },
+      {
+        "handler":      "/api/conversations.*",
+        "service":      "backend-ia (conversations)",
+        "availability": 0.990,
+        "window_h":     24
+      }
+    ]

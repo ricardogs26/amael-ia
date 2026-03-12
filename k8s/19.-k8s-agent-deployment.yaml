@@ -4,20 +4,27 @@ metadata:
   name: k8s-agent-sa
   namespace: amael-ia
 ---
+# ─── RBAC: Observer (ClusterRole — solo lectura en todos los namespaces) ──────
+# Puede VER todo, no puede modificar nada a nivel de clúster.
+# Eliminado: delete en secrets, delete en pods (movido al Role healer).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: k8s-agent-role
+  name: sre-agent-observer
 rules:
-- apiGroups: ["", "apps", "batch", "extensions"]
-  resources: ["pods", "services", "endpoints", "persistentvolumeclaims", "events", "configmaps", "secrets", "deployments", "replicasets", "statefulsets", "daemonsets", "jobs", "cronjobs", "nodes", "namespaces"]
-  verbs: ["get", "list", "watch", "delete"]
+- apiGroups: [""]
+  resources: ["pods", "nodes", "namespaces", "events", "services",
+               "endpoints", "configmaps", "persistentvolumeclaims"]
+  verbs: ["get", "list", "watch"]
 - apiGroups: [""]
   resources: ["pods/log"]
   verbs: ["get", "list", "watch"]
-- apiGroups: [""]
-  resources: ["pods/exec"]
-  verbs: ["create", "get"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list", "watch"]
 - apiGroups: ["metrics.k8s.io"]
   resources: ["pods", "nodes"]
   verbs: ["get", "list"]
@@ -25,16 +32,54 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: k8s-agent-rolebinding
+  name: sre-agent-observer-binding
 subjects:
 - kind: ServiceAccount
   name: k8s-agent-sa
   namespace: amael-ia
 roleRef:
   kind: ClusterRole
-  name: k8s-agent-role
+  name: sre-agent-observer
   apiGroup: rbac.authorization.k8s.io
 ---
+# ─── RBAC: Healer (Role — acciones de escritura SOLO en amael-ia) ─────────────
+# Puede ACTUAR únicamente dentro del namespace amael-ia.
+# pods/exec: diagnóstico read-only desde run_command_in_pod.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sre-agent-healer
+  namespace: amael-ia
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["delete"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create", "get"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["patch"]
+# P3-D: Kubernetes Lease for leader election
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sre-agent-healer-binding
+  namespace: amael-ia
+subjects:
+- kind: ServiceAccount
+  name: k8s-agent-sa
+  namespace: amael-ia
+roleRef:
+  kind: Role
+  name: sre-agent-healer
+  apiGroup: rbac.authorization.k8s.io
+---
+# ─── Deployment ───────────────────────────────────────────────────────────────
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -53,7 +98,7 @@ spec:
       serviceAccountName: k8s-agent-sa
       containers:
       - name: k8s-agent
-        image: registry.richardx.dev/k8s-agent:1.6.0
+        image: registry.richardx.dev/k8s-agent:5.0.2
         imagePullPolicy: Always
         ports:
         - containerPort: 8002
@@ -61,8 +106,17 @@ spec:
         - configMapRef:
             name: k8s-agent-configmap
         - configMapRef:
+            name: sre-agent-policy
+        - configMapRef:
             name: allowed-users-configmap
+        - configMapRef:
+            name: sre-agent-slo
         env:
+        # P3-D: pod identity for Lease leader election
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         - name: INTERNAL_API_SECRET
           valueFrom:
             secretKeyRef:
@@ -70,16 +124,11 @@ spec:
               key: internal_api_secret
         - name: BACKEND_SRE_URL
           value: "http://backend-service:8000/api/sre/query"
-        - name: NEW_RELIC_ACCOUNT_ID
+        - name: POSTGRES_PASSWORD
           valueFrom:
             secretKeyRef:
-              name: k8s-agent-secret
-              key: new_relic_account_id
-        - name: NEW_RELIC_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: k8s-agent-secret
-              key: new_relic_api_key
+              name: amael-secrets
+              key: POSTGRES_PASSWORD
         - name: GRAFANA_USER
           valueFrom:
             secretKeyRef:
@@ -93,10 +142,20 @@ spec:
         resources:
           requests:
             cpu: "250m"
-            memory: "256Mi"
-          limits:
-            cpu: "500m"
-            memory: "512Mi"
+            memory: "384Mi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8002
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8002
+          initialDelaySeconds: 15
+          periodSeconds: 15
 ---
 apiVersion: v1
 kind: Service
@@ -107,7 +166,7 @@ spec:
   selector:
     app: k8s-agent
   ports:
-    - protocol: TCP
-      port: 8002
-      targetPort: 8002
+  - protocol: TCP
+    port: 8002
+    targetPort: 8002
   type: ClusterIP

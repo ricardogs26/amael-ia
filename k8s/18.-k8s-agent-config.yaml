@@ -1,18 +1,43 @@
 apiVersion: v1
-kind: Secret
-metadata:
-  name: k8s-agent-secret
-  namespace: amael-ia
-type: Opaque
-stringData:
-  new_relic_account_id: "TU_ACCOUNT_ID"
-  new_relic_api_key: "TU_API_KEY_AQUI"
----
-apiVersion: v1
 kind: ConfigMap
 metadata:
   name: k8s-agent-configmap
   namespace: amael-ia
 data:
+  # LLM
   OLLAMA_BASE_URL: "http://ollama-service:11434"
   MODEL_NAME: "qwen2.5:14b"
+
+  # K8s defaults
+  DEFAULT_NAMESPACE: "amael-ia"
+
+  # Redis (dedup de incidentes)
+  REDIS_URL: "redis://redis-service:6379/0"
+
+  # WhatsApp (alertas proactivas)
+  WHATSAPP_BRIDGE_URL: "http://whatsapp-bridge-service:3000"
+  OWNER_PHONE: "5219993437008"
+
+  # Self-healing guardrails
+  SRE_PROTECTED_DEPLOYMENTS: "postgres-deployment,ollama-deployment,vault-0"
+
+  # P1 — Autonomous loop
+  SRE_LOOP_ENABLED: "true"
+  SRE_LOOP_INTERVAL: "60"
+  SRE_OBSERVE_NAMESPACES: "amael-ia,vault,observability,kong"
+  SRE_AUTO_HEAL_MIN_SEVERITY: "HIGH"
+
+  # P1 — PostgreSQL
+  POSTGRES_HOST: "postgres-service"
+  POSTGRES_DB: "amael_db"
+  POSTGRES_USER: "amael_user"
+
+  # P2 — Qdrant (runbooks vectoriales)
+  QDRANT_URL: "http://qdrant-service:6333"
+
+  # P4 — Proactive metrics thresholds
+  SRE_CPU_THRESHOLD: "0.85"
+  SRE_MEMORY_THRESHOLD: "0.85"
+
+  # P5 — Predictive alerting
+  SRE_MEMORY_LEAK_RATE_BYTES: "1048576"  # 1 MB/s

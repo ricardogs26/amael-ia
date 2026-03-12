@@ -13,6 +13,7 @@ __pycache__/
 
 # Security and Kubernetes Secrets
 *.secret.yaml
+*-secret.yaml
 *secrets.yaml
 !*.template.yaml
 token.json
@@ -27,3 +28,12 @@ vault_token*
 .vscode/
 .idea/
 new_token_output.txt
+
+# Entornos virtuales Python (tests locales)
+.venv/
+k8s-agent/.venv/
+
+# Artefactos de pytest
+.coverage
+k8s-agent/.coverage
+.pytest_cache/

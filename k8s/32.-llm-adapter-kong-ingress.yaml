@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: llm-adapter-kong-ingress
+  namespace: amael-ia
+  annotations:
+    # Strip the path so it matches the internal endpoint
+    konghq.com/strip-path: "true"
+spec:
+  ingressClassName: public
+  rules:
+  - host: apiproxy.richardx.dev
+    http:
+      paths:
+      - path: /llm-v1
+        pathType: Prefix
+        backend:
+          service:
+            name: llm-adapter-service
+            port:
+              number: 80
+      - path: /llm-adapter/api
+        pathType: Prefix
+        backend:
+          service:
+            name: llm-adapter-service
+            port:
+              number: 80
