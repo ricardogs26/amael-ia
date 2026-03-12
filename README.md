@@ -163,6 +163,36 @@ El sistema implementa el patrón **Observer Sidecar**:
 *   **Tracing:** Cada mensaje genera un `TraceId` que viaja desde el frontend hasta el agente de K8s, visualizable en el **Service Map** de Grafana/Tempo.
 *   **Alerting:** Métricas de seguridad (`amael_security_input_blocked_total`) disparan alertas cuando se detectan intentos de inyección de prompt.
 
+### 5. `llm-adapter` (Proxy OpenAI Compatible)
+*   **Función:** Actúa como puente entre cualquier cliente OpenAI-compatible (LangChain, Cursor, n8n) y el motor local Ollama.
+*   **Seguridad:** Protegido mediante un `ADAPTER_API_KEY` almacenado en un `Secret` de Kubernetes.
+*   **Comunicación:**
+    *   **Inbound:** Acepta peticiones REST en formato OpenAI `/v1`.
+    *   **Outbound:** Traduce y envía a `ollama-service:11434`.
+
+---
+
+## 🚀 Consumo del LLM-Adapter (OpenAI Standard)
+
+El servicio está expuesto a través de Kong Gateway y permite el uso de cualquier SDK estándar.
+
+### Configuración del Cliente
+- **Base URL:** `https://apiproxy.********.dev/llm-adapter/api/v1`
+- **API Key:** `Bearer YOUR_SECURE_TOKEN`
+- **Modelos Disponibles:** `glm4`, `llama3`, `qwen2.5:14b`.
+
+### Ejemplo de Consulta (cURL)
+```bash
+curl -i https://apiproxy.********.dev/llm-adapter/api/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_SECURE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "glm4",
+    "messages": [{"role": "user", "content": "Hola mundo"}],
+    "stream": true
+  }'
+```
+
 ---
 
 ## 🚀 Despliegue (Manual CI/CD)
