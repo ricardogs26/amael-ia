@@ -7,6 +7,13 @@ pydantic
 kubernetes
 prometheus-fastapi-instrumentator
 prometheus-client
+redis
+psycopg2-binary
+apscheduler
+qdrant-client
+# P3: LangGraph agent
+langgraph
+langchain-core
 # P7: OpenTelemetry for service map tracing
 opentelemetry-sdk
 opentelemetry-exporter-otlp-proto-grpc

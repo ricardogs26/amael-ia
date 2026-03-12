@@ -21,6 +21,8 @@ interface Props {
   onDelete: (id: number) => void
   onLogout: () => void
   onProfile?: () => void
+  onAdmin?: () => void
+  isAdmin?: boolean
 }
 
 // ── Minimal icon set ──────────────────────────────────────────────────────────
@@ -43,6 +45,7 @@ const IcoSun  = () => <Ico d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.
 const IcoMoon = () => <Ico d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
 const IcoOut     = () => <Ico d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" />
 const IcoProfile = () => <Ico d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z" />
+const IcoAdmin   = () => <Ico d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
 const IcoDots = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
     <circle cx="5" cy="12" r="2" /><circle cx="12" cy="12" r="2" /><circle cx="19" cy="12" r="2" />
@@ -90,7 +93,7 @@ function IconBtn({
 
 export default function Sidebar({
   user, conversations, activeId, collapsed, isMobile = false, onToggle,
-  onSelect, onNew, onRename, onDelete, onLogout, onProfile,
+  onSelect, onNew, onRename, onDelete, onLogout, onProfile, onAdmin, isAdmin,
 }: Props) {
   const { theme, toggle } = useTheme()
   const [menuOpenId,  setMenuOpenId]  = useState<number | null>(null)
@@ -391,6 +394,15 @@ export default function Sidebar({
           </div>
         )}
 
+        {isAdmin && onAdmin && (
+          <IconBtn
+            title="Panel de administración"
+            icon={<IcoAdmin />}
+            label="Admin"
+            onClick={onAdmin}
+            collapsed={!isMobile && collapsed}
+          />
+        )}
         {onProfile && (
           <IconBtn
             title="Mi perfil"

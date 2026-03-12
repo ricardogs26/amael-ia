@@ -4,9 +4,9 @@ metadata:
   name: day-planner-cronjob
   namespace: amael-ia
 spec:
-  # 7:00am hora México (CST = UTC-6) → 13:00 UTC
+  # 7:00am hora México — timeZone interpreta el schedule directamente en la zona local
   # Lunes a Viernes
-  schedule: "0 13 * * 1-5"
+  schedule: "0 7 * * 1-5"
   timeZone: "America/Mexico_City"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3

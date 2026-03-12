@@ -471,7 +471,8 @@ def init_db():
 
 def resolve_user_id(identifier: str) -> str:
     """Mapea cualquier identidad (teléfono/email) al user_id canónico (email)."""
-    if not postgres_pool or not identifier:
+    pool = get_postgres_pool()
+    if not pool or not identifier:
         return identifier
     conn = pool.getconn()
     try:
@@ -992,7 +993,7 @@ async def ingest_data(file: UploadFile = File(...), user: str = Depends(get_curr
         # Guardar metadata en user_documents
         doc_id = None
         pool = get_postgres_pool()
-    if pool:
+        if pool:
             conn = pool.getconn()
             try:
                 with conn.cursor() as cur:
@@ -1428,7 +1429,7 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
                 title += "…"
             _touch_conversation(conv_id)
             pool = get_postgres_pool()
-    if pool:
+            if pool:
                 _c = pool.getconn()
                 try:
                     with _c.cursor() as cur:
@@ -1733,7 +1734,7 @@ async def chat_stream(request: ChatRequest, user: str = Depends(get_current_user
             title = prompt[:50].strip() + ("…" if len(prompt) > 50 else "")
             _touch_conversation(conv_id)
             pool = get_postgres_pool()
-    if pool:
+            if pool:
                 _c = pool.getconn()
                 try:
                     with _c.cursor() as cur:
@@ -1744,7 +1745,7 @@ async def chat_stream(request: ChatRequest, user: str = Depends(get_current_user
                         _c.commit()
                 finally:
                     pool.putconn(_c)
-
+        
         # Memory Agent v1: extraer hechos en background (no bloquea el stream)
         asyncio.create_task(extract_facts_background(effective_user, prompt, final_answer, conv_id))
 
@@ -1891,7 +1892,8 @@ def get_user_context(user_id: str) -> str:
 
 def save_user_fact(user_id: str, fact: str, category: str = "general", conv_id: Optional[int] = None):
     """Persiste un hecho extraído sobre el usuario."""
-    if not postgres_pool or not fact.strip():
+    pool = get_postgres_pool()
+    if not pool or not fact.strip():
         return
     conn = pool.getconn()
     try:
@@ -2087,7 +2089,8 @@ async def get_profile(user: str = Depends(get_current_user)):
 async def update_profile(body: UserProfileUpdate, user: str = Depends(get_current_user)):
     """Actualiza el perfil del usuario."""
     upsert_user_profile(user, body.display_name, body.preferences, body.context_data)
-    if body.timezone and postgres_pool:
+    pool = get_postgres_pool()
+    if body.timezone and pool:
         conn = pool.getconn()
         try:
             with conn.cursor() as cur:

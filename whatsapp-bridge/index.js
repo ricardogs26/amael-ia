@@ -1,5 +1,5 @@
-// index.js — v1.3.0
-// Nuevas funciones: /send endpoint, comandos rápidos, historial por conversación
+// index.js — v1.5.0
+// P5-E: Bidirectional /sre command routing to k8s-agent
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const express = require('express');
 const axios = require('axios');
@@ -10,16 +10,19 @@ const app = express();
 app.use(express.json({ limit: '50mb' }));
 
 // --- CONFIGURACIÓN ---
-const AMAEL_BASE_URL  = process.env.AMAEL_BASE_URL  || 'http://backend-service:8000';
-const AMAEL_API_URL   = process.env.AMAEL_API_URL   || `${AMAEL_BASE_URL}/api/chat`;
-const AMAEL_JWT_TOKEN = process.env.AMAEL_JWT_TOKEN;
+const AMAEL_BASE_URL        = process.env.AMAEL_BASE_URL        || 'http://backend-service:8000';
+const AMAEL_API_URL         = process.env.AMAEL_API_URL         || `${AMAEL_BASE_URL}/api/chat`;
+const AMAEL_JWT_TOKEN       = process.env.AMAEL_JWT_TOKEN;
+const AMAEL_INTERNAL_SECRET = process.env.AMAEL_INTERNAL_SECRET || '';
+const K8S_AGENT_URL         = process.env.K8S_AGENT_URL         || 'http://k8s-agent-service:8002';
 
 if (!AMAEL_JWT_TOKEN) {
     console.error("ERROR: La variable de entorno AMAEL_JWT_TOKEN no está configurada.");
     process.exit(1);
 }
 
-const authHeaders = () => ({ Authorization: `Bearer ${AMAEL_JWT_TOKEN}` });
+const authHeaders     = () => ({ Authorization: `Bearer ${AMAEL_JWT_TOKEN}` });
+const internalHeaders = () => ({ Authorization: `Bearer ${AMAEL_INTERNAL_SECRET}` });
 
 // --- ESTADO GLOBAL ---
 let qrCodeData   = null;
@@ -44,6 +47,7 @@ const AYUDA_MSG = `*Comandos disponibles:*
 /plan — Plan del día de hoy
 /gastos — Resumen de gastos recientes
 /objetivos — Objetivos activos
+/sre <cmd> — Agente SRE autónomo (status, incidents, slo, maintenance)
 /ayuda — Esta lista de comandos
 
 También puedes escribir cualquier pregunta y te respondo normalmente. 🤖`;
@@ -130,6 +134,37 @@ async function sendText(phoneNumber, text) {
     await client.sendMessage(chatId, text);
 }
 
+/** Verifica si un número tiene acceso y devuelve su user_id canónico. */
+async function checkUserAccess(phoneNumber) {
+    if (!AMAEL_INTERNAL_SECRET) {
+        // Fallback: whitelist estática
+        const allowed = (process.env.ALLOWED_NUMBERS_CSV || '').split(',').map(n => n.trim()).includes(phoneNumber);
+        return { allowed, canonical_user_id: phoneNumber, allow_requests: false };
+    }
+    try {
+        const res = await axios.get(`${AMAEL_BASE_URL}/api/identity/check`, {
+            params: { identifier: phoneNumber },
+            headers: internalHeaders(),
+            timeout: 5000,
+        });
+        return res.data;
+    } catch (e) {
+        console.warn(`[ACCESS] Error verificando acceso para ${phoneNumber}: ${e.message}`);
+        // Fallback seguro: negar acceso si el backend no responde
+        return { allowed: false, canonical_user_id: phoneNumber, allow_requests: false };
+    }
+}
+
+/** Envía solicitud de acceso al backend. */
+async function requestAccess(phoneNumber, name) {
+    try {
+        await axios.post(`${AMAEL_BASE_URL}/api/auth/access-request`, { phone: phoneNumber, name });
+        console.log(`[ACCESS] Solicitud de acceso enviada para ${phoneNumber}`);
+    } catch (e) {
+        console.warn(`[ACCESS] Error enviando solicitud: ${e.message}`);
+    }
+}
+
 // --- EVENTOS DE WHATSAPP ────────────────────────────────────────────────────────
 
 client.on('qr', (qr) => {
@@ -168,23 +203,55 @@ client.on('message', async message => {
     if (message.from.includes('@g.us') || message.from.includes('status')) return;
 
     const phoneNumber = message.from.split('@')[0].split(':')[0];
+    const body = (message.body || '').trim();
 
-    // Whitelist
-    const allowedNumbers = (process.env.ALLOWED_NUMBERS_CSV || '')
-        .split(',').map(n => n.trim()).filter(Boolean);
-
-    if (!allowedNumbers.includes(phoneNumber)) {
-        console.log(`[BLOQUEO] Número no autorizado: ${phoneNumber}`);
-        await message.reply('Lo siento, este número no está autorizado.');
+    // Verificación dinámica de acceso (backend API)
+    const access = await checkUserAccess(phoneNumber);
+    if (!access.allowed) {
+        console.log(`[BLOQUEO] Número no registrado: ${phoneNumber}`);
+        if (body.toLowerCase().startsWith('/solicitar')) {
+            const name = body.replace(/^\/solicitar\s*/i, '').trim() || null;
+            await requestAccess(phoneNumber, name);
+            await message.reply('✅ Tu solicitud fue enviada al administrador. Te avisaremos cuando tengas acceso.');
+        } else if (access.allow_requests) {
+            await message.reply(
+                '⚠️ *No tienes acceso a este asistente.*\n\n' +
+                'Puedes solicitar acceso escribiendo:\n*/solicitar <tu nombre>*'
+            );
+        } else {
+            await message.reply('⚠️ Este asistente es de uso privado. Contacta al administrador para obtener acceso.');
+        }
         return;
     }
 
-    const body = (message.body || '').trim();
-    console.log(`[MSG] De ${phoneNumber}: ${body}`);
+    // Usar el user_id canónico (email) para todas las llamadas al backend
+    const canonicalUserId = access.canonical_user_id;
+    console.log(`[MSG] De ${phoneNumber} (→${canonicalUserId}): ${body}`);
 
     // ── Comando /ayuda (respuesta local, sin llamar al backend) ──────────────────
     if (body === '/ayuda') {
         await message.reply(AYUDA_MSG);
+        return;
+    }
+
+    // ── P5-E: Comando /sre — rutar al k8s-agent ──────────────────────────────────
+    if (body.startsWith('/sre')) {
+        const sreCmd = body.replace(/^\/sre\s*/i, '').trim() || 'ayuda';
+        console.log(`[SRE] Comando SRE de ${phoneNumber}: "${sreCmd}"`);
+        try {
+            const sreRes = await axios.post(`${K8S_AGENT_URL}/api/sre/command`, {
+                command: sreCmd,
+                phone:   phoneNumber,
+            }, {
+                headers: { Authorization: `Bearer ${AMAEL_INTERNAL_SECRET}` },
+                timeout: 30000,
+            });
+            const reply = sreRes.data.reply || '(sin respuesta)';
+            await message.reply(reply);
+        } catch (err) {
+            console.error(`[SRE] Error llamando k8s-agent: ${err.message}`);
+            await message.reply('❌ El agente SRE no está disponible. Intenta más tarde.');
+        }
         return;
     }
 
@@ -195,7 +262,7 @@ client.on('message', async message => {
     }
 
     try {
-        let payload = { prompt, user_id: phoneNumber };
+        let payload = { prompt, user_id: canonicalUserId };
 
         // Multimedia
         if (message.hasMedia) {
@@ -207,7 +274,7 @@ client.on('message', async message => {
         }
 
         // ── Historial de conversación ────────────────────────────────────────────
-        const convId  = await getOrCreateConv(phoneNumber);
+        const convId  = await getOrCreateConv(canonicalUserId);
         const history = await loadHistory(convId);
         payload.conversation_id = convId;
         payload.history         = history;
@@ -362,16 +429,22 @@ app.get('/status', (req, res) => {
 // --- START ──────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`[BRIDGE v1.3.0] Servidor en puerto ${PORT}`);
+    console.log(`[BRIDGE v1.5.0] Servidor en puerto ${PORT}`);
 });
 
 const initializeClient = () => {
+    console.log('[BRIDGE] Iniciando proceso de inicialización del cliente...');
     clientStatus = 'initializing';
-    client.initialize().catch(err => {
-        console.error('ERROR al inicializar:', err);
-        clientStatus = 'error';
-        setTimeout(initializeClient, 30000);
-    });
+    client.initialize()
+        .then(() => {
+            console.log('[BRIDGE] Solicitud de inicialización enviada con éxito.');
+        })
+        .catch(err => {
+            console.error('[BRIDGE] ERROR CRÍTICO al inicializar:', err);
+            clientStatus = 'error';
+            setTimeout(initializeClient, 30000);
+        });
 };
 
+console.log('[BRIDGE] Arrancando aplicación...');
 initializeClient();

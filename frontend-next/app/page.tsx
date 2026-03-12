@@ -10,14 +10,20 @@ function AppInner() {
   const [token, setToken]       = useState<string | null>(null)
   const [userName, setUserName] = useState('')
   const [userPic, setUserPic]   = useState('')
+  const [calendarNotif, setCalendarNotif] = useState<'connected' | 'error' | null>(null)
 
   useEffect(() => {
     const t    = searchParams.get('token')
     const name = searchParams.get('name')
     const pic  = searchParams.get('picture')
     const err  = searchParams.get('error')
+    const calOk  = searchParams.get('calendar_connected')
+    const calErr = searchParams.get('calendar_error')
 
     if (err) { alert('No tienes permiso para acceder.'); router.replace('/'); return }
+
+    if (calOk) { setCalendarNotif('connected'); router.replace('/') }
+    if (calErr) { setCalendarNotif('error'); router.replace('/') }
 
     if (t) {
       setToken(t)
@@ -45,7 +51,7 @@ function AppInner() {
   }
 
   if (!token) return <Login />
-  return <Chat token={token} userName={userName} userPicture={userPic} onLogout={logout} />
+  return <Chat token={token} userName={userName} userPicture={userPic} onLogout={logout} calendarNotif={calendarNotif} />
 }
 
 export default function Page() {

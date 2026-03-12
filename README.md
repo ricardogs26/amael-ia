@@ -20,6 +20,8 @@ Desplegada completamente sobre Kubernetes, Amael IA utiliza una arquitectura de 
 *   🛠️ **DevOps Autónomo (K8s SRE Agent):** Administra el clúster en tiempo real. Lista pods, revisa logs, consulta PromQL/Grafana y ejecuta acciones correctivas.
 *   📅 **Productividad Integrada:** Automatización de agenda mediante integración con **Google Calendar** y **Gmail API** (`productivity-service`).
 *   📊 **Observabilidad Full-Stack (P6/P7):** Monitoreo con **Prometheus, Grafana y Tempo**. Incluye un **Service Map** en tiempo real y 7 dashboards especializados.
+*   🔄 **Resiliencia (P8):** Conectividad robusta a bases de datos con reintentos automáticos y carga diferida (Lazy Initialization) para evitar fallos por DNS temporales.
+
 
 ---
 
@@ -36,7 +38,7 @@ Amael IA orquestado por **Kubernetes (MicroK8s)** con imágenes en registro priv
 
 | Servicio | Versión | Descripción |
 |---------|---------|-------------|
-| `backend-ia` | `2.16.0` | Orquestador LangGraph, Memory Agent, Facts extraction. |
+| `backend-ia` | `2.20.1` | Orquestador LangGraph, Memory Agent, Facts extraction, Robust DB Init. |
 | `k8s-agent` | `1.6.0` | SRE Expert, automatización K8s + Vault. |
 | `productivity-service` | `1.2.0` | Integración Google Workspace + Vault integration. |
 | `frontend-next` | `1.0.4` | Web UI principal (Next.js 14, activo en `/`). |

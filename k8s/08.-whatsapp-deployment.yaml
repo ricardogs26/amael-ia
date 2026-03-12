@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
       - name: whatsapp-bridge
-        image: registry.richardx.dev/whatsapp-bridge:1.3.0
+        image: registry.richardx.dev/whatsapp-bridge:1.5.0
         imagePullPolicy: Always
         ports:
         - containerPort: 3000
@@ -35,9 +35,13 @@ spec:
             secretKeyRef:
               name: amael-secrets
               key: jwt-token
-        envFrom:
-        - configMapRef:
-            name: allowed-users-configmap
+        - name: AMAEL_INTERNAL_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: google-auth-secret
+              key: internal_api_secret
+        - name: K8S_AGENT_URL
+          value: "http://k8s-agent-service:8002"
         resources:
           requests:
             memory: "768Mi"

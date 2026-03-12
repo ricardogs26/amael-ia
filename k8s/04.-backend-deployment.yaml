@@ -16,7 +16,7 @@ spec:
       imagePullSecrets: []
       containers:
       - name: backend-container
-        image: registry.richardx.dev/backend-ia:2.17.1
+        image: registry.richardx.dev/backend-ia:2.20.1
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8000
@@ -80,6 +80,8 @@ spec:
                 key: MINIO_ROOT_PASSWORD
           - name: CHAT_HISTORIES_DIR
             value: "/chat_histories"
+          - name: WHATSAPP_PERSONAL_URL
+            value: "http://whatsapp-personal-service:3001"
         volumeMounts:
         - name: legacy-history
           mountPath: /chat_histories

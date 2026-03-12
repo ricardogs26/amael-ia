@@ -259,41 +259,55 @@ async def create_chat_completion(request: ChatCompletionRequest, req_raw: Reques
         else:
             # Petición síncrona (No streaming)
             start_time = time.time()
-            async with client:
-                response = await client.post(ollama_url, json=ollama_payload)
-                latency = time.time() - start_time
-                response.raise_for_status()
-                ollama_data = response.json()
+            try:
+                async with client:
+                    response = await client.post(ollama_url, json=ollama_payload)
+                    latency = time.time() - start_time
+                    
+                    if response.status_code != 200:
+                        error_detail = response.text
+                        try:
+                            error_json = response.json()
+                            error_detail = error_json.get("error", error_detail)
+                        except:
+                            pass
+                        logger.error(f"[OLLAMA-ERROR] Upstream returned {response.status_code} for {user_identity}: {error_detail}")
+                        raise HTTPException(status_code=response.status_code, detail=f"Ollama error: {error_detail}")
 
-                # Record metrics
-                LLM_LATENCY_SECONDS.labels(model=target_model, user=user_email).observe(latency)
-                prompt_tokens = ollama_data.get("prompt_eval_count", 0)
-                completion_tokens = ollama_data.get("eval_count", 0)
-                LLM_TOKENS_TOTAL.labels(model=target_model, type="prompt", user=user_email).inc(prompt_tokens)
-                LLM_TOKENS_TOTAL.labels(model=target_model, type="completion", user=user_email).inc(completion_tokens)
-                logger.info(f"[METRICS] Petición síncrona finalizada for {user_identity}: {prompt_tokens} tokens, {latency:.2f}s")
+                    ollama_data = response.json()
 
-                # Formatear respuesta como OpenAI
-                openai_response = {
-                    "id": "chatcmpl-local",
-                    "object": "chat.completion",
-                    "created": int(time.time()),
-                    "model": target_model,
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": ollama_data.get("message", {}).get("content", "")
-                        },
-                        "finish_reason": "stop"
-                    }],
-                    "usage": {
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": prompt_tokens + completion_tokens
+                    # Record metrics
+                    LLM_LATENCY_SECONDS.labels(model=target_model, user=user_email).observe(latency)
+                    prompt_tokens = ollama_data.get("prompt_eval_count", 0)
+                    completion_tokens = ollama_data.get("eval_count", 0)
+                    LLM_TOKENS_TOTAL.labels(model=target_model, type="prompt", user=user_email).inc(prompt_tokens)
+                    LLM_TOKENS_TOTAL.labels(model=target_model, type="completion", user=user_email).inc(completion_tokens)
+                    logger.info(f"[METRICS] Petición síncrona finalizada for {user_identity}: {prompt_tokens} tokens, {latency:.2f}s")
+
+                    # Formatear respuesta como OpenAI
+                    openai_response = {
+                        "id": f"chatcmpl-{uuid.uuid4()}",
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": target_model,
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": ollama_data.get("message", {}).get("content", "")
+                            },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": prompt_tokens + completion_tokens
+                        }
                     }
-                }
-                return JSONResponse(content=openai_response)
+                    return JSONResponse(content=openai_response)
+            except httpx.HTTPStatusError as e:
+                logger.error(f"[OLLAMA-HTTP-ERROR] {user_identity} | {str(e)}")
+                raise HTTPException(status_code=e.response.status_code, detail=f"Upstream HTTP error: {str(e)}")
 
     except httpx.RequestError as exc:
         await client.aclose()
@@ -319,7 +333,10 @@ async def create_embedding(request: EmbeddingRequest, authorized: bool = Depends
                     f"{OLLAMA_BASE_URL}/api/embeddings",
                     json={"model": request.model, "prompt": text}
                 )
-                response.raise_for_status()
+                if response.status_code != 200:
+                    logger.error(f"[OLLAMA-EMBED-ERROR] Upstream returned {response.status_code} for text index {i}")
+                    raise HTTPException(status_code=response.status_code, detail=f"Ollama embeddings error: {response.text}")
+
                 result = response.json()
                 
                 embeddings_data.append({
@@ -330,6 +347,8 @@ async def create_embedding(request: EmbeddingRequest, authorized: bool = Depends
                 # Ollama doesn't always return token counts for embeddings, we estimate or put 0
                 total_tokens += len(text.split()) # Very rough estimation
                 
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"Error generating embedding for index {i}: {e}")
                 raise HTTPException(status_code=502, detail=f"Error from Ollama: {str(e)}")
