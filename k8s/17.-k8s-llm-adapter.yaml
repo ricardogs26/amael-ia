@@ -13,17 +13,17 @@ spec:
       labels:
         app: llm-adapter
     spec:
+      serviceAccountName: llm-adapter-sa
       containers:
       - name: adapter
-        image: registry.richardx.dev/llm-adapter:1.0.5
+        image: registry.richardx.dev/llm-adapter:1.0.6
         ports:
         - containerPort: 8000
         env:
-        - name: ADAPTER_API_KEY
-          valueFrom:
-            secretKeyRef:
-              name: llm-adapter-secret
-              key: ADAPTER_API_KEY
+        - name: VAULT_ADDR
+          value: "http://vault.vault.svc.cluster.local:8200"
+        - name: VAULT_ROLE
+          value: "llm-adapter"
         - name: OLLAMA_BASE_URL
           # IMPORTANTE: Esta es la URL interna del cluster de tu Ollama
           value: "http://ollama-service.amael-ia.svc.cluster.local:11434" 

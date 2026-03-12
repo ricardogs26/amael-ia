@@ -4,6 +4,7 @@ import time
 import uuid
 import json
 import logging
+import hvac
 from fastapi import FastAPI, HTTPException, Request, Depends, status
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,7 +30,48 @@ app.add_middleware(
 # Configuración
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama-service.default.svc.cluster.local:11434")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "glm4")
-ADAPTER_API_KEY = os.getenv("ADAPTER_API_KEY", None)
+
+# --- VAULT CONFIGURATION ---
+VAULT_ADDR = os.getenv("VAULT_ADDR", "http://vault.vault.svc.cluster.local:8200")
+VAULT_ROLE = os.getenv("VAULT_ROLE", "llm-adapter")
+VAULT_SECRET_PATH = "amael/llm-adapter"
+K8S_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+def get_secret_from_vault():
+    """Fetch ADAPTER_API_KEY from Vault using Kubernetes auth."""
+    if not os.path.exists(K8S_TOKEN_PATH):
+        logger.info("[VAULT] No K8s token found, skipping Vault secret retrieval.")
+        return None
+    
+    try:
+        client = hvac.Client(url=VAULT_ADDR)
+        with open(K8S_TOKEN_PATH, 'r') as f:
+            jwt = f.read().strip()
+        
+        client.auth.kubernetes.login(role=VAULT_ROLE, jwt=jwt)
+        if not client.is_authenticated():
+            logger.warning("[VAULT] Authentication to Vault failed.")
+            return None
+        
+        response = client.secrets.kv.v2.read_secret_version(path=VAULT_SECRET_PATH, mount_point="secret")
+        # response['data']['data'] contains the actual key-value pairs
+        secrets = response.get("data", {}).get("data", {})
+        key = secrets.get("ADAPTER_API_KEY")
+        if key:
+            logger.info("[VAULT] Successfully retrieved ADAPTER_API_KEY from Vault.")
+            return key
+    except Exception as e:
+        logger.warning(f"[VAULT] Error retrieving secret from Vault: {e}")
+    
+    return None
+
+# Prioritize Vault, then ENV
+ADAPTER_API_KEY = get_secret_from_vault() or os.getenv("ADAPTER_API_KEY")
+
+if not ADAPTER_API_KEY:
+    logger.warning("[SECURITY] No ADAPTER_API_KEY found in Vault or ENV. Service will be public!")
+else:
+    logger.info("[SECURITY] ADAPTER_API_KEY loaded and active.")
 
 # --- CUSTOM PROMETHEUS METRICS ---
 LLM_TOKENS_TOTAL = Counter('amael_llm_tokens_total', 'Total tokens used by LLM', ['model', 'type', 'user'])
