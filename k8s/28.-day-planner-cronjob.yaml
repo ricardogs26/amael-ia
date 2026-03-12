@@ -23,8 +23,8 @@ spec:
             - name: INTERNAL_API_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: amael-secrets
-                  key: internal-api-secret
+                  name: google-auth-secret
+                  key: internal_api_secret
             - name: ADMIN_PHONE
               value: "5219993437008"
             - name: ADMIN_EMAIL
