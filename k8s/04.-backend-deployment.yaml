@@ -12,6 +12,10 @@ spec:
     metadata:
       labels:
         app: backend
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
     spec:
       imagePullSecrets: []
       containers:
@@ -95,11 +99,14 @@ kind: Service
 metadata:
   name: backend-service
   namespace: amael-ia
+  labels:
+    monitor: amael-metrics
 spec:
   selector:
     app: backend
   ports:
-    - protocol: TCP
+    - name: http-metrics
+      protocol: TCP
       port: 8000
       targetPort: 8000
   type: ClusterIP

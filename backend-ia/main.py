@@ -1396,55 +1396,65 @@ async def chat_endpoint(request: ChatRequest, user: str = Depends(get_current_us
             "tools_map": tools_map,
         }
         
-        final_state = orchestrator_app.invoke(initial_state)
-        
-        agent_latency = time.time() - start_agent_time
-        AGENT_EXECUTION_LATENCY.observe(agent_latency)
-        PLANNER_STEPS_TOTAL.inc(len(final_state.get("plan", [])))
-        
-        final_response = final_state.get("final_answer", "")
-        if final_response is None:
-            final_response = "Lo siento, no pude generar una respuesta en este momento."
+        try:
+            final_state = orchestrator_app.invoke(initial_state)
+            
+            agent_latency = time.time() - start_agent_time
+            AGENT_EXECUTION_LATENCY.observe(agent_latency)
+            PLANNER_STEPS_TOTAL.inc(len(final_state.get("plan", [])))
+            
+            logging.info(f"[AGENT] Success for user={effective_user} in {agent_latency:.2f}s")
 
-        # P4-4: Sanitizar la salida antes de enviarla al usuario
-        final_response = sanitize_output(final_response)
+            final_response = final_state.get("final_answer", "")
+            if final_response is None:
+                final_response = "Lo siento, no pude generar una respuesta en este momento."
 
-        # P3: log supervisor outcome
-        sv_score = final_state.get("supervisor_score", 0)
-        sv_decision = final_state.get("supervisor_decision", "N/A")
-        sv_retries = final_state.get("retry_count", 0)
-        logging.info(
-            f"[SUPERVISOR] user={effective_user} decision={sv_decision} "
-            f"score={sv_score} retries={sv_retries}"
-        )
+            # P4-4: Sanitizar la salida antes de enviarla al usuario
+            final_response = sanitize_output(final_response)
 
-        # Save to history
-        save_chat_message(history_id, "user", request.prompt, conv_id)
-        save_chat_message(history_id, "assistant", final_response, conv_id)
+            # P3: log supervisor outcome
+            sv_score = final_state.get("supervisor_score", 0)
+            sv_decision = final_state.get("supervisor_decision", "N/A")
+            sv_retries = final_state.get("retry_count", 0)
+            logging.info(
+                f"[SUPERVISOR] user={effective_user} decision={sv_decision} "
+                f"score={sv_score} retries={sv_retries}"
+            )
 
-        # Auto-title conversation from first user message
-        if conv_id and len(history) == 0:
-            title = request.prompt[:50].strip()
-            if len(request.prompt) > 50:
-                title += "…"
-            _touch_conversation(conv_id)
-            pool = get_postgres_pool()
-            if pool:
-                _c = pool.getconn()
-                try:
-                    with _c.cursor() as cur:
-                        cur.execute("UPDATE conversations SET title = %s WHERE id = %s AND title = 'Nueva conversación'", (title, conv_id))
-                        _c.commit()
-                finally:
-                    pool.putconn(_c)
+            # Save to history
+            save_chat_message(history_id, "user", request.prompt, conv_id)
+            save_chat_message(history_id, "assistant", final_response, conv_id)
 
-        return ChatResponse(response=final_response)
+            # Auto-title conversation from first user message
+            if conv_id and len(history) == 0:
+                title = request.prompt[:50].strip()
+                if len(request.prompt) > 50:
+                    title += "…"
+                _touch_conversation(conv_id)
+                pool = get_postgres_pool()
+                if pool:
+                    _c = pool.getconn()
+                    try:
+                        with _c.cursor() as cur:
+                            cur.execute("UPDATE conversations SET title = %s WHERE id = %s AND title = 'Nueva conversación'", (title, conv_id))
+                            _c.commit()
+                    finally:
+                        pool.putconn(_c)
 
+            return ChatResponse(response=final_response)
+
+        except Exception as orchestrator_exc:
+            agent_latency = time.time() - start_agent_time
+            AGENT_EXECUTION_LATENCY.observe(agent_latency)
+            AGENT_FAILURES_TOTAL.inc()
+            logging.error(f"[AGENT] Error in Agent Orchestrator for user={effective_user}: {orchestrator_exc}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Error in agent orchestration: {orchestrator_exc}")
+
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error in Agent Orchestrator: {e}")
-        # Fallback to standard RAG if agent fails
-        # ... existing fallback code or just re-raise
-        raise HTTPException(status_code=500, detail=f"Error in agent orchestration: {e}")
+        logging.error(f"[AGENT] Unexpected outer error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error inesperado en el flujo del agente: {e}")
 
     
 # --- ENDPOINTS DE CONOCIMIENTO SRE (Para k8s-agent) ---
