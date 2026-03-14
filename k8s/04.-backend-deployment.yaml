@@ -20,8 +20,8 @@ spec:
       imagePullSecrets: []
       containers:
       - name: backend-container
-        image: registry.richardx.dev/backend-ia:2.20.1
-        imagePullPolicy: IfNotPresent
+        image: registry.richardx.dev/backend-ia:2.20.4
+        imagePullPolicy: Always
         ports:
         - containerPort: 8000
         resources:
@@ -77,6 +77,11 @@ spec:
               secretKeyRef:
                 name: amael-secrets
                 key: POSTGRES_PASSWORD
+          - name: MINIO_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: amael-secrets
+                key: MINIO_ACCESS_KEY
           - name: MINIO_SECRET_KEY
             valueFrom:
               secretKeyRef:

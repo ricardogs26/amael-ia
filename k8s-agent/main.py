@@ -1592,12 +1592,12 @@ def list_k8s_deployments(input_str: str = "") -> str:
 # HERRAMIENTAS — MÉTRICAS
 # ─────────────────────────────────────────────────────────────────────────────
 _PROMETHEUS_ALIASES: dict[str, str] = {
-    "cpu_pods":     'sum(rate(container_cpu_usage_seconds_total{namespace="amael-ia",container!=""}[5m])) by (pod)',
-    "ram_pods":     'sum(container_memory_working_set_bytes{namespace="amael-ia",container!=""}) by (pod)',
+    "cpu_pods":     'sum(rate(container_cpu_usage_seconds_total{namespace=~"amael-ia|vault|kong|observability",container!=""}[5m])) by (pod)',
+    "ram_pods":     'sum(container_memory_working_set_bytes{namespace=~"amael-ia|vault|kong|observability",container!=""}) by (pod) / 1048576',
     "cpu_node":     'sum(rate(node_cpu_seconds_total{mode!="idle"}[5m])) by (instance)',
     "ram_node":     'node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes',
-    "http_errors":  'sum(rate(http_requests_total{namespace="amael-ia",status=~"5.."}[5m])) by (handler)',
-    "restart_rate": 'increase(kube_pod_container_status_restarts_total{namespace="amael-ia"}[15m])',
+    "http_errors":  'sum(rate(http_requests_total{namespace=~"amael-ia|vault|kong|observability",status=~"5.."}[5m])) by (handler)',
+    "restart_rate": 'increase(kube_pod_container_status_restarts_total{namespace=~"amael-ia|vault|kong|observability"}[15m])',
 }
 
 
@@ -1829,8 +1829,8 @@ tools = [
          description="Elimina un pod. Input: 'pod_name' o 'pod_name, namespace'."),
     Tool(name="Prometheus_Query",           func=query_prometheus,
          description=(
-             "PromQL en Prometheus. Aliases: cpu_pods, ram_pods, cpu_node, "
-             "ram_node, http_errors, restart_rate.")),
+             "PromQL en Prometheus. Aliases: cpu_pods, ram_pods (en MB), cpu_node, "
+             "ram_node (%), http_errors, restart_rate.")),
     Tool(name="Listar_Grafana_Dashboards",  func=list_grafana_dashboards,
          description="Lista dashboards de Grafana. Input: vacío."),
     Tool(name="Capturar_Imagen_Grafana",    func=capture_grafana_screenshot,
@@ -1878,7 +1878,10 @@ _SRE_SYSTEM_PROMPT = (
     "2. Vault → Consultar_Vault siempre.\n"
     "3. Runbooks y soluciones → Consultar_Base_Conocimiento.\n"
     "4. Reiniciar → Reiniciar_Deployment (no Eliminar_Pod salvo necesidad).\n"
-    "5. Problema crítico → Notificar_WhatsApp.\n\n"
+    "5. Problema crítico → Notificar_WhatsApp.\n"
+    "6. Al reportar uso de memoria de pods, usa SIEMPRE la unidad *Mb* (el alias ram_pods reporta en MB).\n"
+    "7. Menciona siempre el tipo de recurso (CPU o Memoria).\n"
+    "8. Responde DIRECTAMENTE con los datos técnicos, sin introducciones ni cortesías.\n\n"
     "FORMATO:\n"
     "Thought: | Action: | Action Input: | Observation:\n"
     "Final Answer: [respuesta detallada. Si usaste Capturar_Imagen_Grafana: '[MEDIA_PLACEHOLDER]']\n\n"
@@ -2483,10 +2486,11 @@ def decide_action(anomaly: Anomaly, diagnosis: Optional[Diagnosis] = None) -> Ac
 
     # Nodos, endpoints, y tipos específicos → siempre notificar (sin auto-heal)
     _notify_only_types = {
-        "IMAGE_PULL_ERROR", "HIGH_CPU", "HIGH_ERROR_RATE",
+        "IMAGE_PULL_ERROR", "HIGH_CPU",
         # P5: predictive and SLO anomalies always need human judgment
         "DISK_EXHAUSTION_PREDICTED", "ERROR_RATE_ESCALATING", "SLO_BUDGET_BURNING",
     }
+
     if is_node or anomaly.issue_type in _notify_only_types or anomaly.resource_type in ("endpoint", "namespace", "node"):
         return ActionPlan(
             action="NOTIFY_HUMAN", target_name=anomaly.resource_name,
@@ -2826,6 +2830,32 @@ async def chat_with_agent(request: AgentRequest, req: Request):
     except Exception as e:
         logging.error(f"Agent error: {e}")
         return {"response": f"Error procesando la petición: {str(e)[:150]}"}
+
+
+@app.get("/api/sre/health-stats")
+async def get_health_stats():
+    """
+    Returns structured health stats for the cluster.
+    Used by backend-ia for the daily report status indicator.
+    """
+    snapshot = observe_cluster()
+    total_pods = len(snapshot.pods)
+    problem_pods = []
+    
+    for pod in snapshot.pods:
+        # Define "problem": not Running and not Succeeded
+        if pod.phase not in ("Running", "Succeeded"):
+            problem_pods.append(f"{pod.namespace}/{pod.name} ({pod.phase})")
+        elif pod.restart_count > 10: # Also count pods with too many restarts as problematic
+            problem_pods.append(f"{pod.namespace}/{pod.name} ({pod.restart_count} restarts)")
+
+    return {
+        "status": "ok",
+        "total_pods": total_pods,
+        "failing_count": len(problem_pods),
+        "failing_pods": problem_pods,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
 
 
 @app.get("/api/sre/incidents")

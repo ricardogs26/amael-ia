@@ -104,6 +104,35 @@ class EmbeddingRequest(BaseModel):
     input: Union[str, List[str]]
     user: Optional[str] = None
 
+# --- ANTHROPIC MESSAGES API SCHEMAS ---
+
+class AnthropicContentBlock(BaseModel):
+    type: str  # "text", "image", etc.
+    text: Optional[str] = None
+
+class AnthropicMessage(BaseModel):
+    role: str  # "user" or "assistant"
+    content: Union[str, List[Dict[str, Any]]]
+
+class AnthropicMessagesRequest(BaseModel):
+    model: str
+    messages: List[AnthropicMessage]
+    max_tokens: int = 4096
+    system: Optional[str] = None
+    stream: Optional[bool] = False
+    temperature: Optional[float] = 1.0
+    top_p: Optional[float] = None
+    stop_sequences: Optional[List[str]] = None
+    metadata: Optional[Dict[str, Any]] = None
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Dict[str, Any]] = None
+
+class AnthropicCountTokensRequest(BaseModel):
+    model: str
+    messages: List[AnthropicMessage]
+    system: Optional[str] = None
+    tools: Optional[List[Dict[str, Any]]] = None
+
 class EmbeddingResponse(BaseModel):
     object: str = "list"
     data: List[Dict[str, Any]]
@@ -362,6 +391,152 @@ async def create_embedding(request: EmbeddingRequest, authorized: bool = Depends
             "total_tokens": total_tokens
         }
     }
+
+def _anthropic_messages_to_ollama(messages: List[AnthropicMessage], system: Optional[str]) -> List[Dict]:
+    """Convert Anthropic messages format to Ollama chat messages."""
+    ollama_messages = []
+    if system:
+        ollama_messages.append({"role": "system", "content": system})
+    for msg in messages:
+        content = msg.content if isinstance(msg.content, str) else "".join(
+            block.get("text", "") for block in msg.content if block.get("type") == "text"
+        )
+        ollama_messages.append({"role": msg.role, "content": content})
+    return ollama_messages
+
+
+@app.post("/v1/messages")
+@app.post("/api/v1/messages")
+@app.post("/llm/v1/messages")
+async def anthropic_messages(request: AnthropicMessagesRequest, req_raw: Request, authorized: bool = Depends(get_api_key)):
+    """Anthropic Messages API compatible endpoint — translates to Ollama."""
+    user_email = req_raw.headers.get("X-User-Email", "anonymous")
+    logger.info(f"[ANTHROPIC-ADAPTER] Request from {user_email} | Model: {request.model} | Stream: {request.stream}")
+
+    ollama_messages = _anthropic_messages_to_ollama(request.messages, request.system)
+    ollama_payload = {
+        "model": request.model,
+        "messages": ollama_messages,
+        "stream": request.stream,
+        "options": {
+            "temperature": request.temperature,
+            "num_predict": request.max_tokens,
+        }
+    }
+    if request.top_p is not None:
+        ollama_payload["options"]["top_p"] = request.top_p
+    if request.stop_sequences:
+        ollama_payload["options"]["stop"] = request.stop_sequences
+
+    ollama_url = f"{OLLAMA_BASE_URL}/api/chat"
+    msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+    client = httpx.AsyncClient(timeout=120.0)
+    try:
+        if request.stream:
+            async def stream_generator():
+                start_time = time.time()
+                output_tokens = 0
+                input_tokens = 0
+                try:
+                    # message_start event
+                    yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': request.model, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
+                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                    yield f"event: ping\ndata: {json.dumps({'type': 'ping'})}\n\n"
+
+                    async with client.stream("POST", ollama_url, json=ollama_payload) as response:
+                        response.raise_for_status()
+                        async for line in response.aiter_lines():
+                            if not line:
+                                continue
+                            try:
+                                data = json.loads(line)
+                                if data.get("done"):
+                                    input_tokens = data.get("prompt_eval_count", 0)
+                                    output_tokens = data.get("eval_count", 0)
+                                    latency = time.time() - start_time
+                                    LLM_LATENCY_SECONDS.labels(model=request.model, user=user_email).observe(latency)
+                                    LLM_TOKENS_TOTAL.labels(model=request.model, type="prompt", user=user_email).inc(input_tokens)
+                                    LLM_TOKENS_TOTAL.labels(model=request.model, type="completion", user=user_email).inc(output_tokens)
+                                    break
+                                text = data.get("message", {}).get("content", "")
+                                if text:
+                                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': text}})}\n\n"
+                            except Exception as e:
+                                logger.error(f"[ANTHROPIC-STREAM] Parse error: {e}")
+                                continue
+
+                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': {'output_tokens': output_tokens}})}\n\n"
+                    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+                finally:
+                    await client.aclose()
+
+            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+        else:
+            start_time = time.time()
+            async with client:
+                response = await client.post(ollama_url, json=ollama_payload)
+                latency = time.time() - start_time
+                if response.status_code != 200:
+                    raise HTTPException(status_code=response.status_code, detail=f"Ollama error: {response.text}")
+                ollama_data = response.json()
+
+            input_tokens = ollama_data.get("prompt_eval_count", 0)
+            output_tokens = ollama_data.get("eval_count", 0)
+            LLM_LATENCY_SECONDS.labels(model=request.model, user=user_email).observe(latency)
+            LLM_TOKENS_TOTAL.labels(model=request.model, type="prompt", user=user_email).inc(input_tokens)
+            LLM_TOKENS_TOTAL.labels(model=request.model, type="completion", user=user_email).inc(output_tokens)
+            logger.info(f"[ANTHROPIC-ADAPTER] Completed for {user_email}: {input_tokens} in, {output_tokens} out, {latency:.2f}s")
+
+            return JSONResponse(content={
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": ollama_data.get("message", {}).get("content", "")}],
+                "model": request.model,
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
+            })
+
+    except httpx.RequestError as exc:
+        await client.aclose()
+        raise HTTPException(status_code=503, detail=f"Error conectando con Ollama: {str(exc)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        await client.aclose()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/messages/count_tokens")
+@app.post("/api/v1/messages/count_tokens")
+@app.post("/llm/v1/messages/count_tokens")
+async def anthropic_count_tokens(request: AnthropicCountTokensRequest, authorized: bool = Depends(get_api_key)):
+    """Anthropic count_tokens compatible endpoint — estimates via Ollama prompt_eval_count."""
+    ollama_messages = _anthropic_messages_to_ollama(request.messages, request.system)
+    # Use num_predict=1 to get just the prompt_eval_count without generating output
+    payload = {"model": request.model, "messages": ollama_messages, "stream": False, "options": {"num_predict": 1}}
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+            if response.status_code == 200:
+                data = response.json()
+                input_tokens = data.get("prompt_eval_count", 0)
+                return JSONResponse(content={"input_tokens": input_tokens})
+    except Exception as e:
+        logger.warning(f"[COUNT-TOKENS] Ollama call failed, using estimate: {e}")
+    # Fallback: rough estimation
+    total_chars = sum(
+        len(m.content) if isinstance(m.content, str) else sum(len(b.get("text", "")) for b in m.content)
+        for m in request.messages
+    )
+    if request.system:
+        total_chars += len(request.system)
+    return JSONResponse(content={"input_tokens": max(1, total_chars // 4)})
+
 
 @app.get("/health")
 @app.get("/v1/health")

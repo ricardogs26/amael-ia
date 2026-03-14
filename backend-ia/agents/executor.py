@@ -161,7 +161,13 @@ def _run_reasoning_step(
         f"Los bloques de código contienen ÚNICAMENTE salida raw de comandos o código fuente.\n"
         f"3. Tu análisis, explicaciones y recomendaciones van FUERA de los bloques, como texto normal.\n"
         f"4. NO conviertas datos tabulares de kubectl en tablas markdown; preserva el bloque ```bash original.\n"
-        f"5. Si generas scripts bash o manifiestos YAML nuevos, envuélvelos en ```bash o ```yaml respectivamente."
+        f"5. Si generas scripts bash o manifiestos YAML nuevos, envuélvelos en ```bash o ```yaml respectivamente.\n"
+        f"6. CRÍTICO — REGLA CONTRA ALUCINACIONES: Si el contexto anterior NO contiene información técnica específica sobre la pregunta "
+        f"(como una búsqueda vacía o resultados irrelevantes como tips de Google), DEBES responder claramente: \n"
+        f"   'Lo siento, no pude encontrar información técnica específica sobre [TEMA] en mi infraestructura ni en búsquedas recientes.'\n"
+        f"   NUNCA inventes pasos genéricos de configuración, autenticación o tips de búsqueda si no están en el contexto.\n"
+        f"7. NUNCA des consejos genéricos sobre cómo usar Google o Chrome. Si el contexto es sobre Claude Code y el resultado de búsqueda es genérico, "
+        f"admite que no encontraste los detalles técnicos necesarios para la conexión."
     )
 
     estimated_tokens = len(prompt) // 4

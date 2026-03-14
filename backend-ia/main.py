@@ -10,6 +10,7 @@ from starlette.middleware.sessions import SessionMiddleware
 import time
 import asyncio
 import logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 from pydantic import BaseModel
 from typing import Optional
 import requests
@@ -181,7 +182,12 @@ _llm_doc = _OllamaLLM(model=LLM_MODEL, base_url=OLLAMA_BASE_URL, num_predict=200
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "postgres-service")
 POSTGRES_DB = os.getenv("POSTGRES_DB", "amael_db")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "amael_user")
-POSTGRES_PASS = os.getenv("POSTGRES_PASSWORD", "amael_password_2026")
+POSTGRES_PASS = os.environ.get("POSTGRES_PASSWORD")
+MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY")
+MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY")
+
+if not all([POSTGRES_PASS, MINIO_ACCESS_KEY, MINIO_SECRET_KEY]):
+    raise ValueError("Missing required database/minio environment variables (POSTGRES_PASSWORD, MINIO_ACCESS_KEY, MINIO_SECRET_KEY).")
 
 # Pool de conexiones para Postgres
 _postgres_pool = None
@@ -195,26 +201,37 @@ def get_postgres_pool():
     if _postgres_pool is not None:
         return _postgres_pool
     
-    if now - _last_pool_attempt < POOL_RETRY_INTERVAL:
+    # Si ya falló recientemente, no saturar (mantener intervalo de 30s para reintentos normales)
+    if _last_pool_attempt > 0 and now - _last_pool_attempt < POOL_RETRY_INTERVAL:
         return None
         
     _last_pool_attempt = now
-    try:
-        _postgres_pool = psycopg2.pool.SimpleConnectionPool(1, 10,
-            user=POSTGRES_USER,
-            password=POSTGRES_PASS,
-            host=POSTGRES_HOST,
-            database=POSTGRES_DB
-        )
-        print("PostgreSQL connection pool created successfully")
-        return _postgres_pool
-    except Exception as e:
-        print(f"Error creating PostgreSQL pool: {e}")
-        return None
+    
+    # P7-F: Reintento agresivo inicial (para DNS transitorio en startup)
+    max_retries = 3
+    retry_delay = 2 # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            _postgres_pool = psycopg2.pool.SimpleConnectionPool(1, 15,
+                user=POSTGRES_USER,
+                password=POSTGRES_PASS,
+                host=POSTGRES_HOST,
+                database=POSTGRES_DB
+            )
+            print(f"PostgreSQL connection pool created successfully (attempt {attempt+1})")
+            return _postgres_pool
+        except Exception as e:
+            print(f"Error creating PostgreSQL pool (attempt {attempt+1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+    
+    return None
+
 
 MINIO_URL = os.getenv("MINIO_URL", "minio-service:9000")
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "amael_admin")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "amael_minio_secret_key")
+# The keys are already loaded above from os.environ.get and validated
+
 
 minio_client = Minio(
     MINIO_URL,
@@ -905,21 +922,54 @@ def _web_search(query: str) -> str:
             logger.warning(f"[WEB_SEARCH] Exchange rate API falló: {e}")
 
     # ── General search via DuckDuckGo ─────────────────────────────────────────
+    logging.info(f"[WEB_SEARCH] Query: {query}")
     try:
         from duckduckgo_search import DDGS
         with DDGS() as ddgs:
             results = list(ddgs.text(query, region="mx-es", safesearch="off",
-                                     timelimit="m", max_results=5))
+                                     timelimit="m", max_results=8))
         if not results:
+            logging.warning(f"[WEB_SEARCH] No results found for: {query}")
             return "No se encontraron resultados para la búsqueda."
-        lines = []
+        
+        # Filter junk/generic help pages that cause hallucinations
+        junk_keywords = [
+            "google search help", "how to search on google", "chrome search", 
+            "búsquedas efectivas", "cómo buscar", "soporte de google",
+            "search results help", "google support", "información sobre cómo realizar búsquedas",
+            "search effectively", "mejores prácticas de búsqueda", "ayuda de búsqueda",
+            "google search tips", "chrome tips", "browser search help"
+        ]
+        
+        filtered = []
         for r in results:
+            title_lower = r.get("title", "").lower()
+            snippet_lower = r.get("body", "").lower()
+            href_lower = r.get("href", "").lower()
+            
+            is_junk = any(kw in title_lower or kw in snippet_lower or kw in href_lower for kw in junk_keywords)
+            if not is_junk:
+                filtered.append(r)
+            else:
+                logging.info(f"[WEB_SEARCH] Junk result filtered: {r.get('title')}")
+
+        # Keep top 5 after filtering
+        final_results = filtered[:5]
+        
+        if not final_results:
+            logging.warning(f"[WEB_SEARCH] All results filtered as junk for: {query}")
+            return "No se encontró información técnica específica en la búsqueda web."
+
+        logging.info(f"[WEB_SEARCH] Found {len(final_results)} valid results.")
+        lines = []
+        for r in final_results:
             title = r.get("title", "")
             body = r.get("body", "")
             href = r.get("href", "")
             lines.append(f"**{title}**\n{body}\nFuente: {href}")
         return "\n\n---\n\n".join(lines)
     except Exception as e:
+        logging.error(f"[WEB_SEARCH] Error: {e}")
         return f"Error en búsqueda web: {e}"
 
 
@@ -2190,7 +2240,7 @@ async def _get_k8s_health_brief(user_id: str) -> str:
         r = await asyncio.to_thread(
             _http_client.post,
             f"{K8S_AGENT_URL}/api/k8s-agent",
-            json={"query": "Dame un resumen breve del estado del cluster: pods con problemas, uso de recursos.", "user_email": user_id},
+            json={"query": "Dame un reporte TÉCNICO del clúster. USA TUS HERRAMIENTAS para revisar los pods y recursos en los namespaces: amael-ia, vault, kong y observability. Reporta pods fallidos y consumo de memoria en Mb y CPU.", "user_email": user_id},
             headers={"Authorization": f"Bearer {INTERNAL_API_SECRET}"},
             timeout=60.0,
         )
@@ -2467,6 +2517,21 @@ async def access_request(body: AccessRequestCreate):
     return {"ok": True}
 
 
+async def _get_k8s_health_stats() -> dict:
+    """Obtiene estadísticas estructuradas del clúster via k8s-agent."""
+    try:
+        r = await asyncio.to_thread(
+            _http_client.get,
+            f"{K8S_AGENT_URL}/api/sre/health-stats",
+            headers={"Authorization": f"Bearer {INTERNAL_API_SECRET}"},
+            timeout=30.0,
+        )
+        return r.json() if r.status_code == 200 else {"failing_count": 0}
+    except Exception as e:
+        logging.warning(f"[PLANNER] Error k8s stats: {e}")
+        return {"failing_count": 0}
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @app.post("/api/planner/daily")
@@ -2492,48 +2557,103 @@ async def daily_planner(request: Request):
     today = f"{_days_es[_now.weekday()]} {_now.day} de {_months_es[_now.month-1]} de {_now.year}"
 
     # Recopilar todo el contexto en paralelo
-    k8s_health, calendar_summary, goals_text, user_ctx, news_text = await asyncio.gather(
+    k8s_health, k8s_stats, calendar_summary, goals_text, user_ctx, news_text = await asyncio.gather(
         _get_k8s_health_brief(user_id),
+        _get_k8s_health_stats(),
         _get_calendar_brief(user_id),
         _get_active_goals_text(user_id),
         asyncio.to_thread(get_user_context, user_id),
         _get_daily_news(),
     )
 
-    plan_prompt = f"""Eres el asistente ejecutivo personal de un Subdirector de Infraestructura Digital.
-Genera su briefing ejecutivo matutino. Hoy es {today}.
+    # Lógica de color de cluster (🟢 verde, 🟡 amarillo, 🔴 rojo)
+    failing_count = k8s_stats.get("failing_count", 0)
+    if failing_count == 0:
+        cluster_emoji = "🟢"
+    elif failing_count == 1:
+        cluster_emoji = "🟡"
+    else:
+        cluster_emoji = "🔴"
 
-{f"Perfil:{chr(10)}{user_ctx}" if user_ctx else ""}
+    # Traducir emoji a texto para el prompt
+    status_label = "OK" if cluster_emoji == "🟢" else "ALGO DE ATENCIÓN" if cluster_emoji == "🟡" else "CRÍTICO"
 
-{f"📅 AGENDA DE HOY:{chr(10)}{calendar_summary}" if calendar_summary else "📅 Sin eventos registrados en el calendario."}
+    # Preparar datos base
+    agenda_section = calendar_summary if calendar_summary else "Sin eventos"
+    
+    # Construir contexto de infra a partir de stats + health brief
+    infra_context = f"Estado: {cluster_emoji} {status_label}\n"
+    if k8s_stats:
+        infra_context += f"- Total Pods: {k8s_stats.get('total_pods')}\n"
+        infra_context += f"- Pods Fallidos ({k8s_stats.get('failing_count')}): {', '.join(k8s_stats.get('failing_pods', []))}\n"
+    if k8s_health and "No se encontraron" not in k8s_health and "error" not in k8s_health.lower():
+        infra_context += f"- Detalles Adicionales: {k8s_health}\n"
+    
+    if not k8s_stats and not k8s_health:
+        infra_context = "Sin datos adicionales detectados en los namespaces amael-ia, vault, kong y observability."
 
-{f"🖥️ ESTADO DEL CLÚSTER:{chr(10)}{k8s_health}" if k8s_health else "🖥️ Clúster: Sin datos disponibles."}
+    news_context = news_text if news_text else "Sin noticias relevantes."
 
-{f"🎯 OBJETIVOS ACTIVOS:{chr(10)}{goals_text}" if goals_text else "🎯 Sin objetivos activos registrados."}
+    extract_prompt = f"""Basado en la siguiente información, genera TRES bloques de texto cortos.
+USA LA CADENA '###' EXCLUSIVAMENTE PARA SEPARAR LOS BLOQUES.
 
-{f"📰 NOTICIAS DEL DÍA:{chr(10)}{news_text}" if news_text else ""}
+DATOS:
+Infraestructura: {infra_context}
+Noticias: {news_context}
 
-REGLA CRÍTICA: USA ÚNICAMENTE la información proporcionada arriba. NUNCA inventes eventos, reuniones, citas ni datos que no estén en el contexto. Si una sección dice "Sin eventos" o "Sin datos", repórtalo tal cual.
+INSTRUCCIONES:
+Bloque 1: Resumen de infraestructura (menciona amael-ia, vault, kong y observability). Todo dato de memoria debe decir *Mb*.
+Bloque 2: Una noticia: *Título* — Resumen (máx 30 palabras).
+Bloque 3: Pregunta estratégica (máx 15 palabras).
 
-Genera el briefing ejecutivo con este formato WhatsApp (*negritas*, emojis, saltos de línea):
-1. 🌅 Saludo ejecutivo personalizado con el día y fecha
-2. 📅 Agenda: si hay eventos en AGENDA DE HOY, lista máximo 3; si dice "Sin eventos", escribe "📅 *Agenda limpia* — sin reuniones programadas hoy."
-3. 🖥️ Infraestructura: estado real del clúster según ESTADO DEL CLÚSTER (✅ OK o ⚠️ alertas)
-4. 🎯 Prioridad del día: solo si hay objetivos en OBJETIVOS ACTIVOS; si no hay, omite esta sección
-5. 📰 Una noticia del sector si está disponible en NOTICIAS DEL DÍA
-6. 💡 Una pregunta de reflexión estratégica para el día
-
-Tono: ejecutivo, conciso, orientado a la acción. Máximo 350 palabras."""
+FORMATO DE SALIDA (ESTRICTO):
+[Contenido Bloque 1]
+###
+[Contenido Bloque 2]
+###
+[Contenido Bloque 3]
+"""
 
     try:
         from langchain_ollama import ChatOllama as _CO
         from langchain_core.messages import HumanMessage as _HM
-        _llm = _CO(model=LLM_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.4, num_predict=600)
-        response = await asyncio.to_thread(_llm.invoke, [_HM(content=plan_prompt)])
-        plan_text = response.content.strip()
+        import re
+        _llm = _CO(model=LLM_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.1, num_predict=600)
+        response = await asyncio.to_thread(_llm.invoke, [_HM(content=extract_prompt)])
+        content = response.content.strip()
+        logging.info(f"[PLANNER] LLM Raw: {content[:300]}...")
+        
+        # Separación más robusta
+        parts = re.split(r'###|Bloque \d:|BLOQUE \d:', content, flags=re.IGNORECASE)
+        parts = [p.strip() for p in parts if p.strip()]
+        
+        infra_llm = parts[0] if len(parts) > 0 else "Operación estable en los namespaces monitoreados."
+        news_llm  = parts[1] if len(parts) > 1 else "No se reportan noticias de alto impacto hoy."
+        ques_llm  = parts[2] if len(parts) > 2 else "¿Qué innovaciones podemos integrar hoy?"
+
+        # Ensamblaje final DETERMINÍSTICO
+        agenda_line = f"*Agenda limpia* — sin reuniones programadas hoy." if not calendar_summary else calendar_summary
+        
+        # Lista de pods fallidos si el estado no es verde (🟡 o 🔴)
+        failing_pods_list = ""
+        if cluster_emoji in ("🟡", "🔴") and k8s_stats and k8s_stats.get("failing_pods"):
+            failing_pods_list = "\n⚠️ **Pods con problemas:**\n" + "\n".join([f"• {p}" for p in k8s_stats.get("failing_pods", [])]) + "\n"
+
+        plan_text = (
+            f"🌅 **Buen día Ricardo, {today}**\n\n"
+            f"📅 Agenda: {agenda_line}\n\n"
+            f"🖥️ **Estado del clúster Kubernetes:**\n"
+            f"{cluster_emoji} **{status_label}** — {infra_llm}\n"
+            f"{failing_pods_list}\n"
+            f"🎯 **Prioridad del día:** {goals_text if goals_text else 'Sin objetivos activos registrados.'}\n\n"
+            f"📰 **Noticia del día:**\n{news_llm}\n\n"
+            f"💡 **Pregunta de reflexión estratégica:**\n{ques_llm}\n\n"
+            f"¡Estoy a tu disposición para cualquier consulta o acción inmediata!"
+        )
+
     except Exception as e:
-        logging.error(f"[PLANNER] Error generando plan: {e}")
-        plan_text = f"🌅 Buenos días! Son las {_dt.datetime.now().strftime('%H:%M')}. No pude generar el plan completo hoy, pero estoy disponible para ayudarte."
+        logging.error(f"[PLANNER] Error ensamblando plan: {e}")
+        plan_text = f"🌅 **Buen día Ricardo.** Hoy es {today}.\n\n⚠️ No pude generar el briefing detallado, pero el clúster reporta estado {cluster_emoji}. Estoy a tu disposición."
 
     # Enviar por WhatsApp
     sent = await send_whatsapp_message(phone, plan_text)
