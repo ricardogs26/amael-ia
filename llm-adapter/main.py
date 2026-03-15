@@ -81,7 +81,7 @@ LLM_LATENCY_SECONDS = Histogram('amael_llm_latency_seconds', 'Latency of LLM req
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Union[str, List[Dict[str, Any]]]
     name: Optional[str] = None
 
 class ChatCompletionRequest(BaseModel):
@@ -195,6 +195,12 @@ async def create_chat_completion(request: ChatCompletionRequest, req_raw: Reques
     Endpoint compatible con OpenAI SDK.
     Transforma la petición y la envía a Ollama.
     """
+    if True: # Temporary debug logging
+        try:
+            body = await req_raw.json()
+            logger.info(f"[DEBUG] Raw request body: {json.dumps(body)}")
+        except:
+            pass
     
     # Captura de Identidad (X-User-Email para Frontend, X-User-Phone para WhatsApp)
     user_email = req_raw.headers.get("X-User-Email", "anonymous")
@@ -206,9 +212,26 @@ async def create_chat_completion(request: ChatCompletionRequest, req_raw: Reques
     target_model = request.model
 
     # Payload para Ollama (API nativa /api/chat)
+    ollama_messages = []
+    for msg in request.messages:
+        content = msg.content
+        if isinstance(content, list):
+            # Normalizar formato multi-modal (OpenAI/Anthropic) a texto plano para Ollama si no hay imágenes
+            # O pasar como está si Ollama lo soporta (Ollama soporta strings o strings con imágenes)
+            text_parts = []
+            for block in content:
+                if block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+            content = "".join(text_parts)
+        
+        ollama_messages.append({
+            "role": msg.role,
+            "content": content
+        })
+
     ollama_payload = {
         "model": target_model,
-        "messages": [msg.dict(exclude_none=True) for msg in request.messages],
+        "messages": ollama_messages,
         "stream": request.stream,
         "options": {
             "temperature": request.temperature,

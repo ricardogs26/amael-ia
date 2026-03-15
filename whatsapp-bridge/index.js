@@ -426,6 +426,14 @@ app.get('/status', (req, res) => {
     res.json({ status: clientStatus, hasQR: !!qrCodeData && qrCodeData !== 'CLIENTE_LISTO', timestamp: new Date().toISOString() });
 });
 
+app.get('/health', (req, res) => {
+    if (clientStatus === 'ready') {
+        res.status(200).send('OK');
+    } else {
+        res.status(503).send(clientStatus);
+    }
+});
+
 // --- START ──────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {

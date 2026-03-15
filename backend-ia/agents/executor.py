@@ -134,20 +134,11 @@ def _run_reasoning_step(
     Execute a REASONING step.
     Returns (new_final_answer, unchanged_context).
     """
-    media_pattern = r"\[MEDIA:.+?\]"
-    media_data = None
-    current_answer = state.get("final_answer", "") or ""
-    context = state.get("context", "") or ""
-
-    reasoning_task = step[len("REASONING:"):].strip()
-
-    # Extract [MEDIA:...] BEFORE truncating — base64 payloads are large and
-    # _truncate keeps only the tail, which would drop the [MEDIA: prefix.
-    if "[MEDIA:" in current_answer:
-        match = re.search(media_pattern, current_answer, re.DOTALL)
-        if match:
-            media_data = match.group(0)
-            current_answer = re.sub(media_pattern, "[IMAGEN_ADJUNTA_GENERADA]", current_answer, flags=re.DOTALL)
+    # Extract ALL [MEDIA:...] tags BEFORE truncating
+    all_media = re.findall(media_pattern, current_answer, re.DOTALL)
+    if all_media:
+        # Replace all instances with a unique, cleanable placeholder
+        current_answer = re.sub(media_pattern, "[SYSTEM_MEDIA_MARKER]", current_answer, flags=re.DOTALL)
 
     context_for_llm = _truncate(current_answer, MAX_ANSWER_CHARS, "final_answer")
 
@@ -162,20 +153,21 @@ def _run_reasoning_step(
         f"3. Tu análisis, explicaciones y recomendaciones van FUERA de los bloques, como texto normal.\n"
         f"4. NO conviertas datos tabulares de kubectl en tablas markdown; preserva el bloque ```bash original.\n"
         f"5. Si generas scripts bash o manifiestos YAML nuevos, envuélvelos en ```bash o ```yaml respectivamente.\n"
-        f"6. CRÍTICO — REGLA CONTRA ALUCINACIONES: Si el contexto anterior NO contiene información técnica específica sobre la pregunta "
+        f"6. CRÍTICO — SI EL CONTEXTO TIENE [SYSTEM_MEDIA_MARKER], RECUERDA MENCIONAR QUE HAS ANALIZADO LA IMAGEN ADJUNTA pero NO incluyas el marcador en tu respuesta final.\n"
+        f"7. CRÍTICO — REGLA CONTRA ALUCINACIONES: Si el contexto anterior NO contiene información técnica específica sobre la pregunta "
         f"(como una búsqueda vacía o resultados irrelevantes como tips de Google), DEBES responder claramente: \n"
         f"   'Lo siento, no pude encontrar información técnica específica sobre [TEMA] en mi infraestructura ni en búsquedas recientes.'\n"
         f"   NUNCA inventes pasos genéricos de configuración, autenticación o tips de búsqueda si no están en el contexto.\n"
-        f"7. NUNCA des consejos genéricos sobre cómo usar Google o Chrome. Si el contexto es sobre Claude Code y el resultado de búsqueda es genérico, "
-        f"admite que no encontraste los detalles técnicos necesarios para la conexión."
     )
 
     estimated_tokens = len(prompt) // 4
     EXECUTOR_ESTIMATED_PROMPT_TOKENS.labels(step_type="REASONING").observe(estimated_tokens)
 
     new_answer = llm_reasoning.invoke(prompt)
-    if media_data:
-        new_answer += f"\n\n{media_data}"
+    
+    # Append all captured media back to the end
+    if all_media:
+        new_answer += "\n\n" + "\n".join(all_media)
 
     return new_answer, context
 

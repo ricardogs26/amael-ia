@@ -8,6 +8,7 @@ interface Props {
   isStreaming?: boolean
   feedback?: 'positive' | 'negative' | null
   onFeedback?: (sentiment: 'positive' | 'negative') => void
+  onImageClick?: (src: string) => void
 }
 
 // ── Content block types ───────────────────────────────────────────────────────
@@ -19,6 +20,16 @@ type Block =
   | { kind: 'image-url'; url:  string }
 
 const TERMINAL_LANGS = new Set(['bash', 'sh', 'zsh', 'shell', 'kubectl', 'terminal', 'console', ''])
+
+/** Clean technical markers that shouldn't be visible to users */
+function cleanTechnicalMarkers(text: string): string {
+  if (!text) return ''
+  return text
+    .replace(/\[\s*IMAGEN_ADJUNTA_GENERADA\s*\]/gi, '')
+    .replace(/\[\s*MEDIA_PLACEHOLDER\s*\]/gi, '')
+    .replace(/\[\s*SYSTEM_MEDIA_MARKER\s*\]/gi, '')
+    .replace(/\[MEDIA:[\s\S]+?\]/g, '') // Keep for extraction, but hide in pure text
+}
 
 /** Split text into text/code/document blocks */
 function splitDocuments(text: string): Block[] {
@@ -51,19 +62,25 @@ function splitCodeFences(text: string): Block[] {
 /** Split raw assistant message into typed blocks */
 function parseContent(raw: string): Block[] {
   const out: Block[] = []
-  const mediaRe = /\[MEDIA:([A-Za-z0-9+/=\s]+?)\]/g
+  const mediaRe = /\[MEDIA:([\s\S]+?)\]/g
   const chartRe  = /(?:!\[.*?\]\()?(https:\/\/quickchart\.io\/chart[^\s)\]]*)\)?/g
+
+  // 0. Clean internal placeholders (except [MEDIA:...] which we want to parse)
+  const preCleaned = raw
+    .replace(/\[\s*IMAGEN_ADJUNTA_GENERADA\s*\]/gi, '')
+    .replace(/\[\s*MEDIA_PLACEHOLDER\s*\]/gi, '')
+    .replace(/\[\s*SYSTEM_MEDIA_MARKER\s*\]/gi, '')
 
   // 1. Extract [MEDIA:...] tags
   let tmp = ''; let last = 0; let m: RegExpExecArray | null
   mediaRe.lastIndex = 0
-  while ((m = mediaRe.exec(raw)) !== null) {
-    tmp += raw.slice(last, m.index)
+  while ((m = mediaRe.exec(preCleaned)) !== null) {
+    tmp += preCleaned.slice(last, m.index)
     if (tmp) { out.push(...splitCodeFences(tmp)); tmp = '' }
     out.push({ kind: 'image-b64', data: m[1].replace(/\s/g, '') })
     last = m.index + m[0].length
   }
-  let remaining = tmp + raw.slice(last)
+  let remaining = tmp + preCleaned.slice(last)
 
   // 2. Extract QuickChart URLs
   last = 0; chartRe.lastIndex = 0
@@ -289,7 +306,7 @@ function MarkdownContent({ text }: { text: string }) {
 }
 
 // ── Main Message component ────────────────────────────────────────────────────
-export default function Message({ role, content, ts, isStreaming, feedback, onFeedback }: Props) {
+export default function Message({ role, content, ts, isStreaming, feedback, onFeedback, onImageClick }: Props) {
   const [copied, setCopied] = useState(false)
   const [hovered, setHovered] = useState(false)
   const isUser = role === 'user'
@@ -301,18 +318,34 @@ export default function Message({ role, content, ts, isStreaming, feedback, onFe
   }
 
   const renderBlocks = () => {
-    if (isStreaming) return <><MarkdownContent text={content} /><span className="cursor" /></>
+    if (isStreaming) {
+      return (
+        <>
+          <MarkdownContent text={cleanTechnicalMarkers(content)} />
+          <span className="cursor" />
+        </>
+      )
+    }
     return parseContent(content).map((block, i) => {
       if (block.kind === 'image-b64') {
+        const src = `data:image/png;base64,${block.data}`
         return (
-          <img key={i} src={`data:image/png;base64,${block.data}`} alt="Grafana screenshot"
-            style={{ maxWidth: '100%', borderRadius: '8px', margin: '8px 0', display: 'block' }} />
+          <img key={i} src={src} alt="Grafana screenshot"
+            onClick={(e) => { e.stopPropagation(); onImageClick?.(src); }}
+            style={{ 
+              maxWidth: '100%', borderRadius: '8px', margin: '8px 0', 
+              display: 'block', cursor: 'pointer', pointerEvents: 'auto' 
+            }} />
         )
       }
       if (block.kind === 'image-url') {
         return (
           <img key={i} src={block.url} alt="Chart"
-            style={{ maxWidth: '100%', borderRadius: '8px', margin: '8px 0', display: 'block' }} />
+            onClick={(e) => { e.stopPropagation(); onImageClick?.(block.url); }}
+            style={{ 
+              maxWidth: '100%', borderRadius: '8px', margin: '8px 0', 
+              display: 'block', cursor: 'pointer', pointerEvents: 'auto' 
+            }} />
         )
       }
       if (block.kind === 'code') {

@@ -13,6 +13,7 @@ import glob as _glob
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, List
+from jose import jwt
 
 logging.basicConfig(level=logging.INFO)
 from kubernetes import client, config, stream
@@ -149,6 +150,9 @@ _MAINTENANCE_KEY     = "sre:maintenance:active"
 SRE_MEMORY_LEAK_RATE_BYTES = int(os.environ.get("SRE_MEMORY_LEAK_RATE_BYTES", str(1024 * 1024)))  # 1 MB/s
 _SLO_TARGETS: List[dict] = []  # loaded at startup from SLO_TARGETS_JSON env var
 
+# P6 — Service users
+SERVICE_USER_EMAIL = "bot-amael@richardx.dev"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN — política (desde sre-agent-policy ConfigMap)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,6 +164,7 @@ _PROTECTED_CSV = os.environ.get("SRE_PROTECTED_DEPLOYMENTS",
 PROTECTED_DEPLOYMENTS = {d.strip() for d in _PROTECTED_CSV.split(',') if d.strip()}
 
 AUTO_HEAL_MIN_SEVERITY   = os.environ.get("SRE_AUTO_HEAL_MIN_SEVERITY",   "HIGH")
+MIN_NOTIFY_SEVERITY      = os.environ.get("SRE_MIN_NOTIFY_SEVERITY",      "HIGH")
 CONFIDENCE_THRESHOLD     = float(os.environ.get("SRE_CONFIDENCE_THRESHOLD",     "0.75"))
 MAX_RESTARTS_PER_RESOURCE = int(os.environ.get("SRE_MAX_RESTARTS_PER_RESOURCE", "3"))
 RESTART_WINDOW_MINUTES   = int(os.environ.get("SRE_RESTART_WINDOW_MINUTES",    "15"))
@@ -476,6 +481,46 @@ def get_recent_incidents(limit: int = 20) -> list:
         return []
     finally:
         pool.putconn(conn)
+
+
+def generate_daily_summary() -> str:
+    """P5: Genera un resumen de los incidentes y acciones de las últimas 24 horas."""
+    pool = get_postgres_pool()
+    if not pool:
+        return "Resumen no disponible: Sin base de datos."
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT issue_type, action_taken, action_result, count(*)
+                FROM sre_incidents
+                WHERE created_at > now() - INTERVAL '24 hours'
+                GROUP BY issue_type, action_taken, action_result;
+            """)
+            rows = cur.fetchall()
+        
+        if not rows:
+            return "✅ *Reporte Diario:* No se detectaron anomalías en las últimas 24 h."
+        
+        summary = ["📊 *Reporte Diario de SRE* (últimas 24h):"]
+        for issue, action, result, count in rows:
+            icon = "✅" if "✅" in (result or "") else "⚠️"
+            summary.append(f"• {count}x {issue} → {action} ({icon})")
+        
+        return "\n".join(summary)
+    except Exception as e:
+        return f"Error generando reporte: {e}"
+    finally:
+        pool.putconn(conn)
+
+
+def send_daily_report_whatsapp():
+    """Envía el reporte diario a WhatsApp."""
+    logging.info("[SRE_REPORT] Iniciando envío de reporte diario...")
+    report = generate_daily_summary()
+    res = _send_sre_notification(report, "DAILY_REPORT")
+    logging.info(f"[SRE_REPORT] Resultado de _send_sre_notification: {res}")
+    return res
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1090,6 +1135,7 @@ class PodStatus:
     name:              str
     namespace:         str
     phase:             str
+    ready:             bool
     restart_count:     int
     waiting_reason:    str
     last_state_reason: str
@@ -1628,6 +1674,8 @@ def list_grafana_dashboards(query: str = "") -> str:
         if not cms.items:
             return "No se encontraron dashboards."
         result = "Dashboards en Grafana:\n"
+        result += "- Recursos Cluster (recursos)\n"
+        result += "- GPU & Infra (gpu)\n"
         for cm in cms.items:
             title = cm.metadata.name.replace("kube-prometheus-stack-", "").replace("-", " ").title()
             result += f"- {title} ({cm.metadata.name})\n"
@@ -1655,6 +1703,42 @@ def rollout_restart_deployment(input_str: str) -> str:
         return f"Error al reiniciar '{deployment_name}': {e}"
 
 
+def refresh_whatsapp_bridge_token() -> str:
+    """
+    P6-A: Autonomously refreshes the WhatsApp bridge JWT token.
+    1. Reads JWT_SECRET_KEY from google-auth-secret.
+    2. Generates new token for SERVICE_USER_EMAIL.
+    3. Updates amael-secrets.
+    4. Restarts whatsapp-bridge-deployment.
+    """
+    try:
+        logging.info("[AUDIT] Iniciando REFRESH_WA_TOKEN autónomo.")
+        # 1. Get Secret Key
+        secret = v1.read_namespaced_secret("google-auth-secret", DEFAULT_NAMESPACE)
+        import base64
+        jwt_key_b64 = secret.data.get("jwt_secret_key")
+        if not jwt_key_b64:
+            return "Error: jwt_secret_key no encontrado en google-auth-secret."
+        jwt_key = base64.b64decode(jwt_key_b64).decode('utf-8')
+
+        # 2. Create Token
+        to_encode = {"sub": SERVICE_USER_EMAIL}
+        new_token = jwt.encode(to_encode, jwt_key, algorithm="HS256")
+
+        # 3. Update amael-secrets
+        new_token_b64 = base64.b64encode(new_token.encode('utf-8')).decode('utf-8')
+        patch = {"data": {"jwt-token": new_token_b64}}
+        v1.patch_namespaced_secret("amael-secrets", DEFAULT_NAMESPACE, patch)
+        logging.info("[AUDIT] Secreto 'amael-secrets' actualizado con nuevo token.")
+
+        # 4. Restart Bridge
+        restart_res = rollout_restart_deployment(f"whatsapp-bridge-deployment, {DEFAULT_NAMESPACE}")
+        return f"✅ Token actualizado satisfactoriamente. {restart_res}"
+    except Exception as e:
+        logging.error(f"[REFRESH_WA_TOKEN] Error: {e}")
+        return f"Error en REFRESH_WA_TOKEN: {e}"
+
+
 def delete_k8s_pod(input_str: str) -> str:
     pod_name, namespace = _parse_two(input_str)
     try:
@@ -1675,7 +1759,7 @@ def notify_whatsapp_sre(input_str: str) -> str:
     try:
         resp = requests.post(
             f"{WHATSAPP_BRIDGE_URL}/send",
-            json={"phone": OWNER_PHONE, "message": f"[SRE] {message}"},
+            json={"phoneNumber": OWNER_PHONE, "text": f"[SRE] {message}"},
             timeout=10,
         )
         if resp.status_code == 200:
@@ -1690,15 +1774,29 @@ def _send_sre_notification(message: str, severity: str = "INFO"):
     if not WHATSAPP_BRIDGE_URL or not OWNER_PHONE:
         logging.info(f"[SRE_NOTIFY] {severity}: {message}")
         return
+        
+    if severity in _SEVERITY_RANK:
+        min_rank = _SEVERITY_RANK.get(MIN_NOTIFY_SEVERITY, 2)  # Default HIGH is 2
+        this_rank = _SEVERITY_RANK[severity]
+        if this_rank < min_rank:
+            logging.info(f"[SRE_NOTIFY] (Skipped via policy) {severity}: {message[:50]}...")
+            return
+
     try:
-        requests.post(
+        # P5: Alert pacing (3s delay) to avoid WhatsApp saturation
+        time.sleep(3)
+        resp = requests.post(
             f"{WHATSAPP_BRIDGE_URL}/send",
-            json={"phone": OWNER_PHONE, "message": f"[SRE {severity}] {message}"},
+            json={"phoneNumber": OWNER_PHONE, "text": f"[SRE {severity}] {message}"},
             timeout=10,
         )
-        SRE_NOTIFY_TOTAL.labels(severity=severity.lower()).inc()
+        if resp.status_code == 200:
+            logging.info(f"[SRE_NOTIFY] Alerta enviada ({severity}): {message[:50]}...")
+            SRE_NOTIFY_TOTAL.labels(severity=severity.lower()).inc()
+        else:
+            logging.warning(f"[SRE_NOTIFY] Error bridge {resp.status_code}: {resp.text}")
     except Exception as e:
-        logging.warning(f"[SRE_NOTIFY] {e}")
+        logging.warning(f"[SRE_NOTIFY] Exception: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1778,8 +1876,9 @@ def capture_grafana_screenshot(dashboard: str = "recursos") -> str:
     DASHBOARD_MAP = {
         "recursos": "efa86fd1d0c121a26444b636a3f509a8/k8s-resources-cluster",
         "rag":      "amael-rag/3-amael-rag-performance",
+        "gpu":      "amael-infra",
     }
-    db_key      = "rag" if "rag" in dashboard.lower() else "recursos"
+    db_key      = "gpu" if "gpu" in dashboard.lower() else ("rag" if "rag" in dashboard.lower() else "recursos")
     target_path = DASHBOARD_MAP[db_key]
     url = (f"http://kube-prometheus-stack-grafana.observability.svc.cluster.local"
            f"/d/{target_path}?orgId=1&refresh=10s")
@@ -1956,6 +2055,7 @@ def _deterministic_diagnosis(anomaly: Anomaly) -> Diagnosis:
         "ERROR_RATE_ESCALATING":     ("DEPENDENCY",     "NOTIFY_HUMAN", 0.70),
         # P5-C — SLO violations
         "SLO_BUDGET_BURNING":        ("DEPENDENCY",     "NOTIFY_HUMAN", 0.90),
+        "UNHEALTHY_SERVICE":         ("DEPENDENCY",     "ROLLOUT_RESTART", 0.75),
     }
     cat, action, conf = ISSUE_MAP.get(
         anomaly.issue_type, ("UNKNOWN", "NOTIFY_HUMAN", 0.50)
@@ -2357,10 +2457,12 @@ def observe_cluster() -> ClusterSnapshot:
         try:
             k8s_pods = v1.list_namespaced_pod(ns)
             for pod in k8s_pods.items:
-                phase, rc, wr, lsr = pod.status.phase or "Unknown", 0, "", ""
+                phase, rc, wr, lsr, is_ready = pod.status.phase or "Unknown", 0, "", "", True
                 if pod.status.container_statuses:
                     for cs in pod.status.container_statuses:
                         rc += cs.restart_count or 0
+                        if not cs.ready:
+                            is_ready = False
                         if cs.state and cs.state.waiting:
                             wr = cs.state.waiting.reason or ""
                         if cs.last_state and cs.last_state.terminated:
@@ -2384,7 +2486,7 @@ def observe_cluster() -> ClusterSnapshot:
                             break
 
                 pods.append(PodStatus(
-                    name=pod.metadata.name, namespace=ns, phase=phase,
+                    name=pod.metadata.name, namespace=ns, phase=phase, ready=is_ready,
                     restart_count=rc, waiting_reason=wr, last_state_reason=lsr,
                     owner_name=owner_name, owner_kind=owner_kind,
                     start_time=pod.status.start_time,
@@ -2446,6 +2548,14 @@ def detect_anomalies(snapshot: ClusterSnapshot) -> List[Anomaly]:
                 "pod", pod.owner_name, pod.owner_kind,
                 f"Pod '{pod.name}' tiene {pod.restart_count} reinicios (actualmente Running).",
                 f"{kp}:HIGH_RESTARTS"))
+        elif pod.phase == "Running" and not pod.ready and pod.start_time:
+            age = (datetime.now(timezone.utc) - pod.start_time).total_seconds()
+            if age > 120:  # More than 2 minutes running but not ready
+                anomalies.append(Anomaly("UNHEALTHY_SERVICE", "HIGH", pod.namespace, pod.name,
+                    "pod", pod.owner_name, pod.owner_kind,
+                    f"Pod '{pod.name}' está Running pero NO Ready hace {int(age)}s. "
+                    "Posible servicio atascado en inicialización.",
+                    f"{kp}:UNHEALTHY"))
 
     for node in snapshot.nodes:
         kn = f"node:{node.name}"
@@ -2583,6 +2693,17 @@ def execute_sre_action(plan: ActionPlan, anomaly: Anomaly,
         _send_sre_notification(msg, severity=anomaly.severity)
         SRE_ACTIONS_TAKEN.labels(action="notify_human", result="ok").inc()
         return f"Notificación enviada: {anomaly.issue_type}"
+
+    if plan.action == "REFRESH_WA_TOKEN":
+        result = refresh_whatsapp_bridge_token()
+        ok = "✅" in result
+        SRE_ACTIONS_TAKEN.labels(action="refresh_wa_token", result="ok" if ok else "error").inc()
+        if ok:
+            _send_sre_notification(
+                f"✅ Reparación autónoma: Token de WhatsApp bridge renovado y servicio reiniciado.",
+                severity="INFO"
+            )
+        return result
 
     return "NO_ACTION"
 
@@ -2751,6 +2872,14 @@ async def startup():
             max_instances=1,
             coalesce=True,
             id="sre_loop",
+        )
+        # P5: Reporte diario a las 20:00 (hora local del pod)
+        scheduler.add_job(
+            send_daily_report_whatsapp,
+            trigger="cron",
+            hour=20,
+            minute=0,
+            id="daily_report",
         )
         scheduler.start()
         app.state.sre_scheduler = scheduler
@@ -2986,6 +3115,7 @@ async def sre_command(body: SRECommandRequest):
             "• `status` — estado del loop y circuit breaker\n"
             "• `incidents` — últimos 5 incidentes\n"
             "• `postmortems` — últimos 3 postmortems\n"
+            "• `report` — resumen de las últimas 24h\n"
             "• `slo` — estado de SLOs\n"
             "• `maintenance on <min>` — activar mantenimiento\n"
             "• `maintenance off` — desactivar mantenimiento"
@@ -3028,6 +3158,11 @@ async def sre_command(body: SRECommandRequest):
                 f"  Causa: {(pm.get('root_cause_summary') or '')[:80]}"
             )
         return {"reply": "\n".join(lines)}
+
+    if cmd == "report":
+        summary = generate_daily_summary()
+        send_daily_report_whatsapp() # Mandar a WhatsApp proactivamente
+        return {"reply": summary}
 
     if cmd == "slo":
         slo_data = []
