@@ -238,10 +238,23 @@ client.on('message', async message => {
     if (body.startsWith('/sre')) {
         const sreCmd = body.replace(/^\/sre\s*/i, '').trim() || 'ayuda';
         console.log(`[SRE] Comando SRE de ${phoneNumber}: "${sreCmd}"`);
+
+        let quotedText = null;
+        try {
+            if (message.hasQuotedMsg) {
+                const quotedMsg = await message.getQuotedMessage();
+                quotedText = quotedMsg.body;
+                console.log(`[SRE] Mensaje citado detectado: "${quotedText.slice(0, 50)}..."`);
+            }
+        } catch (e) {
+            console.warn(`[SRE] Error obteniendo mensaje citado: ${e.message}`);
+        }
+
         try {
             const sreRes = await axios.post(`${K8S_AGENT_URL}/api/sre/command`, {
                 command: sreCmd,
                 phone:   phoneNumber,
+                quoted_text: quotedText,
             }, {
                 headers: { Authorization: `Bearer ${AMAEL_INTERNAL_SECRET}` },
                 timeout: 30000,

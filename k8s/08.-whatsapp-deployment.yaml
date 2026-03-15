@@ -25,6 +25,9 @@ spec:
           mountPath: /usr/src/app/.wwebjs_auth
         - name: shm
           mountPath: /dev/shm
+        - name: bridge-code-volume
+          mountPath: /usr/src/app/index.js
+          subPath: index.js
         env:
         - name: AMAEL_BASE_URL
           value: "http://backend-service:8000"
@@ -74,6 +77,9 @@ spec:
         emptyDir:
           medium: Memory
           sizeLimit: 256Mi
+      - name: bridge-code-volume
+        configMap:
+          name: whatsapp-bridge-code
 ---
 apiVersion: v1
 kind: Service

@@ -13,7 +13,6 @@ import glob as _glob
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, List
-from jose import jwt
 
 logging.basicConfig(level=logging.INFO)
 from kubernetes import client, config, stream
@@ -101,6 +100,7 @@ class SRECommandRequest(BaseModel):
     """P5-E: WhatsApp SRE command routed from whatsapp-bridge."""
     command: str        # e.g. "status", "incidents", "slo", "maintenance on 60"
     phone:   str = ""   # sender phone number (for reply routing)
+    quoted_text: Optional[str] = None # P5-F: Context for specific silencing
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN — operacional
@@ -149,9 +149,6 @@ _MAINTENANCE_KEY     = "sre:maintenance:active"
 # P5 — Predictive alerting & SLO
 SRE_MEMORY_LEAK_RATE_BYTES = int(os.environ.get("SRE_MEMORY_LEAK_RATE_BYTES", str(1024 * 1024)))  # 1 MB/s
 _SLO_TARGETS: List[dict] = []  # loaded at startup from SLO_TARGETS_JSON env var
-
-# P6 — Service users
-SERVICE_USER_EMAIL = "bot-amael@richardx.dev"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN — política (desde sre-agent-policy ConfigMap)
@@ -516,11 +513,8 @@ def generate_daily_summary() -> str:
 
 def send_daily_report_whatsapp():
     """Envía el reporte diario a WhatsApp."""
-    logging.info("[SRE_REPORT] Iniciando envío de reporte diario...")
     report = generate_daily_summary()
-    res = _send_sre_notification(report, "DAILY_REPORT")
-    logging.info(f"[SRE_REPORT] Resultado de _send_sre_notification: {res}")
-    return res
+    return _send_sre_notification(report, "DAILY_REPORT")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1070,6 +1064,52 @@ def get_recent_postmortems(limit: int = 10) -> list:
 # P4-C: MAINTENANCE WINDOWS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _parse_duration(duration_str: str) -> int:
+    """Converts duration like '24h', '1h', '30m' to minutes. Default 60."""
+    if not duration_str: return 60
+    duration_str = duration_str.strip().lower()
+    
+    # Try simple integer first
+    if duration_str.isdigit():
+        return int(duration_str)
+        
+    match = re.match(r"(\d+)([hm])?", duration_str)
+    if not match:
+        return 60
+    val, unit = match.groups()
+    val = int(val)
+    if unit == 'h': return val * 60
+    return val # 'm' or default
+
+def _parse_alert_context(text: Optional[str]):
+    """Extracts namespace, resource and issue from alert text."""
+    if not text: return None
+    try:
+        # Example: [SRE HIGH] ⚠️ HIGH: POD_FAILED\nRecurso: ollama-deployment-795dcc85d9-7lkf5 (amael-ia)
+        issue_match = re.search(r"⚠️ [^:]+: ([A-Z_]+)", text)
+        res_match = re.search(r"Recurso: ([^\s\(]+) \(([^\)]+)\)", text)
+        if issue_match and res_match:
+            return {
+                "issue": issue_match.group(1),
+                "resource": res_match.group(1),
+                "namespace": res_match.group(2)
+            }
+    except:
+        pass
+    return None
+
+def _is_anomaly_silenced(a: Anomaly) -> bool:
+    """Checks if this specific anomaly is silenced in Redis."""
+    if not _redis: return False
+    keys = [
+        f"sre:silent:{a.namespace}:{a.resource_name}:{a.issue_type}",
+        f"sre:silent:{a.namespace}:{a.owner_name}:{a.issue_type}" if a.owner_name else None
+    ]
+    for k in keys:
+        if k and _redis.exists(k): return True
+    return False
+
+
 def _is_maintenance_active() -> bool:
     """Returns True if a maintenance window is currently active (Redis key exists)."""
     if _redis:
@@ -1081,12 +1121,9 @@ def _is_maintenance_active() -> bool:
 
 
 def _activate_maintenance(input_str: str = "60") -> str:
-    """Activates maintenance window. Input: duration in minutes (default 60)."""
-    try:
-        minutes = int(input_str.strip() or "60")
-        minutes = max(1, min(minutes, 480))  # clamp 1 min–8 h
-    except ValueError:
-        minutes = 60
+    """Activates maintenance window. Supports durations like '24h', '1h'."""
+    minutes = _parse_duration(input_str)
+    minutes = max(1, min(minutes, 10080))  # clamp 1 min – 7 days
     if _redis:
         _redis.set(_MAINTENANCE_KEY, "1", ex=minutes * 60)
         SRE_MAINTENANCE_ACTIVE.set(1)
@@ -1135,7 +1172,6 @@ class PodStatus:
     name:              str
     namespace:         str
     phase:             str
-    ready:             bool
     restart_count:     int
     waiting_reason:    str
     last_state_reason: str
@@ -1674,8 +1710,6 @@ def list_grafana_dashboards(query: str = "") -> str:
         if not cms.items:
             return "No se encontraron dashboards."
         result = "Dashboards en Grafana:\n"
-        result += "- Recursos Cluster (recursos)\n"
-        result += "- GPU & Infra (gpu)\n"
         for cm in cms.items:
             title = cm.metadata.name.replace("kube-prometheus-stack-", "").replace("-", " ").title()
             result += f"- {title} ({cm.metadata.name})\n"
@@ -1701,42 +1735,6 @@ def rollout_restart_deployment(input_str: str) -> str:
         return f"✅ Rollout restart iniciado en '{deployment_name}' ({namespace})."
     except Exception as e:
         return f"Error al reiniciar '{deployment_name}': {e}"
-
-
-def refresh_whatsapp_bridge_token() -> str:
-    """
-    P6-A: Autonomously refreshes the WhatsApp bridge JWT token.
-    1. Reads JWT_SECRET_KEY from google-auth-secret.
-    2. Generates new token for SERVICE_USER_EMAIL.
-    3. Updates amael-secrets.
-    4. Restarts whatsapp-bridge-deployment.
-    """
-    try:
-        logging.info("[AUDIT] Iniciando REFRESH_WA_TOKEN autónomo.")
-        # 1. Get Secret Key
-        secret = v1.read_namespaced_secret("google-auth-secret", DEFAULT_NAMESPACE)
-        import base64
-        jwt_key_b64 = secret.data.get("jwt_secret_key")
-        if not jwt_key_b64:
-            return "Error: jwt_secret_key no encontrado en google-auth-secret."
-        jwt_key = base64.b64decode(jwt_key_b64).decode('utf-8')
-
-        # 2. Create Token
-        to_encode = {"sub": SERVICE_USER_EMAIL}
-        new_token = jwt.encode(to_encode, jwt_key, algorithm="HS256")
-
-        # 3. Update amael-secrets
-        new_token_b64 = base64.b64encode(new_token.encode('utf-8')).decode('utf-8')
-        patch = {"data": {"jwt-token": new_token_b64}}
-        v1.patch_namespaced_secret("amael-secrets", DEFAULT_NAMESPACE, patch)
-        logging.info("[AUDIT] Secreto 'amael-secrets' actualizado con nuevo token.")
-
-        # 4. Restart Bridge
-        restart_res = rollout_restart_deployment(f"whatsapp-bridge-deployment, {DEFAULT_NAMESPACE}")
-        return f"✅ Token actualizado satisfactoriamente. {restart_res}"
-    except Exception as e:
-        logging.error(f"[REFRESH_WA_TOKEN] Error: {e}")
-        return f"Error en REFRESH_WA_TOKEN: {e}"
 
 
 def delete_k8s_pod(input_str: str) -> str:
@@ -1876,9 +1874,8 @@ def capture_grafana_screenshot(dashboard: str = "recursos") -> str:
     DASHBOARD_MAP = {
         "recursos": "efa86fd1d0c121a26444b636a3f509a8/k8s-resources-cluster",
         "rag":      "amael-rag/3-amael-rag-performance",
-        "gpu":      "amael-infra",
     }
-    db_key      = "gpu" if "gpu" in dashboard.lower() else ("rag" if "rag" in dashboard.lower() else "recursos")
+    db_key      = "rag" if "rag" in dashboard.lower() else "recursos"
     target_path = DASHBOARD_MAP[db_key]
     url = (f"http://kube-prometheus-stack-grafana.observability.svc.cluster.local"
            f"/d/{target_path}?orgId=1&refresh=10s")
@@ -2055,7 +2052,6 @@ def _deterministic_diagnosis(anomaly: Anomaly) -> Diagnosis:
         "ERROR_RATE_ESCALATING":     ("DEPENDENCY",     "NOTIFY_HUMAN", 0.70),
         # P5-C — SLO violations
         "SLO_BUDGET_BURNING":        ("DEPENDENCY",     "NOTIFY_HUMAN", 0.90),
-        "UNHEALTHY_SERVICE":         ("DEPENDENCY",     "ROLLOUT_RESTART", 0.75),
     }
     cat, action, conf = ISSUE_MAP.get(
         anomaly.issue_type, ("UNKNOWN", "NOTIFY_HUMAN", 0.50)
@@ -2457,12 +2453,10 @@ def observe_cluster() -> ClusterSnapshot:
         try:
             k8s_pods = v1.list_namespaced_pod(ns)
             for pod in k8s_pods.items:
-                phase, rc, wr, lsr, is_ready = pod.status.phase or "Unknown", 0, "", "", True
+                phase, rc, wr, lsr = pod.status.phase or "Unknown", 0, "", ""
                 if pod.status.container_statuses:
                     for cs in pod.status.container_statuses:
                         rc += cs.restart_count or 0
-                        if not cs.ready:
-                            is_ready = False
                         if cs.state and cs.state.waiting:
                             wr = cs.state.waiting.reason or ""
                         if cs.last_state and cs.last_state.terminated:
@@ -2486,7 +2480,7 @@ def observe_cluster() -> ClusterSnapshot:
                             break
 
                 pods.append(PodStatus(
-                    name=pod.metadata.name, namespace=ns, phase=phase, ready=is_ready,
+                    name=pod.metadata.name, namespace=ns, phase=phase,
                     restart_count=rc, waiting_reason=wr, last_state_reason=lsr,
                     owner_name=owner_name, owner_kind=owner_kind,
                     start_time=pod.status.start_time,
@@ -2548,14 +2542,6 @@ def detect_anomalies(snapshot: ClusterSnapshot) -> List[Anomaly]:
                 "pod", pod.owner_name, pod.owner_kind,
                 f"Pod '{pod.name}' tiene {pod.restart_count} reinicios (actualmente Running).",
                 f"{kp}:HIGH_RESTARTS"))
-        elif pod.phase == "Running" and not pod.ready and pod.start_time:
-            age = (datetime.now(timezone.utc) - pod.start_time).total_seconds()
-            if age > 120:  # More than 2 minutes running but not ready
-                anomalies.append(Anomaly("UNHEALTHY_SERVICE", "HIGH", pod.namespace, pod.name,
-                    "pod", pod.owner_name, pod.owner_kind,
-                    f"Pod '{pod.name}' está Running pero NO Ready hace {int(age)}s. "
-                    "Posible servicio atascado en inicialización.",
-                    f"{kp}:UNHEALTHY"))
 
     for node in snapshot.nodes:
         kn = f"node:{node.name}"
@@ -2694,17 +2680,6 @@ def execute_sre_action(plan: ActionPlan, anomaly: Anomaly,
         SRE_ACTIONS_TAKEN.labels(action="notify_human", result="ok").inc()
         return f"Notificación enviada: {anomaly.issue_type}"
 
-    if plan.action == "REFRESH_WA_TOKEN":
-        result = refresh_whatsapp_bridge_token()
-        ok = "✅" in result
-        SRE_ACTIONS_TAKEN.labels(action="refresh_wa_token", result="ok" if ok else "error").inc()
-        if ok:
-            _send_sre_notification(
-                f"✅ Reparación autónoma: Token de WhatsApp bridge renovado y servicio reiniciado.",
-                severity="INFO"
-            )
-        return result
-
     return "NO_ACTION"
 
 
@@ -2748,6 +2723,10 @@ def _run_loop_iteration():
         logging.info(f"[SRE_LOOP] {len(anomalies)} anomalía(s).")
 
         for anomaly in anomalies:
+            # P5-F: Skip silenced anomalies
+            if _is_anomaly_silenced(anomaly):
+                logging.info(f"[SRE_LOOP] Anomalía silenciada: {anomaly.issue_type} en {anomaly.resource_name}")
+                continue
             if _is_duplicate_incident(anomaly.dedup_key):
                 continue
             _mark_incident(anomaly.dedup_key)
@@ -3160,9 +3139,7 @@ async def sre_command(body: SRECommandRequest):
         return {"reply": "\n".join(lines)}
 
     if cmd == "report":
-        summary = generate_daily_summary()
-        send_daily_report_whatsapp() # Mandar a WhatsApp proactivamente
-        return {"reply": summary}
+        summary = generate_daily_summary(); send_daily_report_whatsapp(); return {"reply": summary}
 
     if cmd == "slo":
         slo_data = []
@@ -3175,17 +3152,39 @@ async def sre_command(body: SRECommandRequest):
             return {"reply": "📭 No hay SLO targets configurados (SLO_TARGETS_JSON vacío)."}
         return {"reply": "📊 *SLO Targets:*\n" + "\n".join(slo_data)}
 
-    if cmd.startswith("maintenance"):
+    if cmd.startswith("maintenance") or cmd.startswith("silent"):
         parts = cmd.split()
-        if len(parts) >= 2 and parts[1] == "off":
+        # Handle "off" or "unsilent" or "resume"
+        if len(parts) >= 2 and parts[1] in ("off", "unsilent", "resume"):
             return {"reply": _deactivate_maintenance()}
-        if len(parts) >= 3 and parts[1] == "on":
-            return {"reply": _activate_maintenance(parts[2])}
-        if len(parts) == 2 and parts[1] == "on":
-            return {"reply": _activate_maintenance("60")}
+            
+        # Handle duration (either 'maintenance on <dur>' or 'silent <dur>')
+        duration_part = "60"
+        if cmd.startswith("maintenance"):
+            if len(parts) >= 3 and parts[1] == "on": duration_part = parts[2]
+            elif len(parts) == 2 and parts[1] == "on": duration_part = "60"
+        else: # silent command
+            if len(parts) >= 2: duration_part = parts[1]
+
+        # Specific silencing if replying to alert
+        if cmd.startswith("silent"):
+            context = _parse_alert_context(body.quoted_text)
+            if context:
+                ns, res, issue = context["namespace"], context["resource"], context["issue"]
+                key = f"sre:silent:{ns}:{res}:{issue}"
+                if _redis:
+                    duration_min = _parse_duration(duration_part)
+                    _redis.set(key, "1", ex=duration_min * 60)
+                    return {"reply": f"🔇 Alerta silenciada: *{issue}* en *{res}* ({ns}) por {duration_min} min."}
+                return {"reply": "❌ Redis no disponible."}
+
+        # General maintenance (if no quoted text or using 'maintenance' explicitly)
+        if cmd.startswith("maintenance") or not body.quoted_text:
+            return {"reply": _activate_maintenance(duration_part)}
+
         active = _is_maintenance_active()
         return {"reply": f"🔧 Mantenimiento: {'activo' if active else 'inactivo'}. "
-                         f"Usa: maintenance on <min> / maintenance off"}
+                         f"Usa: silent <dur> (respondiendo a alerta) o maintenance on <dur>"}
 
     return {"reply": f"❓ Comando desconocido: '{cmd}'. Escribe `ayuda` para ver opciones."}
 
