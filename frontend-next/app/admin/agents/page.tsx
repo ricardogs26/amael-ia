@@ -126,19 +126,29 @@ export default function AgentsPage() {
     cto: 'Active', dev: 'Thinking', arch: 'Active', sre: 'Idle',
   })
 
-  const messagesEndRef   = useRef<HTMLDivElement>(null)
+  const messagesEndRef    = useRef<HTMLDivElement>(null)
   const interactionEndRef = useRef<HTMLDivElement>(null)
   const interactionIdRef  = useRef(INIT_INTERACTIONS.length + 1)
+  const chatTimeoutRef    = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Polling de estado real del SRE loop (cada 30s)
   useEffect(() => {
     const fetchStatus = () => {
       fetch(`${BACKEND}/sre/loop/status`)
         .then(r => r.ok ? r.json() : Promise.reject(r.status))
-        .then(data => setAgentStatuses(sreLoopToStatuses(data)))
+        .then(data => {
+          const next = sreLoopToStatuses(data)
+          setAgentStatuses(prev => {
+            const changed = (Object.keys(next) as AgentId[]).some(k => prev[k] !== next[k])
+            return changed ? next : prev
+          })
+        })
         .catch(() => {
-          // Si el backend no responde, todos los agentes en Idle
-          setAgentStatuses({ cto: 'Idle', dev: 'Idle', arch: 'Idle', sre: 'Idle' })
+          setAgentStatuses(prev => {
+            const idle: Record<AgentId, Status> = { cto: 'Idle', dev: 'Idle', arch: 'Idle', sre: 'Idle' }
+            const changed = (Object.keys(idle) as AgentId[]).some(k => prev[k] !== idle[k])
+            return changed ? idle : prev
+          })
         })
     }
     fetchStatus()
@@ -146,7 +156,10 @@ export default function AgentsPage() {
     return () => clearInterval(iv)
   }, [])
 
-// Auto-scroll chat
+  // Cleanup chat timeout on unmount
+  useEffect(() => () => { if (chatTimeoutRef.current) clearTimeout(chatTimeoutRef.current) }, [])
+
+  // Auto-scroll chat
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, thinking])
@@ -166,13 +179,12 @@ export default function AgentsPage() {
     setMessages(prev => [...prev, userMsg])
     setThinking(true)
 
-    const delay = rnd(1500, 2500)
-    setTimeout(() => {
+    chatTimeoutRef.current = setTimeout(() => {
       const pool = AGENT_RESPONSES[chatAgent]
       const reply = pool[rnd(0, pool.length - 1)]
       setMessages(prev => [...prev, { id: Date.now() + 1, role: 'assistant', agent: chatAgent, text: reply }])
       setThinking(false)
-    }, delay)
+    }, rnd(1500, 2500))
   }
 
   const simulateInteraction = () => {
