@@ -1,0 +1,7 @@
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.4
+soundfile==0.12.1
+numpy==1.26.4
+# CosyVoice y sus deps se instalan desde el repo oficial en el Dockerfile
+# torch, torchaudio: versión CPU en el Dockerfile (evita 4GB de CUDA)
