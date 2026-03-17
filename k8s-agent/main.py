@@ -102,6 +102,15 @@ class SRECommandRequest(BaseModel):
     phone:   str = ""   # sender phone number (for reply routing)
     quoted_text: Optional[str] = None # P5-F: Context for specific silencing
 
+
+class DeployHookRequest(BaseModel):
+    """Phase 1 — CI/CD deploy hook: notifies Raphael after a new image is deployed."""
+    service: str        # e.g. "amael-agentic-backend"
+    version: str        # e.g. "1.7.0"
+    commit:  str = ""   # full commit SHA
+    author:  str = ""   # GitHub actor
+    message: str = ""   # commit message
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN — operacional
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3187,6 +3196,48 @@ async def sre_command(body: SRECommandRequest):
                          f"Usa: silent <dur> (respondiendo a alerta) o maintenance on <dur>"}
 
     return {"reply": f"❓ Comando desconocido: '{cmd}'. Escribe `ayuda` para ver opciones."}
+
+
+@app.post("/api/sre/deploy-hook")
+async def deploy_hook(body: DeployHookRequest, request: Request):
+    """
+    Phase 1 — Deploy hook desde CI/CD (GitHub Actions).
+    Raphael activa monitoreo intensificado durante 10 minutos tras un despliegue.
+
+    Requiere: Authorization: Bearer <INTERNAL_API_SECRET>
+    """
+    auth = request.headers.get("Authorization", "")
+    if not INTERNAL_API_SECRET or auth != f"Bearer {INTERNAL_API_SECRET}":
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    short_sha = body.commit[:8] if body.commit else "?"
+    logging.info(
+        f"[Raphael] deploy-hook recibido: service={body.service} "
+        f"version={body.version} commit={short_sha} author={body.author}"
+    )
+
+    # Activar monitoreo intensificado: marca en Redis durante 10 minutos
+    if _redis:
+        key = f"sre:deploy_watch:{body.service}"
+        _redis.setex(key, 600, body.version)  # 600s = 10 min
+        logging.info(f"[Raphael] Monitoreo intensificado activado para '{body.service}' (10 min)")
+
+    # Notificar por WhatsApp
+    wa_msg = (
+        f"🚀 *Raphael — Nuevo despliegue detectado*\n"
+        f"• Servicio: `{body.service}:{body.version}`\n"
+        f"• Commit: `{short_sha}` — {body.message[:80]}\n"
+        f"• Autor: {body.author}\n"
+        f"• Monitoreo intensificado: 10 min ✅"
+    )
+    _send_sre_notification(wa_msg, severity="INFO")
+
+    return {
+        "status": "ok",
+        "service": body.service,
+        "version": body.version,
+        "monitoring_window_seconds": 600,
+    }
 
 
 @app.get("/health")
