@@ -1,5 +1,6 @@
 'use client'
 import { useEffect, useRef, useState, useCallback } from 'react'
+import { useRouter } from 'next/navigation'
 import Message from './Message'
 import Sidebar from './Sidebar'
 
@@ -1025,6 +1026,7 @@ function AdminPanel({ token, onClose }: { token: string; onClose: () => void }) 
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function Chat({ token, userName, userPicture, onLogout, calendarNotif }: Props) {
+  const router = useRouter()
   const [messages,        setMessages]        = useState<Msg[]>([])
   const [conversations,   setConversations]   = useState<Conv[]>([])
   const [convId,          setConvId]          = useState<number | null>(null)
@@ -1341,6 +1343,7 @@ export default function Chat({ token, userName, userPicture, onLogout, calendarN
         onLogout={onLogout}
         onProfile={() => setShowProfile(true)}
         onAdmin={() => setShowAdmin(true)}
+        onAgents={() => router.push('/admin/agents')}
         isAdmin={userRole === 'admin'}
       />
 

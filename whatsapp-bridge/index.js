@@ -283,6 +283,12 @@ client.on('message', async message => {
             if (media && media.mimetype.startsWith('image/')) {
                 payload.image = media.data;
                 if (!payload.prompt) payload.prompt = 'Analiza esta imagen.';
+            } else if (media && (message.type === 'ptt' || message.type === 'audio')) {
+                // Nota de voz o audio → transcribir en el backend
+                payload.audio_base64   = media.data;
+                payload.audio_mimetype = media.mimetype || 'audio/ogg; codecs=opus';
+                if (!payload.prompt) payload.prompt = '[audio]';
+                console.log(`[AUDIO] Nota de voz de ${phoneNumber} (${media.mimetype})`);
             }
         }
 

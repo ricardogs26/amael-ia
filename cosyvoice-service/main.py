@@ -54,9 +54,12 @@ MODEL_DIR        = os.environ.get("COSYVOICE_MODEL_DIR", "/models/CosyVoice2-0.5
 SAMPLE_RATE      = 22050   # placeholder; real rate from model.sample_rate
 MAX_CHARS        = int(os.environ.get("TTS_MAX_CHARS", "500"))
 # Voz por defecto: audio de referencia bundled en el repo de CosyVoice
-DEFAULT_REF_WAV  = "/cosyvoice/asset/zero_shot_prompt.wav"
-# Transcripción del audio de referencia (希望你以后能做的比我还好呦。)
-DEFAULT_REF_TEXT = "希望你以后能做的比我还好呦。"
+# Voz de referencia: mujer mexicana (generado con Piper es_MX-claude-high)
+# Fallback: audio bundled en el repo de CosyVoice (voz china)
+DEFAULT_REF_WAV  = "/models/reference/es_MX_female.wav"
+DEFAULT_REF_TEXT = "Hola, me da mucho gusto saludarte hoy. Espero que tengas un excelente día lleno de buenas noticias."
+_FALLBACK_REF_WAV  = "/cosyvoice/asset/zero_shot_prompt.wav"
+_FALLBACK_REF_TEXT = "希望你以后能做的比我还好呦。"
 
 # ── Modelo global ─────────────────────────────────────────────────────────────
 _model      = None
@@ -72,14 +75,16 @@ def _load_model():
     elapsed = time.monotonic() - t0
     logger.info(f"[cosyvoice] Modelo listo en {elapsed:.1f}s (CPU)")
 
-    # Verificar que el audio de referencia existe (se pasa como path al modelo)
-    if os.path.exists(DEFAULT_REF_WAV):
-        audio_np, sr = sf.read(DEFAULT_REF_WAV, dtype="float32")
+    # Seleccionar audio de referencia (mexicana > fallback china)
+    ref_path = DEFAULT_REF_WAV if os.path.exists(DEFAULT_REF_WAV) else _FALLBACK_REF_WAV
+    ref_text = DEFAULT_REF_TEXT if os.path.exists(DEFAULT_REF_WAV) else _FALLBACK_REF_TEXT
+    if os.path.exists(ref_path):
+        audio_np, sr = sf.read(ref_path, dtype="float32")
         duration = len(audio_np) / sr
-        _ref_audio = DEFAULT_REF_WAV   # path string; CosyVoice lo carga con load_wav→torchaudio.load(monkeypatched)
-        logger.info(f"[cosyvoice] Voz de referencia: {DEFAULT_REF_WAV} ({duration:.1f}s @ {sr}Hz)")
+        _ref_audio = (ref_path, ref_text)
+        logger.info(f"[cosyvoice] Voz de referencia: {ref_path} ({duration:.1f}s @ {sr}Hz)")
     else:
-        logger.warning(f"[cosyvoice] No se encontró audio de referencia en {DEFAULT_REF_WAV}")
+        logger.warning("[cosyvoice] No se encontró ningún audio de referencia")
 
 
 @asynccontextmanager
@@ -163,13 +168,14 @@ def synthesize(req: TTSRequest):
         raise HTTPException(400, "El texto no puede estar vacío")
 
     lang_tag = "<|es|>" if req.language.startswith("es") else "<|en|>"
+    ref_path, ref_text = _ref_audio
 
     try:
         t0 = time.monotonic()
         gen = _model.inference_zero_shot(
             f"{lang_tag}{text}",
-            DEFAULT_REF_TEXT,
-            _ref_audio,
+            ref_text,
+            ref_path,
             stream=True,
         )
         audio = _collect_chunks(gen)
