@@ -6,6 +6,8 @@ metadata:
   namespace: amael-ia  # <-- CORREGIDO
 spec:
   replicas: 1
+  strategy:
+    type: Recreate   # Chromium no puede compartir el perfil — matar antes de crear
   selector:
     matchLabels:
       app: whatsapp-bridge
@@ -16,7 +18,7 @@ spec:
     spec:
       containers:
       - name: whatsapp-bridge
-        image: registry.richardx.dev/whatsapp-bridge:1.5.0
+        image: registry.richardx.dev/whatsapp-bridge:1.5.3
         imagePullPolicy: Always
         ports:
         - containerPort: 3000
