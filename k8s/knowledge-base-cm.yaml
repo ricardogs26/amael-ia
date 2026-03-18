@@ -30,3 +30,21 @@ data:
     1. Obtener logs: `Obtener_Logs_Pod(pod_name)`
     2. Si es error de conexión a DB, verificar disponibilidad de `postgres-service`.
     3. Si es OOMKilled, el pod necesita más memoria (notificar al admin).
+
+  backend-503-error: |
+    # Problema: Backend retorna 503 Service Unavailable
+    
+    ## Síntomas
+    - Peticiones a `POST /api/conversations` fallan con error 503.
+    - Los logs del backend muestran "Error creating PostgreSQL pool" o "Base de datos no disponible".
+    
+    ## Causa Raíz
+    Fallo transitorio en la resolución de DNS al intentar conectar con `postgres-service` durante el arranque, lo que deja el pool de conexiones sin inicializar.
+    
+    ## Solución Automática
+    Reiniciar el despliegue del backend para forzar una nueva inicialización del pool con la lógica de reintentos mejorada.
+    
+    ## Comandos para el Agente
+    - `Reiniciar_Deployment("backend-ia", "amael-ia")`
+    - `Verificar_Logs_Pod(pod_name, "PostgreSQL connection pool created successfully")`
+

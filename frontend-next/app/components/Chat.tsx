@@ -1,5 +1,6 @@
 'use client'
 import { useEffect, useRef, useState, useCallback } from 'react'
+import { useRouter } from 'next/navigation'
 import Message from './Message'
 import Sidebar from './Sidebar'
 
@@ -46,6 +47,62 @@ function StatusBanner({ msg }: { msg: string }) {
         ))}
       </div>
       <span style={{ color: 'var(--text-secondary)' }}>{msg}</span>
+    </div>
+  )
+}
+
+// ── Image Modal ─────────────────────────────────────────────────────────────
+function ImageModal({ src, onClose }: { src: string; onClose: () => void }) {
+  useEffect(() => {
+    const handleEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', handleEsc)
+    return () => window.removeEventListener('keydown', handleEsc)
+  }, [onClose])
+
+  return (
+    <div 
+      onClick={onClose}
+      style={{
+        position: 'fixed', inset: 0, zIndex: 9999,
+        background: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(8px)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px',
+        cursor: 'zoom-out',
+        animation: 'fadeIn 0.2s ease-out'
+      }}
+    >
+      <div style={{ position: 'relative', maxWidth: '95vw', maxHeight: '95vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <img 
+          src={src} 
+          alt="Expanded" 
+          style={{ 
+            maxWidth: '100%', 
+            maxHeight: '95vh', 
+            borderRadius: '8px', 
+            boxShadow: '0 20px 50px rgba(0,0,0,0.5)',
+            cursor: 'default'
+          }} 
+          onClick={e => e.stopPropagation()}
+        />
+        <button 
+          onClick={onClose}
+          style={{
+            position: 'absolute', top: '-40px', right: 0,
+            background: 'none', border: 'none', color: '#fff',
+            fontSize: '24px', cursor: 'pointer', padding: '10px',
+            opacity: 0.8, transition: 'opacity 0.2s'
+          }}
+          onMouseEnter={e => e.currentTarget.style.opacity = '1'}
+          onMouseLeave={e => e.currentTarget.style.opacity = '0.8'}
+        >
+          ✕
+        </button>
+      </div>
+      <style jsx>{`
+        @keyframes fadeIn {
+          from { opacity: 0; }
+          to { opacity: 1; }
+        }
+      `}</style>
     </div>
   )
 }
@@ -969,6 +1026,7 @@ function AdminPanel({ token, onClose }: { token: string; onClose: () => void }) 
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function Chat({ token, userName, userPicture, onLogout, calendarNotif }: Props) {
+  const router = useRouter()
   const [messages,        setMessages]        = useState<Msg[]>([])
   const [conversations,   setConversations]   = useState<Conv[]>([])
   const [convId,          setConvId]          = useState<number | null>(null)
@@ -985,6 +1043,7 @@ export default function Chat({ token, userName, userPicture, onLogout, calendarN
   const [calendarToast, setCalendarToast] = useState<'connected' | 'error' | null>(calendarNotif ?? null)
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [uploadStatus, setUploadStatus] = useState<'idle' | 'uploading' | 'done' | 'error'>('idle')
+  const [expandedImage, setExpandedImage] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const bottomRef  = useRef<HTMLDivElement>(null)
@@ -1284,6 +1343,7 @@ export default function Chat({ token, userName, userPicture, onLogout, calendarN
         onLogout={onLogout}
         onProfile={() => setShowProfile(true)}
         onAdmin={() => setShowAdmin(true)}
+        onAgents={() => router.push('/admin/agents')}
         isAdmin={userRole === 'admin'}
       />
 
@@ -1361,6 +1421,7 @@ export default function Chat({ token, userName, userPicture, onLogout, calendarN
                       ts={m.ts}
                       feedback={m.role === 'assistant' ? (feedback[i] ?? null) : undefined}
                       onFeedback={m.role === 'assistant' ? s => sendFeedback(i, s) : undefined}
+                      onImageClick={setExpandedImage}
                     />
                   ))}
 
@@ -1369,6 +1430,7 @@ export default function Chat({ token, userName, userPicture, onLogout, calendarN
                       role="assistant"
                       content={streamingContent}
                       isStreaming
+                      onImageClick={setExpandedImage}
                     />
                   )}
 
@@ -1502,6 +1564,9 @@ export default function Chat({ token, userName, userPicture, onLogout, calendarN
           </p>
         </div>
       </div>
+      {expandedImage && (
+        <ImageModal src={expandedImage} onClose={() => setExpandedImage(null)} />
+      )}
     </div>
   )
 }

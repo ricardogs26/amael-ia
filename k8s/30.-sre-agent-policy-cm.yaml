@@ -13,6 +13,11 @@ data:
   # Por debajo → NOTIFY_HUMAN en lugar de actuar.
   SRE_CONFIDENCE_THRESHOLD: "0.75"
 
+  # ─── Filtrado de Notificaciones ─────────────────────────────────────────────
+  # Nivel mínimo para notificar via WhatsApp. Por defecto HIGH.
+  # Valores: CRITICAL, HIGH, MEDIUM, LOW
+  SRE_MIN_NOTIFY_SEVERITY: "HIGH"
+
   # ─── Guardrail de reinicios ─────────────────────────────────────────────────
   # Máximo de rollout restarts automáticos permitidos por deployment
   # dentro de la ventana de tiempo definida abajo.

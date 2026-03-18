@@ -1,4 +1,4 @@
-// index.js — v1.5.0
+// index.js — v1.5.2
 // P5-E: Bidirectional /sre command routing to k8s-agent
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const express = require('express');
@@ -238,10 +238,23 @@ client.on('message', async message => {
     if (body.startsWith('/sre')) {
         const sreCmd = body.replace(/^\/sre\s*/i, '').trim() || 'ayuda';
         console.log(`[SRE] Comando SRE de ${phoneNumber}: "${sreCmd}"`);
+
+        let quotedText = null;
+        try {
+            if (message.hasQuotedMsg) {
+                const quotedMsg = await message.getQuotedMessage();
+                quotedText = quotedMsg.body;
+                console.log(`[SRE] Mensaje citado detectado: "${quotedText.slice(0, 50)}..."`);
+            }
+        } catch (e) {
+            console.warn(`[SRE] Error obteniendo mensaje citado: ${e.message}`);
+        }
+
         try {
             const sreRes = await axios.post(`${K8S_AGENT_URL}/api/sre/command`, {
                 command: sreCmd,
                 phone:   phoneNumber,
+                quoted_text: quotedText,
             }, {
                 headers: { Authorization: `Bearer ${AMAEL_INTERNAL_SECRET}` },
                 timeout: 30000,
@@ -262,7 +275,7 @@ client.on('message', async message => {
     }
 
     try {
-        let payload = { prompt, user_id: canonicalUserId };
+        let payload = { prompt, user_id: canonicalUserId, phone: phoneNumber };
 
         // Multimedia
         if (message.hasMedia) {
@@ -270,6 +283,12 @@ client.on('message', async message => {
             if (media && media.mimetype.startsWith('image/')) {
                 payload.image = media.data;
                 if (!payload.prompt) payload.prompt = 'Analiza esta imagen.';
+            } else if (media && (message.type === 'ptt' || message.type === 'audio')) {
+                // Nota de voz o audio → transcribir en el backend
+                payload.audio_base64   = media.data;
+                payload.audio_mimetype = media.mimetype || 'audio/ogg; codecs=opus';
+                if (!payload.prompt) payload.prompt = '[audio]';
+                console.log(`[AUDIO] Nota de voz de ${phoneNumber} (${media.mimetype})`);
             }
         }
 
@@ -339,6 +358,29 @@ app.post('/send-media', async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         console.error('[SEND-MEDIA] Error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+/** Envía nota de voz (PTT) desde el backend — usado por PiperTool. */
+app.post('/send-audio', async (req, res) => {
+    const { phoneNumber, base64, mimetype, ptt } = req.body;
+    if (!phoneNumber || !base64) {
+        return res.status(400).json({ error: 'Faltan parámetros: phoneNumber o base64' });
+    }
+    if (clientStatus !== 'ready') {
+        return res.status(503).json({ error: `Cliente no listo. Estado: ${clientStatus}` });
+    }
+    try {
+        const chatId    = phoneNumber.includes('@c.us') ? phoneNumber : `${phoneNumber}@c.us`;
+        const audioMime = mimetype || 'audio/ogg; codecs=opus';
+        const filename  = audioMime.startsWith('audio/wav') ? 'voice.wav' : 'voice.ogg';
+        const media     = new MessageMedia(audioMime, base64, filename);
+        // sendAudio: ptt=true → aparece como nota de voz (ícono de micrófono)
+        await client.sendMessage(chatId, media, { sendAudioAsVoice: ptt === true });
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[SEND-AUDIO] Error:', error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -426,10 +468,18 @@ app.get('/status', (req, res) => {
     res.json({ status: clientStatus, hasQR: !!qrCodeData && qrCodeData !== 'CLIENTE_LISTO', timestamp: new Date().toISOString() });
 });
 
+app.get('/health', (req, res) => {
+    if (clientStatus === 'ready') {
+        res.status(200).send('OK');
+    } else {
+        res.status(503).send(clientStatus);
+    }
+});
+
 // --- START ──────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`[BRIDGE v1.5.0] Servidor en puerto ${PORT}`);
+    console.log(`[BRIDGE v1.5.2] Servidor en puerto ${PORT}`);
 });
 
 const initializeClient = () => {

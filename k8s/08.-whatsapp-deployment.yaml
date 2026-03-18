@@ -6,6 +6,8 @@ metadata:
   namespace: amael-ia  # <-- CORREGIDO
 spec:
   replicas: 1
+  strategy:
+    type: Recreate   # Chromium no puede compartir el perfil — matar antes de crear
   selector:
     matchLabels:
       app: whatsapp-bridge
@@ -16,7 +18,7 @@ spec:
     spec:
       containers:
       - name: whatsapp-bridge
-        image: registry.richardx.dev/whatsapp-bridge:1.5.0
+        image: registry.richardx.dev/whatsapp-bridge:1.5.4
         imagePullPolicy: Always
         ports:
         - containerPort: 3000
@@ -25,6 +27,9 @@ spec:
           mountPath: /usr/src/app/.wwebjs_auth
         - name: shm
           mountPath: /dev/shm
+        - name: bridge-code-volume
+          mountPath: /usr/src/app/index.js
+          subPath: index.js
         env:
         - name: AMAEL_BASE_URL
           value: "http://backend-service:8000"
@@ -49,6 +54,23 @@ spec:
           limits:
             memory: "2Gi"
             cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /status # /status is always 200 if server is up
+            port: 3000
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health # /health only 200 if client is 'ready'
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 15
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
       volumes:
       - name: whatsapp-session-storage
         persistentVolumeClaim:
@@ -57,6 +79,9 @@ spec:
         emptyDir:
           medium: Memory
           sizeLimit: 256Mi
+      - name: bridge-code-volume
+        configMap:
+          name: whatsapp-bridge-code
 ---
 apiVersion: v1
 kind: Service

@@ -100,6 +100,16 @@ class SRECommandRequest(BaseModel):
     """P5-E: WhatsApp SRE command routed from whatsapp-bridge."""
     command: str        # e.g. "status", "incidents", "slo", "maintenance on 60"
     phone:   str = ""   # sender phone number (for reply routing)
+    quoted_text: Optional[str] = None # P5-F: Context for specific silencing
+
+
+class DeployHookRequest(BaseModel):
+    """Phase 1 — CI/CD deploy hook: notifies Raphael after a new image is deployed."""
+    service: str        # e.g. "amael-agentic-backend"
+    version: str        # e.g. "1.7.0"
+    commit:  str = ""   # full commit SHA
+    author:  str = ""   # GitHub actor
+    message: str = ""   # commit message
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURACIÓN — operacional
@@ -160,6 +170,7 @@ _PROTECTED_CSV = os.environ.get("SRE_PROTECTED_DEPLOYMENTS",
 PROTECTED_DEPLOYMENTS = {d.strip() for d in _PROTECTED_CSV.split(',') if d.strip()}
 
 AUTO_HEAL_MIN_SEVERITY   = os.environ.get("SRE_AUTO_HEAL_MIN_SEVERITY",   "HIGH")
+MIN_NOTIFY_SEVERITY      = os.environ.get("SRE_MIN_NOTIFY_SEVERITY",      "HIGH")
 CONFIDENCE_THRESHOLD     = float(os.environ.get("SRE_CONFIDENCE_THRESHOLD",     "0.75"))
 MAX_RESTARTS_PER_RESOURCE = int(os.environ.get("SRE_MAX_RESTARTS_PER_RESOURCE", "3"))
 RESTART_WINDOW_MINUTES   = int(os.environ.get("SRE_RESTART_WINDOW_MINUTES",    "15"))
@@ -476,6 +487,43 @@ def get_recent_incidents(limit: int = 20) -> list:
         return []
     finally:
         pool.putconn(conn)
+
+
+def generate_daily_summary() -> str:
+    """P5: Genera un resumen de los incidentes y acciones de las últimas 24 horas."""
+    pool = get_postgres_pool()
+    if not pool:
+        return "Resumen no disponible: Sin base de datos."
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT issue_type, action_taken, action_result, count(*)
+                FROM sre_incidents
+                WHERE created_at > now() - INTERVAL '24 hours'
+                GROUP BY issue_type, action_taken, action_result;
+            """)
+            rows = cur.fetchall()
+        
+        if not rows:
+            return "✅ *Reporte Diario:* No se detectaron anomalías en las últimas 24 h."
+        
+        summary = ["📊 *Reporte Diario de SRE* (últimas 24h):"]
+        for issue, action, result, count in rows:
+            icon = "✅" if "✅" in (result or "") else "⚠️"
+            summary.append(f"• {count}x {issue} → {action} ({icon})")
+        
+        return "\n".join(summary)
+    except Exception as e:
+        return f"Error generando reporte: {e}"
+    finally:
+        pool.putconn(conn)
+
+
+def send_daily_report_whatsapp():
+    """Envía el reporte diario a WhatsApp."""
+    report = generate_daily_summary()
+    return _send_sre_notification(report, "DAILY_REPORT")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1025,6 +1073,52 @@ def get_recent_postmortems(limit: int = 10) -> list:
 # P4-C: MAINTENANCE WINDOWS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _parse_duration(duration_str: str) -> int:
+    """Converts duration like '24h', '1h', '30m' to minutes. Default 60."""
+    if not duration_str: return 60
+    duration_str = duration_str.strip().lower()
+    
+    # Try simple integer first
+    if duration_str.isdigit():
+        return int(duration_str)
+        
+    match = re.match(r"(\d+)([hm])?", duration_str)
+    if not match:
+        return 60
+    val, unit = match.groups()
+    val = int(val)
+    if unit == 'h': return val * 60
+    return val # 'm' or default
+
+def _parse_alert_context(text: Optional[str]):
+    """Extracts namespace, resource and issue from alert text."""
+    if not text: return None
+    try:
+        # Example: [SRE HIGH] ⚠️ HIGH: POD_FAILED\nRecurso: ollama-deployment-795dcc85d9-7lkf5 (amael-ia)
+        issue_match = re.search(r"⚠️ [^:]+: ([A-Z_]+)", text)
+        res_match = re.search(r"Recurso: ([^\s\(]+) \(([^\)]+)\)", text)
+        if issue_match and res_match:
+            return {
+                "issue": issue_match.group(1),
+                "resource": res_match.group(1),
+                "namespace": res_match.group(2)
+            }
+    except:
+        pass
+    return None
+
+def _is_anomaly_silenced(a: Anomaly) -> bool:
+    """Checks if this specific anomaly is silenced in Redis."""
+    if not _redis: return False
+    keys = [
+        f"sre:silent:{a.namespace}:{a.resource_name}:{a.issue_type}",
+        f"sre:silent:{a.namespace}:{a.owner_name}:{a.issue_type}" if a.owner_name else None
+    ]
+    for k in keys:
+        if k and _redis.exists(k): return True
+    return False
+
+
 def _is_maintenance_active() -> bool:
     """Returns True if a maintenance window is currently active (Redis key exists)."""
     if _redis:
@@ -1036,12 +1130,9 @@ def _is_maintenance_active() -> bool:
 
 
 def _activate_maintenance(input_str: str = "60") -> str:
-    """Activates maintenance window. Input: duration in minutes (default 60)."""
-    try:
-        minutes = int(input_str.strip() or "60")
-        minutes = max(1, min(minutes, 480))  # clamp 1 min–8 h
-    except ValueError:
-        minutes = 60
+    """Activates maintenance window. Supports durations like '24h', '1h'."""
+    minutes = _parse_duration(input_str)
+    minutes = max(1, min(minutes, 10080))  # clamp 1 min – 7 days
     if _redis:
         _redis.set(_MAINTENANCE_KEY, "1", ex=minutes * 60)
         SRE_MAINTENANCE_ACTIVE.set(1)
@@ -1592,12 +1683,12 @@ def list_k8s_deployments(input_str: str = "") -> str:
 # HERRAMIENTAS — MÉTRICAS
 # ─────────────────────────────────────────────────────────────────────────────
 _PROMETHEUS_ALIASES: dict[str, str] = {
-    "cpu_pods":     'sum(rate(container_cpu_usage_seconds_total{namespace="amael-ia",container!=""}[5m])) by (pod)',
-    "ram_pods":     'sum(container_memory_working_set_bytes{namespace="amael-ia",container!=""}) by (pod)',
+    "cpu_pods":     'sum(rate(container_cpu_usage_seconds_total{namespace=~"amael-ia|vault|kong|observability",container!=""}[5m])) by (pod)',
+    "ram_pods":     'sum(container_memory_working_set_bytes{namespace=~"amael-ia|vault|kong|observability",container!=""}) by (pod) / 1048576',
     "cpu_node":     'sum(rate(node_cpu_seconds_total{mode!="idle"}[5m])) by (instance)',
     "ram_node":     'node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes',
-    "http_errors":  'sum(rate(http_requests_total{namespace="amael-ia",status=~"5.."}[5m])) by (handler)',
-    "restart_rate": 'increase(kube_pod_container_status_restarts_total{namespace="amael-ia"}[15m])',
+    "http_errors":  'sum(rate(http_requests_total{namespace=~"amael-ia|vault|kong|observability",status=~"5.."}[5m])) by (handler)',
+    "restart_rate": 'increase(kube_pod_container_status_restarts_total{namespace=~"amael-ia|vault|kong|observability"}[15m])',
 }
 
 
@@ -1675,7 +1766,7 @@ def notify_whatsapp_sre(input_str: str) -> str:
     try:
         resp = requests.post(
             f"{WHATSAPP_BRIDGE_URL}/send",
-            json={"phone": OWNER_PHONE, "message": f"[SRE] {message}"},
+            json={"phoneNumber": OWNER_PHONE, "text": f"[SRE] {message}"},
             timeout=10,
         )
         if resp.status_code == 200:
@@ -1690,15 +1781,29 @@ def _send_sre_notification(message: str, severity: str = "INFO"):
     if not WHATSAPP_BRIDGE_URL or not OWNER_PHONE:
         logging.info(f"[SRE_NOTIFY] {severity}: {message}")
         return
+        
+    if severity in _SEVERITY_RANK:
+        min_rank = _SEVERITY_RANK.get(MIN_NOTIFY_SEVERITY, 2)  # Default HIGH is 2
+        this_rank = _SEVERITY_RANK[severity]
+        if this_rank < min_rank:
+            logging.info(f"[SRE_NOTIFY] (Skipped via policy) {severity}: {message[:50]}...")
+            return
+
     try:
-        requests.post(
+        # P5: Alert pacing (3s delay) to avoid WhatsApp saturation
+        time.sleep(3)
+        resp = requests.post(
             f"{WHATSAPP_BRIDGE_URL}/send",
-            json={"phone": OWNER_PHONE, "message": f"[SRE {severity}] {message}"},
+            json={"phoneNumber": OWNER_PHONE, "text": f"[SRE {severity}] {message}"},
             timeout=10,
         )
-        SRE_NOTIFY_TOTAL.labels(severity=severity.lower()).inc()
+        if resp.status_code == 200:
+            logging.info(f"[SRE_NOTIFY] Alerta enviada ({severity}): {message[:50]}...")
+            SRE_NOTIFY_TOTAL.labels(severity=severity.lower()).inc()
+        else:
+            logging.warning(f"[SRE_NOTIFY] Error bridge {resp.status_code}: {resp.text}")
     except Exception as e:
-        logging.warning(f"[SRE_NOTIFY] {e}")
+        logging.warning(f"[SRE_NOTIFY] Exception: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1829,8 +1934,8 @@ tools = [
          description="Elimina un pod. Input: 'pod_name' o 'pod_name, namespace'."),
     Tool(name="Prometheus_Query",           func=query_prometheus,
          description=(
-             "PromQL en Prometheus. Aliases: cpu_pods, ram_pods, cpu_node, "
-             "ram_node, http_errors, restart_rate.")),
+             "PromQL en Prometheus. Aliases: cpu_pods, ram_pods (en MB), cpu_node, "
+             "ram_node (%), http_errors, restart_rate.")),
     Tool(name="Listar_Grafana_Dashboards",  func=list_grafana_dashboards,
          description="Lista dashboards de Grafana. Input: vacío."),
     Tool(name="Capturar_Imagen_Grafana",    func=capture_grafana_screenshot,
@@ -1878,7 +1983,10 @@ _SRE_SYSTEM_PROMPT = (
     "2. Vault → Consultar_Vault siempre.\n"
     "3. Runbooks y soluciones → Consultar_Base_Conocimiento.\n"
     "4. Reiniciar → Reiniciar_Deployment (no Eliminar_Pod salvo necesidad).\n"
-    "5. Problema crítico → Notificar_WhatsApp.\n\n"
+    "5. Problema crítico → Notificar_WhatsApp.\n"
+    "6. Al reportar uso de memoria de pods, usa SIEMPRE la unidad *Mb* (el alias ram_pods reporta en MB).\n"
+    "7. Menciona siempre el tipo de recurso (CPU o Memoria).\n"
+    "8. Responde DIRECTAMENTE con los datos técnicos, sin introducciones ni cortesías.\n\n"
     "FORMATO:\n"
     "Thought: | Action: | Action Input: | Observation:\n"
     "Final Answer: [respuesta detallada. Si usaste Capturar_Imagen_Grafana: '[MEDIA_PLACEHOLDER]']\n\n"
@@ -2483,10 +2591,11 @@ def decide_action(anomaly: Anomaly, diagnosis: Optional[Diagnosis] = None) -> Ac
 
     # Nodos, endpoints, y tipos específicos → siempre notificar (sin auto-heal)
     _notify_only_types = {
-        "IMAGE_PULL_ERROR", "HIGH_CPU", "HIGH_ERROR_RATE",
+        "IMAGE_PULL_ERROR", "HIGH_CPU",
         # P5: predictive and SLO anomalies always need human judgment
         "DISK_EXHAUSTION_PREDICTED", "ERROR_RATE_ESCALATING", "SLO_BUDGET_BURNING",
     }
+
     if is_node or anomaly.issue_type in _notify_only_types or anomaly.resource_type in ("endpoint", "namespace", "node"):
         return ActionPlan(
             action="NOTIFY_HUMAN", target_name=anomaly.resource_name,
@@ -2623,6 +2732,10 @@ def _run_loop_iteration():
         logging.info(f"[SRE_LOOP] {len(anomalies)} anomalía(s).")
 
         for anomaly in anomalies:
+            # P5-F: Skip silenced anomalies
+            if _is_anomaly_silenced(anomaly):
+                logging.info(f"[SRE_LOOP] Anomalía silenciada: {anomaly.issue_type} en {anomaly.resource_name}")
+                continue
             if _is_duplicate_incident(anomaly.dedup_key):
                 continue
             _mark_incident(anomaly.dedup_key)
@@ -2748,6 +2861,14 @@ async def startup():
             coalesce=True,
             id="sre_loop",
         )
+        # P5: Reporte diario a las 20:00 (hora local del pod)
+        scheduler.add_job(
+            send_daily_report_whatsapp,
+            trigger="cron",
+            hour=20,
+            minute=0,
+            id="daily_report",
+        )
         scheduler.start()
         app.state.sre_scheduler = scheduler
         # P3-A: expose scheduler for one-shot verification jobs
@@ -2826,6 +2947,32 @@ async def chat_with_agent(request: AgentRequest, req: Request):
     except Exception as e:
         logging.error(f"Agent error: {e}")
         return {"response": f"Error procesando la petición: {str(e)[:150]}"}
+
+
+@app.get("/api/sre/health-stats")
+async def get_health_stats():
+    """
+    Returns structured health stats for the cluster.
+    Used by backend-ia for the daily report status indicator.
+    """
+    snapshot = observe_cluster()
+    total_pods = len(snapshot.pods)
+    problem_pods = []
+    
+    for pod in snapshot.pods:
+        # Define "problem": not Running and not Succeeded
+        if pod.phase not in ("Running", "Succeeded"):
+            problem_pods.append(f"{pod.namespace}/{pod.name} ({pod.phase})")
+        elif pod.restart_count > 10: # Also count pods with too many restarts as problematic
+            problem_pods.append(f"{pod.namespace}/{pod.name} ({pod.restart_count} restarts)")
+
+    return {
+        "status": "ok",
+        "total_pods": total_pods,
+        "failing_count": len(problem_pods),
+        "failing_pods": problem_pods,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
 
 
 @app.get("/api/sre/incidents")
@@ -2956,6 +3103,7 @@ async def sre_command(body: SRECommandRequest):
             "• `status` — estado del loop y circuit breaker\n"
             "• `incidents` — últimos 5 incidentes\n"
             "• `postmortems` — últimos 3 postmortems\n"
+            "• `report` — resumen de las últimas 24h\n"
             "• `slo` — estado de SLOs\n"
             "• `maintenance on <min>` — activar mantenimiento\n"
             "• `maintenance off` — desactivar mantenimiento"
@@ -2999,6 +3147,9 @@ async def sre_command(body: SRECommandRequest):
             )
         return {"reply": "\n".join(lines)}
 
+    if cmd == "report":
+        summary = generate_daily_summary(); send_daily_report_whatsapp(); return {"reply": summary}
+
     if cmd == "slo":
         slo_data = []
         for slo in _SLO_TARGETS:
@@ -3010,19 +3161,83 @@ async def sre_command(body: SRECommandRequest):
             return {"reply": "📭 No hay SLO targets configurados (SLO_TARGETS_JSON vacío)."}
         return {"reply": "📊 *SLO Targets:*\n" + "\n".join(slo_data)}
 
-    if cmd.startswith("maintenance"):
+    if cmd.startswith("maintenance") or cmd.startswith("silent"):
         parts = cmd.split()
-        if len(parts) >= 2 and parts[1] == "off":
+        # Handle "off" or "unsilent" or "resume"
+        if len(parts) >= 2 and parts[1] in ("off", "unsilent", "resume"):
             return {"reply": _deactivate_maintenance()}
-        if len(parts) >= 3 and parts[1] == "on":
-            return {"reply": _activate_maintenance(parts[2])}
-        if len(parts) == 2 and parts[1] == "on":
-            return {"reply": _activate_maintenance("60")}
+            
+        # Handle duration (either 'maintenance on <dur>' or 'silent <dur>')
+        duration_part = "60"
+        if cmd.startswith("maintenance"):
+            if len(parts) >= 3 and parts[1] == "on": duration_part = parts[2]
+            elif len(parts) == 2 and parts[1] == "on": duration_part = "60"
+        else: # silent command
+            if len(parts) >= 2: duration_part = parts[1]
+
+        # Specific silencing if replying to alert
+        if cmd.startswith("silent"):
+            context = _parse_alert_context(body.quoted_text)
+            if context:
+                ns, res, issue = context["namespace"], context["resource"], context["issue"]
+                key = f"sre:silent:{ns}:{res}:{issue}"
+                if _redis:
+                    duration_min = _parse_duration(duration_part)
+                    _redis.set(key, "1", ex=duration_min * 60)
+                    return {"reply": f"🔇 Alerta silenciada: *{issue}* en *{res}* ({ns}) por {duration_min} min."}
+                return {"reply": "❌ Redis no disponible."}
+
+        # General maintenance (if no quoted text or using 'maintenance' explicitly)
+        if cmd.startswith("maintenance") or not body.quoted_text:
+            return {"reply": _activate_maintenance(duration_part)}
+
         active = _is_maintenance_active()
         return {"reply": f"🔧 Mantenimiento: {'activo' if active else 'inactivo'}. "
-                         f"Usa: maintenance on <min> / maintenance off"}
+                         f"Usa: silent <dur> (respondiendo a alerta) o maintenance on <dur>"}
 
     return {"reply": f"❓ Comando desconocido: '{cmd}'. Escribe `ayuda` para ver opciones."}
+
+
+@app.post("/api/sre/deploy-hook")
+async def deploy_hook(body: DeployHookRequest, request: Request):
+    """
+    Phase 1 — Deploy hook desde CI/CD (GitHub Actions).
+    Raphael activa monitoreo intensificado durante 10 minutos tras un despliegue.
+
+    Requiere: Authorization: Bearer <INTERNAL_API_SECRET>
+    """
+    auth = request.headers.get("Authorization", "")
+    if not INTERNAL_API_SECRET or auth != f"Bearer {INTERNAL_API_SECRET}":
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    short_sha = body.commit[:8] if body.commit else "?"
+    logging.info(
+        f"[Raphael] deploy-hook recibido: service={body.service} "
+        f"version={body.version} commit={short_sha} author={body.author}"
+    )
+
+    # Activar monitoreo intensificado: marca en Redis durante 10 minutos
+    if _redis:
+        key = f"sre:deploy_watch:{body.service}"
+        _redis.setex(key, 600, body.version)  # 600s = 10 min
+        logging.info(f"[Raphael] Monitoreo intensificado activado para '{body.service}' (10 min)")
+
+    # Notificar por WhatsApp
+    wa_msg = (
+        f"🚀 *Raphael — Nuevo despliegue detectado*\n"
+        f"• Servicio: `{body.service}:{body.version}`\n"
+        f"• Commit: `{short_sha}` — {body.message[:80]}\n"
+        f"• Autor: {body.author}\n"
+        f"• Monitoreo intensificado: 10 min ✅"
+    )
+    _send_sre_notification(wa_msg, severity="INFO")
+
+    return {
+        "status": "ok",
+        "service": body.service,
+        "version": body.version,
+        "monitoring_window_seconds": 600,
+    }
 
 
 @app.get("/health")

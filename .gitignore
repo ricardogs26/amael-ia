@@ -37,3 +37,4 @@ k8s-agent/.venv/
 .coverage
 k8s-agent/.coverage
 .pytest_cache/
+*.onnx

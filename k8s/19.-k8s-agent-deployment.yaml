@@ -98,10 +98,14 @@ spec:
       serviceAccountName: k8s-agent-sa
       containers:
       - name: k8s-agent
-        image: registry.richardx.dev/k8s-agent:5.0.2
+        image: registry.richardx.dev/k8s-agent:1.6.8
         imagePullPolicy: Always
         ports:
         - containerPort: 8002
+        volumeMounts:
+        - name: agent-code-volume
+          mountPath: /app/main.py
+          subPath: main.py
         envFrom:
         - configMapRef:
             name: k8s-agent-configmap
@@ -156,6 +160,10 @@ spec:
             port: 8002
           initialDelaySeconds: 15
           periodSeconds: 15
+      volumes:
+      - name: agent-code-volume
+        configMap:
+          name: k8s-agent-code
 ---
 apiVersion: v1
 kind: Service
