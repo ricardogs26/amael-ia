@@ -378,10 +378,12 @@ export default function AgentDashboard() {
               {registeredAgents.map(ag => (
                 <div key={ag.name} style={{ background: 'var(--bg-elevated)', borderRadius: 8, padding: '10px 14px' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-                    <div style={{ width: 7, height: 7, borderRadius: '50%', background: '#22c55e' }} />
+                    <div style={{ width: 7, height: 7, borderRadius: '50%', background: '#22c55e', flexShrink: 0 }} />
                     <span style={{ fontWeight: 600, fontSize: 13 }}>{ag.name}</span>
                     <span style={{ fontSize: 11, color: 'var(--text-disabled)' }}>v{ag.version}</span>
-                    <span style={{ ...pill('#6366f1'), marginLeft: 'auto' }}>{ag.role}</span>
+                  </div>
+                  <div style={{ marginBottom: 4 }}>
+                    <span style={{ ...pill('#6366f1'), display: 'inline-block', maxWidth: '100%', whiteSpace: 'normal' as const, lineHeight: 1.4 }}>{ag.role}</span>
                   </div>
                   {ag.capabilities.length > 0 && (
                     <div style={{ display: 'flex', flexWrap: 'wrap' as const, gap: 3, marginTop: 4 }}>
