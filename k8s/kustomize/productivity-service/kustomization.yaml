@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../13.-productivity-configmap.yaml
+  - ../../15.-productivity-deployment.yaml
+  - ../../16.-productivity-service.yaml
+  - ../../26.-productivity-vault-sa.yaml
