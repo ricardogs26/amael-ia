@@ -169,6 +169,11 @@ _PROTECTED_CSV = os.environ.get("SRE_PROTECTED_DEPLOYMENTS",
                                 "postgres-deployment,ollama-deployment,vault-0")
 PROTECTED_DEPLOYMENTS = {d.strip() for d in _PROTECTED_CSV.split(',') if d.strip()}
 
+# Deployments excluidos de detección de anomalías (ej. runners efímeros que
+# restartan por diseño — sus reinicios no deben generar alertas SRE).
+_EXCLUDED_CSV = os.environ.get("SRE_EXCLUDED_DEPLOYMENTS", "github-runner-deployment")
+EXCLUDED_DEPLOYMENTS = {d.strip() for d in _EXCLUDED_CSV.split(",") if d.strip()}
+
 AUTO_HEAL_MIN_SEVERITY   = os.environ.get("SRE_AUTO_HEAL_MIN_SEVERITY",   "HIGH")
 MIN_NOTIFY_SEVERITY      = os.environ.get("SRE_MIN_NOTIFY_SEVERITY",      "HIGH")
 CONFIDENCE_THRESHOLD     = float(os.environ.get("SRE_CONFIDENCE_THRESHOLD",     "0.75"))
@@ -2517,6 +2522,9 @@ def detect_anomalies(snapshot: ClusterSnapshot) -> List[Anomaly]:
     anomalies: List[Anomaly] = []
 
     for pod in snapshot.pods:
+        # Saltar pods cuyo deployment está en la lista de exclusión SRE
+        if pod.owner_name and pod.owner_name in EXCLUDED_DEPLOYMENTS:
+            continue
         kp = f"{pod.namespace}:{pod.name}"
         if pod.waiting_reason == "CrashLoopBackOff":
             anomalies.append(Anomaly("CRASH_LOOP", "CRITICAL", pod.namespace, pod.name,
