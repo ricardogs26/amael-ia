@@ -36,3 +36,15 @@ data:
   # Tiempo en segundos antes de intentar HALF_OPEN (probar si el sistema
   # se recuperó) después de que el circuito se abre.
   SRE_CB_RECOVERY_TIMEOUT_S: "600"
+
+  # ─── Exclusiones de detección ───────────────────────────────────────────────
+  # Deployments excluidos completamente del loop SRE (separados por coma).
+  # Útil para runners efímeros o workloads que restartan por diseño.
+  SRE_EXCLUDED_DEPLOYMENTS: "github-runner-deployment"
+
+  # ─── Filtro de pods Failed por antigüedad ───────────────────────────────────
+  # Pods en estado Failed con más de este tiempo (minutos) se ignoran.
+  # Evita alertas repetidas por pods zombie (ej. GPU no disponible en admission
+  # durante reinicio transitorio del NVIDIA device plugin).
+  # Un pod Failed reciente (<30 min) sí genera alerta HIGH normalmente.
+  SRE_POD_FAILED_MAX_AGE_MINUTES: "30"

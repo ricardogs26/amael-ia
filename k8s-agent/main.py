@@ -179,6 +179,9 @@ MIN_NOTIFY_SEVERITY      = os.environ.get("SRE_MIN_NOTIFY_SEVERITY",      "HIGH"
 CONFIDENCE_THRESHOLD     = float(os.environ.get("SRE_CONFIDENCE_THRESHOLD",     "0.75"))
 MAX_RESTARTS_PER_RESOURCE = int(os.environ.get("SRE_MAX_RESTARTS_PER_RESOURCE", "3"))
 RESTART_WINDOW_MINUTES   = int(os.environ.get("SRE_RESTART_WINDOW_MINUTES",    "15"))
+# Pods en Failed con más de este tiempo (minutos) se ignoran — evita alertas por
+# pods zombie (ej. GPU no disponible en admission durante reinicio de device plugin).
+POD_FAILED_MAX_AGE_MINUTES = int(os.environ.get("SRE_POD_FAILED_MAX_AGE_MINUTES", "30"))
 
 _SEVERITY_RANK = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0}
 
@@ -2543,6 +2546,12 @@ def detect_anomalies(snapshot: ClusterSnapshot) -> List[Anomaly]:
                 f"Pod '{pod.name}' terminado por OOMKilled. Memory limit excedido.",
                 f"{kp}:OOM"))
         elif pod.phase == "Failed":
+            # Ignorar pods Failed muy antiguos (zombies por GPU admission error u otros
+            # fallos transitorios al arrancar). Solo alertar si el pod falló recientemente.
+            if pod.start_time:
+                age_min = (datetime.now(timezone.utc) - pod.start_time).total_seconds() / 60
+                if age_min > POD_FAILED_MAX_AGE_MINUTES:
+                    continue
             anomalies.append(Anomaly("POD_FAILED", "HIGH", pod.namespace, pod.name,
                 "pod", pod.owner_name, pod.owner_kind,
                 f"Pod '{pod.name}' en estado Failed.",
