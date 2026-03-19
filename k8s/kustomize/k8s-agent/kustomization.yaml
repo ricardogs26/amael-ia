@@ -1,9 +1,11 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-
 resources:
-  - ../../18.-k8s-agent-config.yaml
-  - ../../19.-k8s-agent-deployment.yaml
-  - ../../30.-sre-agent-policy-cm.yaml
-  - ../../31.-sre-agent-slo-cm.yaml
-  - ../../knowledge-base-cm.yaml
+- ../../18.-k8s-agent-config.yaml
+- ../../19.-k8s-agent-deployment.yaml
+- ../../30.-sre-agent-policy-cm.yaml
+- ../../31.-sre-agent-slo-cm.yaml
+- ../../knowledge-base-cm.yaml
+images:
+- name: registry.richardx.dev/k8s-agent
+  newTag: 5.0.2
