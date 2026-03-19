@@ -382,8 +382,8 @@ export default function AgentDashboard() {
                     <span style={{ fontWeight: 600, fontSize: 13 }}>{ag.name}</span>
                     <span style={{ fontSize: 11, color: 'var(--text-disabled)' }}>v{ag.version}</span>
                   </div>
-                  <div style={{ marginBottom: 4 }}>
-                    <span style={{ ...pill('#6366f1'), display: 'inline-block', maxWidth: '100%', whiteSpace: 'normal' as const, lineHeight: 1.4 }}>{ag.role}</span>
+                  <div style={{ marginBottom: 4, overflow: 'hidden' }}>
+                    <span style={{ ...pill('#6366f1'), display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' as const, overflow: 'hidden', whiteSpace: 'normal' as const, lineHeight: 1.4 }}>{ag.role}</span>
                   </div>
                   {ag.capabilities.length > 0 && (
                     <div style={{ display: 'flex', flexWrap: 'wrap' as const, gap: 3, marginTop: 4 }}>
