@@ -157,6 +157,78 @@ const AGENT_CATALOG = [
     module: 'agents/sre/agent.py',
     capabilities: ['60s loop', 'Auto-heal', 'Predictive trends', 'SLO tracking', 'LLM postmortems'],
   },
+  {
+    key: 'gabriel',
+    name: 'Gabriel',
+    role: 'Dev Agent',
+    subtitle: 'Desarrollo autónomo en GitHub',
+    color: '#22d3ee',
+    icon: '◐',
+    description: 'Desarrolla features de forma autónoma: analiza el request, genera código, crea ramas, hace commits y abre Pull Requests en GitHub.',
+    type: 'direct' as const,
+    module: 'agents/dev/agent.py',
+    capabilities: ['GitHub PRs', 'Feature branches', 'Code generation', 'Autonomous commits'],
+  },
+  {
+    key: 'camael',
+    name: 'Camael',
+    role: 'DevOps Agent',
+    subtitle: 'CI/CD y operaciones K8s',
+    color: '#f97316',
+    icon: '⬟',
+    description: 'Gestiona pipelines CI/CD, configuraciones de Kubernetes y operaciones de entrega. Coordina despliegues, rollbacks y automatización de infraestructura.',
+    type: 'direct' as const,
+    module: 'agents/devops/agent.py',
+    capabilities: ['CI/CD', 'K8s ops', 'Deployments', 'Rollback'],
+  },
+  {
+    key: 'uriel',
+    name: 'Uriel',
+    role: 'Arch Agent',
+    subtitle: 'Diseño de sistemas y ADRs',
+    color: '#a78bfa',
+    icon: '◫',
+    description: 'Diseña arquitecturas de software, genera ADRs y recomienda patrones de diseño. Evalúa trade-offs técnicos y escalabilidad del sistema.',
+    type: 'direct' as const,
+    module: 'agents/arch/agent.py',
+    capabilities: ['System design', 'ADRs', 'Design patterns', 'Trade-off analysis'],
+  },
+  {
+    key: 'raziel',
+    name: 'Raziel',
+    role: 'CTO Agent',
+    subtitle: 'Estrategia tecnológica',
+    color: '#e11d48',
+    icon: '✧',
+    description: 'Define estrategia tecnológica, roadmap y decisiones ejecutivas de arquitectura. Alinea la visión técnica con los objetivos de negocio.',
+    type: 'direct' as const,
+    module: 'agents/cto/agent.py',
+    capabilities: ['Tech strategy', 'Roadmap', 'Exec decisions', 'Tech investment'],
+  },
+  {
+    key: 'zaphkiel',
+    name: 'Zaphkiel',
+    role: 'Memory Agent',
+    subtitle: 'Memoria episódica por usuario',
+    color: '#0ea5e9',
+    icon: '◌',
+    description: 'Almacena y recupera contexto a largo plazo por usuario: hechos, metas y episodios previos. Enriquece cada request con memoria persistente en PostgreSQL.',
+    type: 'direct' as const,
+    module: 'agents/memory_agent/agent.py',
+    capabilities: ['Long-term memory', 'User facts', 'Goals tracking', 'Context enrichment'],
+  },
+  {
+    key: 'jophiel',
+    name: 'Jophiel',
+    role: 'Coder Agent',
+    subtitle: 'Generación y refactoring de código',
+    color: '#34d399',
+    icon: '◑',
+    description: 'Especializado en generación, refactoring y análisis de código en memoria. Opera sobre el workspace sin necesitar acceso a GitHub — complementa a Gabriel.',
+    type: 'direct' as const,
+    module: 'agents/coder/agent.py',
+    capabilities: ['Code generation', 'Refactoring', 'Code analysis', 'In-memory ops'],
+  },
 ]
 
 // ── Step types del pipeline ──────────────────────────────────────────────────
@@ -307,7 +379,7 @@ export default function AgentDashboard() {
           <h2 style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>Agentes del sistema</h2>
           <p style={{ color: 'var(--text-secondary)', fontSize: 13 }}>
             {registeredAgents.length > 0
-              ? `${registeredAgents.length} agente(s) registrados en el registry — arquitectura LangGraph multi-agente`
+              ? `${registeredAgents.length} agentes en el registry + Amael (orchestrator) — ${AGENT_CATALOG.length} agentes en total`
               : 'Pipeline LangGraph: Sariel → Grouper → Executor → Remiel — con agentes directos por intent'}
           </p>
         </div>
@@ -371,19 +443,22 @@ export default function AgentDashboard() {
         {/* Agentes registrados en el registry (datos live) */}
         {registeredAgents.length > 0 && (
           <div style={{ ...s.card, marginTop: 24 }}>
-            <h3 style={{ fontSize: 14, fontWeight: 600, marginBottom: 14 }}>
-              Registry en vivo — {registeredAgents.length} agente(s) registrados
+            <h3 style={{ fontSize: 14, fontWeight: 600, marginBottom: 4 }}>
+              Registry en vivo — {registeredAgents.length} agentes registrados
             </h3>
+            <p style={{ fontSize: 12, color: 'var(--text-disabled)', marginBottom: 14 }}>
+              Amael (orchestrator) no aparece aquí — gestiona el grafo LangGraph directamente, sin registrarse como agente.
+            </p>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 10 }}>
               {registeredAgents.map(ag => (
                 <div key={ag.name} style={{ background: 'var(--bg-elevated)', borderRadius: 8, padding: '10px 14px' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
                     <div style={{ width: 7, height: 7, borderRadius: '50%', background: '#22c55e', flexShrink: 0 }} />
-                    <span style={{ fontWeight: 600, fontSize: 13 }}>{ag.name}</span>
+                    <span style={{ fontWeight: 600, fontSize: 13, textTransform: 'capitalize' }}>{ag.name}</span>
                     <span style={{ fontSize: 11, color: 'var(--text-disabled)' }}>v{ag.version}</span>
                   </div>
-                  <div style={{ marginBottom: 4 }}>
-                    <span style={{ ...pill('#6366f1'), display: 'inline-block', maxWidth: '100%', whiteSpace: 'normal' as const, lineHeight: 1.4 }}>{ag.role}</span>
+                  <div style={{ marginBottom: 4, overflow: 'hidden' }}>
+                    <span style={{ ...pill('#6366f1'), display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical' as const, overflow: 'hidden', whiteSpace: 'normal' as const, lineHeight: 1.4 }}>{ag.role}</span>
                   </div>
                   {ag.capabilities.length > 0 && (
                     <div style={{ display: 'flex', flexWrap: 'wrap' as const, gap: 3, marginTop: 4 }}>
