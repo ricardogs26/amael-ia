@@ -52,7 +52,10 @@ interface SreIncident {
   severity: 'HIGH' | 'MEDIUM' | 'LOW'
   issue_type: string
   pod_name: string
+  resource_name?: string
   namespace?: string
+  details?: string
+  root_cause?: string
   action?: string
   created_at: string
 }
@@ -521,12 +524,19 @@ export default function AgentDashboard() {
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
               {incidents.map((inc, i) => (
-                <div key={i} style={{ background: 'var(--bg-elevated)', borderRadius: 8, padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' as const }}>
-                  <span style={pill(severityColor(inc.severity))}>{inc.severity}</span>
-                  <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--primary)' }}>{inc.issue_type}</span>
-                  <span style={{ fontSize: 13 }}>{inc.pod_name}</span>
-                  {inc.action && <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>→ {inc.action}</span>}
-                  <span style={{ fontSize: 11, color: 'var(--text-disabled)', marginLeft: 'auto' }}>{fmtTs(inc.created_at)}</span>
+                <div key={i} style={{ background: 'var(--bg-elevated)', borderRadius: 8, padding: '10px 14px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' as const }}>
+                    <span style={pill(severityColor(inc.severity))}>{inc.severity}</span>
+                    <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--primary)' }}>{inc.issue_type}</span>
+                    <span style={{ fontSize: 13 }}>{inc.resource_name ?? inc.pod_name}</span>
+                    {inc.action && <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>→ {inc.action}</span>}
+                    <span style={{ fontSize: 11, color: 'var(--text-disabled)', marginLeft: 'auto' }}>{fmtTs(inc.created_at)}</span>
+                  </div>
+                  {(inc.root_cause || inc.details) && (
+                    <div style={{ fontSize: 12, color: 'var(--text-secondary)', paddingLeft: 4, borderLeft: '2px solid var(--border)' }}>
+                      {inc.root_cause || inc.details}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
