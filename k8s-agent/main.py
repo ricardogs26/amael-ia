@@ -18,8 +18,8 @@ logging.basicConfig(level=logging.INFO)
 from kubernetes import client, config, stream
 import requests
 from langchain_ollama import OllamaLLM
-from langchain.agents import initialize_agent, AgentType, Tool
-from langchain.callbacks.base import BaseCallbackHandler
+from langchain_core.tools import Tool
+from langchain_core.callbacks import BaseCallbackHandler
 from prometheus_fastapi_instrumentator import Instrumentator
 from prometheus_client import Counter, Gauge, Histogram
 from typing import Dict, Any
@@ -2001,18 +2001,7 @@ _SRE_SYSTEM_PROMPT = (
     "Herramientas disponibles:"
 )
 
-agent = initialize_agent(
-    tools, llm,
-    agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-    verbose=True,
-    handle_parsing_errors="Use 'Action:' and 'Action Input:' or 'Final Answer:'.",
-    max_iterations=10,
-    early_stopping_method="generate",
-    agent_kwargs={
-        "prefix": _SRE_SYSTEM_PROMPT,
-        "suffix": "Pregunta: {input}\n{agent_scratchpad}",
-    },
-)
+agent = None  # Legacy classic agent removed — LangGraph is the only path (see below)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # P3-C: LANGGRAPH AGENT (principal)
@@ -2958,12 +2947,7 @@ async def chat_with_agent(request: AgentRequest, req: Request):
             logging.warning(f"[LangGraph] Error en invocación: {e}. Fallback a LangChain clásico.")
             SRE_LANGGRAPH_REQUESTS.labels(result="fallback").inc()
 
-    try:
-        raw_response = agent.run(request.query, callbacks=[metrics_callback])
-        return {"response": extract_final_answer(raw_response)}
-    except Exception as e:
-        logging.error(f"Agent error: {e}")
-        return {"response": f"Error procesando la petición: {str(e)[:150]}"}
+    return {"response": "Agente no disponible: LangGraph falló al inicializar."}
 
 
 @app.get("/api/sre/health-stats")
