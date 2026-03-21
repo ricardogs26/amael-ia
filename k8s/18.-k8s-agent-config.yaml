@@ -41,3 +41,10 @@ data:
 
   # P5 — Predictive alerting
   SRE_MEMORY_LEAK_RATE_BYTES: "1048576"  # 1 MB/s
+
+  # P1-007 — Lease leader election timeouts
+  # leaseDurationSeconds: cuánto tiempo el líder puede ausentarse antes de que
+  # otro pod tome el liderazgo (30s = failover rápido si el líder muere)
+  SRE_LEASE_DURATION_SECONDS: "30"
+  SRE_LEASE_RENEW_DEADLINE_SECONDS: "20"
+  SRE_LEASE_RETRY_PERIOD_SECONDS: "5"

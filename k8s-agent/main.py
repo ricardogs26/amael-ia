@@ -123,6 +123,7 @@ GRAFANA_USER         = os.environ.get("GRAFANA_USER",  "admin")
 GRAFANA_PASSWORD     = os.environ.get("GRAFANA_PASSWORD", "admin")
 INTERNAL_API_SECRET  = os.environ.get("INTERNAL_API_SECRET")
 BACKEND_SRE_URL      = os.environ.get("BACKEND_SRE_URL", "http://backend-service:8000/api/sre/query")
+BACKEND_READY_URL    = os.environ.get("BACKEND_READY_URL", "http://amael-agentic-service:8000/ready")
 WHATSAPP_BRIDGE_URL  = os.environ.get("WHATSAPP_BRIDGE_URL", "http://whatsapp-bridge-service:3000")
 OWNER_PHONE          = os.environ.get("OWNER_PHONE", "")
 
@@ -2451,13 +2452,16 @@ def _maybe_save_runbook_entry(anomaly: Anomaly, diagnosis: Diagnosis):
 # LOOP — OBSERVE / DETECT / DECIDE / ACT (P1 + P2 guardrails)
 # ─────────────────────────────────────────────────────────────────────────────
 
+_OBSERVE_TIMEOUT = 20  # segundos — evita que el SRE loop bloquee indefinidamente
+
+
 def observe_cluster() -> ClusterSnapshot:
     pods:  List[PodStatus]  = []
     nodes: List[NodeStatus] = []
 
     for ns in OBSERVE_NAMESPACES:
         try:
-            k8s_pods = v1.list_namespaced_pod(ns)
+            k8s_pods = v1.list_namespaced_pod(ns, _request_timeout=_OBSERVE_TIMEOUT)
             for pod in k8s_pods.items:
                 phase, rc, wr, lsr = pod.status.phase or "Unknown", 0, "", ""
                 if pod.status.container_statuses:
@@ -2495,7 +2499,7 @@ def observe_cluster() -> ClusterSnapshot:
             logging.warning(f"[OBSERVE] Error en '{ns}': {e}")
 
     try:
-        for node in v1.list_node().items:
+        for node in v1.list_node(_request_timeout=_OBSERVE_TIMEOUT).items:
             conds = {c.type: c.status for c in (node.status.conditions or [])}
             nodes.append(NodeStatus(
                 name=node.metadata.name,
@@ -2698,6 +2702,58 @@ def execute_sre_action(plan: ActionPlan, anomaly: Anomaly,
     return "NO_ACTION"
 
 
+# P6 — Backend health check (Vault sealed, skill/tool failures)
+def observe_backend_health() -> List[Anomaly]:
+    """
+    Consulta /ready del backend y genera anomalías para componentes unhealthy.
+    Detecta especialmente: Vault sealed, Ollama caído, Qdrant caído.
+    """
+    anomalies: List[Anomaly] = []
+    try:
+        resp = requests.get(BACKEND_READY_URL, timeout=8)
+        if resp.status_code != 200:
+            return anomalies
+        data = resp.json()
+        components = data.get("components", {})
+        for name, comp in components.items():
+            if comp.get("healthy"):
+                continue
+            detail = comp.get("detail", "")
+            # Determinar severidad y tipo según el componente
+            if "vault" in name:
+                issue_type = "VAULT_SEALED"
+                severity   = "HIGH"
+                description = (
+                    "Vault está sealed — los tokens OAuth de Google no son accesibles. "
+                    "El servicio de productividad (Calendar/Gmail) falla hasta desellar. "
+                    f"Detalle: {detail or 'sin detalle'}"
+                )
+            elif name in ("postgres", "redis", "qdrant", "ollama"):
+                issue_type = f"{name.upper()}_UNAVAILABLE"
+                severity   = "HIGH"
+                description = f"Componente core '{name}' no disponible. Detalle: {detail or 'sin detalle'}"
+            else:
+                issue_type = "BACKEND_COMPONENT_UNHEALTHY"
+                severity   = "MEDIUM"
+                description = f"Componente '{name}' unhealthy. Detalle: {detail or 'sin detalle'}"
+
+            anomalies.append(Anomaly(
+                issue_type=issue_type,
+                severity=severity,
+                namespace="amael-ia",
+                resource_name=f"amael-agentic-backend:{name}",
+                resource_type="BackendComponent",
+                owner_name="amael-agentic-deployment",
+                owner_kind="Deployment",
+                details=description,
+                dedup_key=f"backend_health:{name}",
+            ))
+            logging.warning(f"[BACKEND_HEALTH] {severity} {issue_type} — {name}: {description[:80]}")
+    except Exception as exc:
+        logging.warning(f"[BACKEND_HEALTH] No se pudo consultar /ready: {exc}")
+    return anomalies
+
+
 def _run_loop_iteration():
     logging.info("[SRE_LOOP] Iniciando iteración.")
 
@@ -2724,8 +2780,11 @@ def _run_loop_iteration():
         # ── OBSERVE SLO (P5-C) ───────────────────────────────────────────────
         slo_anomalies    = observe_slo()
 
+        # ── OBSERVE BACKEND HEALTH (P6) ──────────────────────────────────────
+        backend_anomalies = observe_backend_health()
+
         # ── DETECT ───────────────────────────────────────────────────────────
-        anomalies = detect_anomalies(snapshot) + metric_anomalies + trend_anomalies + slo_anomalies
+        anomalies = detect_anomalies(snapshot) + metric_anomalies + trend_anomalies + slo_anomalies + backend_anomalies
 
         # ── CORRELATE (P4-B) ─────────────────────────────────────────────────
         anomalies = correlate_anomalies(anomalies)
