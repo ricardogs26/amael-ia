@@ -8,4 +8,4 @@ resources:
 - ../../knowledge-base-cm.yaml
 images:
 - name: registry.richardx.dev/k8s-agent
-  newTag: 5.0.5
+  newTag: 5.0.6
