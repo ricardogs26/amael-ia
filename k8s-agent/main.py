@@ -499,30 +499,84 @@ def get_recent_incidents(limit: int = 20) -> list:
 
 
 def generate_daily_summary() -> str:
-    """P5: Genera un resumen de los incidentes y acciones de las últimas 24 horas."""
+    """P5: Genera un resumen de los incidentes y acciones de las últimas 24 horas.
+    Incluye top 5 anomalías con descripción breve del último incidente de cada tipo.
+    """
     pool = get_postgres_pool()
     if not pool:
         return "Resumen no disponible: Sin base de datos."
     conn = pool.getconn()
     try:
         with conn.cursor() as cur:
+            # Totales globales del día
             cur.execute("""
-                SELECT issue_type, action_taken, action_result, count(*)
+                SELECT
+                    COUNT(*)                                          AS total,
+                    COUNT(*) FILTER (WHERE action_taken = 'ROLLOUT_RESTART' AND action_result LIKE '%✅%') AS healed,
+                    COUNT(*) FILTER (WHERE action_taken = 'NOTIFY_HUMAN')  AS notified
                 FROM sre_incidents
-                WHERE created_at > now() - INTERVAL '24 hours'
-                GROUP BY issue_type, action_taken, action_result;
+                WHERE created_at > now() - INTERVAL '24 hours';
             """)
-            rows = cur.fetchall()
-        
-        if not rows:
-            return "✅ *Reporte Diario:* No se detectaron anomalías en las últimas 24 h."
-        
-        summary = ["📊 *Reporte Diario de SRE* (últimas 24h):"]
-        for issue, action, result, count in rows:
-            icon = "✅" if "✅" in (result or "") else "⚠️"
-            summary.append(f"• {count}x {issue} → {action} ({icon})")
-        
-        return "\n".join(summary)
+            totals = cur.fetchone()
+            total, healed, notified = (totals or (0, 0, 0))
+
+            # Top 5 tipos de anomalía con ejemplo del último incidente
+            cur.execute("""
+                SELECT
+                    i.issue_type,
+                    COUNT(*)                         AS cnt,
+                    MAX(i.severity)                  AS max_severity,
+                    (
+                        SELECT details
+                        FROM sre_incidents i2
+                        WHERE i2.issue_type  = i.issue_type
+                          AND i2.created_at  > now() - INTERVAL '24 hours'
+                        ORDER BY i2.created_at DESC
+                        LIMIT 1
+                    )                                AS last_detail,
+                    (
+                        SELECT resource_name
+                        FROM sre_incidents i2
+                        WHERE i2.issue_type  = i.issue_type
+                          AND i2.created_at  > now() - INTERVAL '24 hours'
+                        ORDER BY i2.created_at DESC
+                        LIMIT 1
+                    )                                AS last_resource
+                FROM sre_incidents i
+                WHERE i.created_at > now() - INTERVAL '24 hours'
+                GROUP BY i.issue_type
+                ORDER BY cnt DESC
+                LIMIT 5;
+            """)
+            top5 = cur.fetchall()
+
+        if not top5:
+            return "✅ *[SRE DAILY_REPORT]*\nSin anomalías detectadas en las últimas 24 h."
+
+        _SEV_ICON = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}
+
+        lines = [
+            f"📊 *[SRE DAILY_REPORT]* Reporte Diario (últimas 24h)",
+            f"Total: {total} incidentes  |  Auto-reparados: {healed}  |  Notificados: {notified}",
+            "",
+            "*Top 5 anomalías:*",
+        ]
+        for issue_type, cnt, severity, last_detail, last_resource in top5:
+            icon = _SEV_ICON.get(severity, "⚪")
+            # Descripción breve: primera oración del detalle (hasta 80 chars)
+            desc = ""
+            if last_detail:
+                desc = last_detail.split(".")[0].strip()
+                if len(desc) > 80:
+                    desc = desc[:77] + "..."
+            resource_short = (last_resource or "").split("/")[-1][:30]
+            lines.append(f"{icon} *{issue_type}* ×{cnt}")
+            if desc:
+                lines.append(f"   └ {desc}")
+            if resource_short:
+                lines.append(f"   └ Último: {resource_short}")
+
+        return "\n".join(lines)
     except Exception as e:
         return f"Error generando reporte: {e}"
     finally:
@@ -2926,12 +2980,13 @@ async def startup():
             coalesce=True,
             id="sre_loop",
         )
-        # P5: Reporte diario a las 20:00 (hora local del pod)
+        # P5: Reporte diario a las 20:00 hora México
         scheduler.add_job(
             send_daily_report_whatsapp,
             trigger="cron",
             hour=20,
             minute=0,
+            timezone="America/Mexico_City",
             id="daily_report",
         )
         scheduler.start()
