@@ -1,4 +1,4 @@
-// index.js — v1.5.2
+// index.js — v1.5.3
 // P5-E: Bidirectional /sre command routing to k8s-agent
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const express = require('express');
@@ -34,7 +34,6 @@ const convMap = {};
 
 // ── Comandos rápidos: texto que el usuario escribe → prompt expandido al backend ─
 const QUICK_COMMANDS = {
-    '/estado':   'Dame un reporte completo del estado del cluster kubernetes: pods, namespaces y cualquier alerta activa.',
     '/plan':     'Genera mi plan del día de hoy basado en mi calendario y el estado actual del cluster.',
     '/gastos':   'Muéstrame un resumen de mis gastos recientes guardados en el sistema.',
     '/objetivos':'Muéstrame mis objetivos activos y el progreso de cada uno.',
@@ -43,11 +42,16 @@ const QUICK_COMMANDS = {
 
 const AYUDA_MSG = `*Comandos disponibles:*
 
-/estado — Estado del cluster Kubernetes
 /plan — Plan del día de hoy
 /gastos — Resumen de gastos recientes
 /objetivos — Objetivos activos
-/sre <cmd> — Agente SRE autónomo (status, incidents, slo, maintenance)
+/sre <cmd> — Agente SRE autónomo:
+  • estado — pods en todos los namespaces
+  • grafana — dashboards de Grafana
+  • status — loop y circuit breaker
+  • incidents — últimos incidentes
+  • slo — estado de SLOs
+  • maintenance on/off — ventana de mantenimiento
 /ayuda — Esta lista de comandos
 
 También puedes escribir cualquier pregunta y te respondo normalmente. 🤖`;
@@ -231,6 +235,24 @@ client.on('message', async message => {
     // ── Comando /ayuda (respuesta local, sin llamar al backend) ──────────────────
     if (body === '/ayuda') {
         await message.reply(AYUDA_MSG);
+        return;
+    }
+
+    // ── /estado — rutar al k8s-agent como comando SRE ────────────────────────────
+    if (body === '/estado') {
+        try {
+            const sreRes = await axios.post(`${K8S_AGENT_URL}/api/sre/command`, {
+                command: 'estado',
+                phone:   phoneNumber,
+            }, {
+                headers: { Authorization: `Bearer ${AMAEL_INTERNAL_SECRET}` },
+                timeout: 30000,
+            });
+            await message.reply(sreRes.data.reply || '(sin respuesta)');
+        } catch (err) {
+            console.error(`[ESTADO] Error llamando k8s-agent: ${err.message}`);
+            await message.reply('❌ No se pudo obtener el estado del cluster. Intenta más tarde.');
+        }
         return;
     }
 

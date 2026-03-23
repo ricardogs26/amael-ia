@@ -19,9 +19,9 @@ El backend principal es [`amael-agentic-backend`](../Amael-AgenticIA/) (en `Amae
 | `amael-agentic-backend` | `1.10.24` | 8000 | **Backend principal** — LangGraph multi-agente, SRE autónomo, RAG, audio, visión |
 | `frontend-next` | `1.3.9` | 3000 | Web UI activa (Next.js 14) |
 | `frontend-ia` | `2.0.4` | 8501 | Web UI standby (Streamlit) |
-| `k8s-agent` | `1.6.7` | 8002 | Agente K8s especializado + SRE loop (v1) |
+| `k8s-agent` | `5.0.7` | 8002 | Agente K8s especializado + SRE loop (v1) |
 | `productivity-service` | `1.3.0` | 8001 | Google Calendar / Gmail + Vault OAuth |
-| `whatsapp-bridge` | `1.5.0` | 3000 | WhatsApp Web via Puppeteer (personal) |
+| `whatsapp-bridge` | `1.5.6` | 3000 | WhatsApp Web via Puppeteer (personal) |
 | `whatsapp-personal` | `1.0.1` | 3001 | WhatsApp personal adicional |
 | `llm-adapter` | `1.0.8` | 80 | Proxy OpenAI-compatible → Ollama |
 
@@ -108,14 +108,19 @@ planner → grouper → batch_executor → supervisor
 ### WhatsApp — Comandos disponibles
 | Comando | Descripción |
 |---------|-------------|
-| `/estado` | Estado del sistema |
+| `/sre estado` | Estado de pods en todos los namespaces |
+| `/sre grafana` | Lista de dashboards de Grafana |
+| `/sre status` | Estado del loop SRE y circuit breaker |
+| `/sre incidents` | Últimos incidentes |
+| `/sre postmortems` | Últimos postmortems generados por LLM |
+| `/sre slo` | Estado de SLO targets |
+| `/sre maintenance on <min>` | Activar ventana de mantenimiento |
+| `/sre maintenance off` | Desactivar mantenimiento |
+| `/sre ayuda` | Lista de subcomandos SRE |
 | `/plan` | Day planner |
 | `/gastos` | Resumen de gastos |
 | `/objetivos` | Objetivos activos |
-| `/sre status` | Estado del loop SRE |
-| `/sre incidents` | Últimos incidentes |
-| `/sre maintenance on <min>` | Activar mantenimiento |
-| `/ayuda` | Lista de comandos |
+| `/ayuda` | Lista de todos los comandos |
 
 ---
 

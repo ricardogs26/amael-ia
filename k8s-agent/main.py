@@ -3215,6 +3215,8 @@ async def sre_command(body: SRECommandRequest):
     if not cmd or cmd == "ayuda":
         return {"reply": (
             "📋 *Comandos SRE disponibles:*\n"
+            "• `estado` — estado de pods en todos los namespaces\n"
+            "• `grafana` — listar dashboards de Grafana\n"
             "• `status` — estado del loop y circuit breaker\n"
             "• `incidents` — últimos 5 incidentes\n"
             "• `postmortems` — últimos 3 postmortems\n"
@@ -3309,6 +3311,67 @@ async def sre_command(body: SRECommandRequest):
         active = _is_maintenance_active()
         return {"reply": f"🔧 Mantenimiento: {'activo' if active else 'inactivo'}. "
                          f"Usa: silent <dur> (respondiendo a alerta) o maintenance on <dur>"}
+
+    if cmd == "estado":
+        lines = ["🖥️ *Estado del cluster Kubernetes*"]
+        total_pods, problem_pods = 0, []
+        for ns in OBSERVE_NAMESPACES:
+            try:
+                pods = v1.list_namespaced_pod(ns)
+                ns_lines = []
+                for pod in pods.items:
+                    total_pods += 1
+                    phase = pod.status.phase or "Unknown"
+                    rc, wr = 0, ""
+                    if pod.status.container_statuses:
+                        for cs in pod.status.container_statuses:
+                            rc += cs.restart_count or 0
+                            if cs.state and cs.state.waiting:
+                                wr = cs.state.waiting.reason or ""
+                    status = wr if wr else phase
+                    icon = "✅" if status in ("Running", "Succeeded") else ("⚠️" if status in ("Pending", "Terminating") else "❌")
+                    short = pod.metadata.name
+                    entry = f"  {icon} {short}: {status}" + (f" (↺{rc})" if rc > 0 else "")
+                    ns_lines.append(entry)
+                    if status not in ("Running", "Succeeded", "Terminating"):
+                        problem_pods.append(f"{ns}/{short}")
+                if ns_lines:
+                    lines.append(f"\n*{ns}:*")
+                    lines.extend(ns_lines)
+            except Exception as e:
+                lines.append(f"\n*{ns}:* ❌ Error: {e}")
+        lines.append(f"\n📊 Total pods: {total_pods}")
+        if problem_pods:
+            lines.append(f"🚨 Problemas detectados: {', '.join(problem_pods)}")
+        else:
+            lines.append("✅ Todos los pods saludables")
+        return {"reply": "\n".join(lines)}
+
+    if cmd == "grafana":
+        try:
+            cms = v1.list_namespaced_config_map(
+                namespace="observability", label_selector="grafana_dashboard=1")
+            if not cms.items:
+                return {"reply": "📭 No se encontraron dashboards de Grafana."}
+            lines = ["📊 *Dashboards de Grafana:*"]
+            # Also list known custom dashboards by UID
+            known = [
+                ("amael-llm",         "LLM & HTTP — latencia, tokens, throughput"),
+                ("amael-agent",       "Pipeline de Agente — pasos, herramientas, REPLAN"),
+                ("amael-rag",         "RAG Performance — hit/miss, latencia"),
+                ("amael-infra",       "Infraestructura & GPU — VRAM, CPU, pods"),
+                ("amael-supervisor",  "Supervisor & Calidad — quality scores"),
+                ("amael-security",    "Seguridad & Rate Limiting"),
+                ("amael-service-map", "Service Map — topología OTel"),
+                ("amael-sre-agent",   "SRE Autónomo — loop runs, anomalías, acciones"),
+                ("amael-backend",     "Backend Overview — golden signals completos"),
+            ]
+            for uid, desc in known:
+                lines.append(f"• `{uid}` — {desc}")
+            lines.append("\n🔗 grafana.richardx.dev")
+        except Exception as e:
+            lines = [f"❌ Error listando dashboards: {e}"]
+        return {"reply": "\n".join(lines)}
 
     return {"reply": f"❓ Comando desconocido: '{cmd}'. Escribe `ayuda` para ver opciones."}
 
