@@ -5,4 +5,4 @@ resources:
 - ../../08.-whatsapp-deployment.yaml
 images:
 - name: registry.richardx.dev/whatsapp-bridge
-  newTag: 1.5.5
+  newTag: 1.5.6
