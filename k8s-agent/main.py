@@ -88,6 +88,10 @@ SRE_ROLLBACK_TOTAL          = Counter('amael_sre_rollback_total',             'A
 SRE_POSTMORTEM_TOTAL        = Counter('amael_sre_postmortem_total',           'Auto-generated postmortems')
 SRE_WA_COMMANDS_TOTAL       = Counter('amael_sre_wa_commands_total',          'WhatsApp SRE commands received', ['command'])
 
+# P6 — Agentic actions: resource patching, auto scale-down
+SRE_PATCH_RESOURCES_TOTAL   = Counter('amael_sre_patch_resources_total',      'Memory limit patches applied')
+SRE_SCALE_DOWN_TOTAL        = Counter('amael_sre_scale_down_total',           'Auto scale-down after HIGH_CPU resolved', ['result'])
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MODELOS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1395,6 +1399,110 @@ def _schedule_verification(incident_key: str, deployment_name: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# P#4: AUTO SCALE-DOWN AFTER HIGH_CPU RESOLVES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _run_scale_down_check(deployment_name: str, namespace: str, original_replicas: int):
+    """
+    Runs ~30min after a SCALE_UP to check if CPU normalized.
+    If yes, scales back to original_replicas. If still high, keeps current replicas and notifies.
+    """
+    try:
+        query = (
+            f'sum(rate(container_cpu_usage_seconds_total{{namespace="{namespace}",'
+            f'pod=~"{deployment_name}-.*",container!="",container!="POD"}}[5m]))'
+        )
+        resp = requests.get(
+            f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10
+        )
+        results = resp.json().get("data", {}).get("result", [])
+
+        cpu_still_high = False
+        if results:
+            cpu_val = float(results[0].get("value", [0, "0"])[1])
+            try:
+                deploy = apps_v1.read_namespaced_deployment(deployment_name, namespace)
+                containers = deploy.spec.template.spec.containers
+                replicas = deploy.spec.replicas or 1
+                if containers and containers[0].resources and containers[0].resources.limits:
+                    cpu_limit = containers[0].resources.limits.get("cpu", "")
+                    if cpu_limit:
+                        limit_cores = (
+                            float(cpu_limit[:-1]) / 1000
+                            if cpu_limit.endswith("m")
+                            else float(cpu_limit)
+                        )
+                        total_limit = limit_cores * replicas
+                        if total_limit > 0:
+                            cpu_threshold = float(os.environ.get("SRE_CPU_THRESHOLD", "0.85"))
+                            cpu_still_high = (cpu_val / total_limit) >= cpu_threshold
+            except Exception:
+                pass
+
+        if cpu_still_high:
+            logging.info(
+                f"[SCALE_DOWN] CPU aún elevado en '{deployment_name}' — manteniendo réplicas."
+            )
+            SRE_SCALE_DOWN_TOTAL.labels(result="skipped_high_cpu").inc()
+            _send_sre_notification(
+                f"📊 SCALE_DOWN cancelado: '{deployment_name}' ({namespace}) "
+                f"sigue con CPU elevado 30min después del scale-up. Monitorear.",
+                severity="INFO",
+            )
+        else:
+            deploy = apps_v1.read_namespaced_deployment(deployment_name, namespace)
+            current = deploy.spec.replicas or 1
+            if current > original_replicas:
+                apps_v1.patch_namespaced_deployment_scale(
+                    deployment_name, namespace,
+                    {"spec": {"replicas": original_replicas}},
+                )
+                logging.info(
+                    f"[AUDIT] scale_down deployment={deployment_name!r} ns={namespace!r} "
+                    f"{current}→{original_replicas}"
+                )
+                SRE_SCALE_DOWN_TOTAL.labels(result="ok").inc()
+                SRE_ACTIONS_TAKEN.labels(action="scale_down", result="ok").inc()
+                _send_sre_notification(
+                    f"📉 Auto-scale-down: '{deployment_name}' ({namespace}) — "
+                    f"CPU normalizado, reducido de {current} a {original_replicas} réplicas.",
+                    severity="INFO",
+                )
+            else:
+                SRE_SCALE_DOWN_TOTAL.labels(result="skipped_already_scaled").inc()
+                logging.info(
+                    f"[SCALE_DOWN] '{deployment_name}' ya en {current} réplicas "
+                    f"(original={original_replicas}), sin acción."
+                )
+    except Exception as e:
+        SRE_SCALE_DOWN_TOTAL.labels(result="error").inc()
+        logging.error(f"[SCALE_DOWN] Error en check para '{deployment_name}': {e}")
+
+
+def _schedule_scale_down(deployment_name: str, namespace: str,
+                          original_replicas: int, delay_s: int = 1800):
+    """Schedules a one-shot scale-down check via APScheduler (default 30 min)."""
+    if _sre_scheduler is None:
+        return
+    import datetime as _dt
+    run_at = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=delay_s)
+    try:
+        _sre_scheduler.add_job(
+            _run_scale_down_check,
+            trigger="date",
+            run_date=run_at,
+            args=[deployment_name, namespace, original_replicas],
+            id=f"scaledown:{namespace}:{deployment_name}",
+            replace_existing=True,
+        )
+        logging.info(
+            f"[SCALE_DOWN] Check programado en {delay_s}s para '{deployment_name}'."
+        )
+    except Exception as e:
+        logging.warning(f"[SCALE_DOWN] Error al programar scale-down check: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # P3-B: HISTORICAL CONFIDENCE ADJUSTMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1835,6 +1943,53 @@ def scale_deployment_replicas(deployment_name: str, namespace: str, delta: int =
         return f"✅ Scale-up: '{deployment_name}' escalado de {current} a {desired} réplicas."
     except Exception as e:
         return f"Error al escalar '{deployment_name}': {e}"
+
+
+def patch_deployment_memory_limit(deployment_name: str, namespace: str,
+                                   increase_pct: int = 50) -> str:
+    """
+    Aumenta el memory limit del container principal en increase_pct% (mínimo +256Mi).
+    Usado por el SRE autónomo para responder a OOMKilled sin solo reiniciar.
+    """
+    if deployment_name in PROTECTED_DEPLOYMENTS:
+        return f"Error: '{deployment_name}' está protegido."
+    try:
+        deploy = apps_v1.read_namespaced_deployment(deployment_name, namespace)
+        containers = deploy.spec.template.spec.containers
+        if not containers:
+            return f"Error: '{deployment_name}' no tiene containers."
+        container = containers[0]
+        old_limit_str = "no definido"
+        new_limit_mi  = 512  # default if no limit set
+        if container.resources and container.resources.limits:
+            mem_limit = container.resources.limits.get("memory", "")
+            if mem_limit:
+                old_limit_str = mem_limit
+                m = re.match(r'^(\d+(?:\.\d+)?)(Mi|Gi|Ki|M|G|K)?$', mem_limit, re.IGNORECASE)
+                if m:
+                    val, unit = float(m.group(1)), (m.group(2) or "Mi").upper()
+                    val_mi = (
+                        int(val * 1024) if unit in ("GI", "G")
+                        else int(val / 1024) if unit in ("KI", "K")
+                        else int(val)
+                    )
+                    new_limit_mi = val_mi + max(int(val_mi * increase_pct / 100), 256)
+        new_limit_str = f"{new_limit_mi}Mi"
+        patch = {"spec": {"template": {"spec": {"containers": [{
+            "name": container.name,
+            "resources": {"limits": {"memory": new_limit_str}},
+        }]}}}}
+        apps_v1.patch_namespaced_deployment(deployment_name, namespace, patch)
+        logging.info(
+            f"[AUDIT] patch_memory deployment={deployment_name!r} ns={namespace!r} "
+            f"{old_limit_str}→{new_limit_str}"
+        )
+        return (
+            f"✅ Memory patch: '{deployment_name}' límite aumentado "
+            f"de {old_limit_str} a {new_limit_str}."
+        )
+    except Exception as e:
+        return f"Error al patchear '{deployment_name}': {e}"
 
 
 def delete_k8s_pod(input_str: str) -> str:
@@ -2292,6 +2447,12 @@ def _diagnose_llm_sync(anomaly: Anomaly) -> Optional[Diagnosis]:
     prompt = f"""Eres un SRE experto. Analiza el siguiente incidente de Kubernetes y genera un diagnóstico estructurado.
 Tienes evidencia REAL del pod: logs del container anterior (si crasheó), status del container y events K8s.
 Usa esta evidencia para determinar la causa raíz EXACTA, no suposiciones genéricas.
+Guía de acción recomendada:
+- ROLLOUT_RESTART: para CRASH_LOOP, POD_FAILED, HIGH_RESTARTS con error de dependencia/config
+- SCALE_UP: para HIGH_CPU sostenido sin evidencia de crash
+- PATCH_RESOURCES: SOLO para OOMKilled con root_cause_category=RESOURCE_LIMIT (exit_code=137)
+- FIX_IMAGE: para IMAGE_PULL_ERROR o imagen inválida
+- NOTIFY_HUMAN: para cualquier caso donde no hay acción automática segura
 
 INCIDENTE:
 - Tipo: {anomaly.issue_type}
@@ -2309,7 +2470,7 @@ Responde ÚNICAMENTE con un objeto JSON válido, sin texto adicional antes ni de
   "root_cause_category": "uno de: DB_ERROR, OOM, CONFIG_ERROR, DEPENDENCY, NETWORK, IMAGE_ERROR, RESOURCE_LIMIT, UNKNOWN",
   "confidence": 0.85,
   "severity": "{anomaly.severity}",
-  "recommended_action": "uno de: ROLLOUT_RESTART, NOTIFY_HUMAN, SCALE_UP, FIX_IMAGE",
+  "recommended_action": "uno de: ROLLOUT_RESTART, NOTIFY_HUMAN, SCALE_UP, FIX_IMAGE, PATCH_RESOURCES",
   "evidence_summary": ["hecho clave de los logs/status", "otro hecho clave"]
 }}
 
@@ -2830,6 +2991,13 @@ def decide_action(anomaly: Anomaly, diagnosis: Optional[Diagnosis] = None) -> Ac
                 reason=reason_base, auto_execute=True,
             )
 
+        if llm_action == "PATCH_RESOURCES":
+            return ActionPlan(
+                action="PATCH_RESOURCES", target_name=anomaly.owner_name,
+                target_namespace=anomaly.namespace,
+                reason=reason_base, auto_execute=True,
+            )
+
         # FIX_IMAGE u otros → notificar con el diagnóstico específico del LLM
         return ActionPlan(
             action="NOTIFY_HUMAN", target_name=anomaly.resource_name,
@@ -2903,6 +3071,13 @@ def execute_sre_action(plan: ActionPlan, anomaly: Anomaly,
         return result
 
     if plan.action == "SCALE_UP":
+        # P#4: Capture original replicas before scaling to schedule auto scale-down
+        _original_replicas = 1
+        try:
+            _d = apps_v1.read_namespaced_deployment(plan.target_name, plan.target_namespace)
+            _original_replicas = _d.spec.replicas or 1
+        except Exception:
+            pass
         result = scale_deployment_replicas(plan.target_name, plan.target_namespace)
         ok = "✅" in result
         SRE_ACTIONS_TAKEN.labels(action="scale_up", result="ok" if ok else "error").inc()
@@ -2910,6 +3085,22 @@ def execute_sre_action(plan: ActionPlan, anomaly: Anomaly,
             confidence_str = f" (confianza: {diagnosis.confidence:.0%})" if diagnosis else ""
             _send_sre_notification(
                 f"📈 Auto-escalado: {anomaly.issue_type} en "
+                f"'{plan.target_name}' ({plan.target_namespace}){confidence_str}.\n{result}",
+                severity="INFO",
+            )
+            # P#4: Schedule scale-down check in 30min
+            _schedule_scale_down(plan.target_name, plan.target_namespace, _original_replicas)
+        return result
+
+    if plan.action == "PATCH_RESOURCES":
+        result = patch_deployment_memory_limit(plan.target_name, plan.target_namespace)
+        ok = "✅" in result
+        SRE_ACTIONS_TAKEN.labels(action="patch_resources", result="ok" if ok else "error").inc()
+        if ok:
+            SRE_PATCH_RESOURCES_TOTAL.inc()
+            confidence_str = f" (confianza: {diagnosis.confidence:.0%})" if diagnosis else ""
+            _send_sre_notification(
+                f"🔧 Auto-patch OOM: memory limit aumentado en "
                 f"'{plan.target_name}' ({plan.target_namespace}){confidence_str}.\n{result}",
                 severity="INFO",
             )

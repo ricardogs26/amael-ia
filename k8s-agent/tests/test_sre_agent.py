@@ -48,6 +48,8 @@ from main import (
     observe_slo, observe_trends, observe_metrics,
     rollout_undo_deployment, rollout_restart_deployment,
     search_runbooks, _maybe_save_runbook_entry,
+    patch_deployment_memory_limit,
+    _run_scale_down_check, _schedule_scale_down,
     _SEVERITY_RANK, CONFIDENCE_THRESHOLD,
 )
 
@@ -1838,3 +1840,321 @@ class TestMemoryLeakExclusions:
         assert "ollama-abc-123" not in containers_alerted, "ollama debe estar excluido"
         assert "prometheus-0" not in containers_alerted, "prometheus debe estar excluido"
         assert "whatsapp-bridge-abc" in containers_alerted, "whatsapp-bridge sí debe alertar"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# P#3 — PATCH_RESOURCES: MEMORY LIMIT AUTO-PATCH
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestPatchDeploymentMemoryLimit:
+    """Valida patch_deployment_memory_limit() — Priority #3."""
+
+    def _make_deploy(self, mem_limit: str, name: str = "backend-ia-deployment"):
+        container = MagicMock()
+        container.name = "backend-ia"
+        container.resources = MagicMock()
+        container.resources.limits = {"memory": mem_limit}
+        deploy = MagicMock()
+        deploy.spec.template.spec.containers = [container]
+        return deploy
+
+    def test_increases_memory_limit_mi(self):
+        """512Mi → 768Mi (512 + 50% = 256Mi mínimo → +256Mi → 768Mi)."""
+        from main import patch_deployment_memory_limit
+        deploy = self._make_deploy("512Mi")
+        with patch("main.apps_v1") as mock_apps:
+            mock_apps.read_namespaced_deployment.return_value = deploy
+            result = patch_deployment_memory_limit("backend-ia-deployment", "amael-ia")
+        assert "✅" in result
+        assert "512Mi" in result
+        assert "768Mi" in result
+
+    def test_increases_by_50_pct_minimum_256mi(self):
+        """128Mi → 384Mi: 50% de 128 = 64 < 256 mínimo → +256Mi → 384Mi."""
+        from main import patch_deployment_memory_limit
+        deploy = self._make_deploy("128Mi")
+        with patch("main.apps_v1") as mock_apps:
+            mock_apps.read_namespaced_deployment.return_value = deploy
+            result = patch_deployment_memory_limit("backend-ia-deployment", "amael-ia")
+        assert "384Mi" in result
+
+    def test_parses_gi_limit(self):
+        """1Gi (= 1024Mi) + 50% = +512Mi → 1536Mi."""
+        from main import patch_deployment_memory_limit
+        deploy = self._make_deploy("1Gi")
+        with patch("main.apps_v1") as mock_apps:
+            mock_apps.read_namespaced_deployment.return_value = deploy
+            result = patch_deployment_memory_limit("backend-ia-deployment", "amael-ia")
+        assert "1536Mi" in result
+
+    def test_default_limit_when_none_set(self):
+        """Sin memory limit definido usa 512Mi como base."""
+        from main import patch_deployment_memory_limit
+        container = MagicMock()
+        container.name = "backend-ia"
+        container.resources = MagicMock()
+        container.resources.limits = {}  # no memory key
+        deploy = MagicMock()
+        deploy.spec.template.spec.containers = [container]
+        with patch("main.apps_v1") as mock_apps:
+            mock_apps.read_namespaced_deployment.return_value = deploy
+            result = patch_deployment_memory_limit("backend-ia-deployment", "amael-ia")
+        assert "✅" in result
+        assert "512Mi" in result  # default
+
+    def test_protected_deployment_blocked(self):
+        """Deployments protegidos no pueden ser patcheados."""
+        from main import patch_deployment_memory_limit
+        with patch("main.PROTECTED_DEPLOYMENTS", {"postgres-deployment"}):
+            result = patch_deployment_memory_limit("postgres-deployment", "amael-ia")
+        assert "protegido" in result
+        assert "✅" not in result
+
+    def test_k8s_error_returns_error_string(self):
+        """Si K8s falla, retorna string de error sin propagar excepción."""
+        from main import patch_deployment_memory_limit
+        with patch("main.apps_v1") as mock_apps:
+            mock_apps.read_namespaced_deployment.side_effect = Exception("api down")
+            result = patch_deployment_memory_limit("backend-ia-deployment", "amael-ia")
+        assert "Error" in result
+        assert "✅" not in result
+
+    def test_patches_correct_container_name(self):
+        """El patch enviado a K8s incluye el nombre correcto del container."""
+        from main import patch_deployment_memory_limit
+        deploy = self._make_deploy("256Mi", name="backend-ia-deployment")
+        with patch("main.apps_v1") as mock_apps:
+            mock_apps.read_namespaced_deployment.return_value = deploy
+            patch_deployment_memory_limit("backend-ia-deployment", "amael-ia")
+            call_args = mock_apps.patch_namespaced_deployment.call_args
+        patch_body = call_args[0][2]
+        containers = patch_body["spec"]["template"]["spec"]["containers"]
+        assert containers[0]["name"] == "backend-ia"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# P#3 — decide_action PATCH_RESOURCES
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestDecideActionPatchResources:
+    """Valida que decide_action() honra PATCH_RESOURCES del LLM (Priority #3)."""
+
+    def test_llm_patch_resources_returns_patch_plan(self, crash_loop_anomaly):
+        """LLM recomienda PATCH_RESOURCES para OOMKilled → decide_action lo honra."""
+        oom_diag = Diagnosis(
+            issue_type="OOM_KILLED",
+            root_cause="Container excede memory limit (OOMKilled, exit_code=137)",
+            root_cause_category="RESOURCE_LIMIT",
+            confidence=0.92,
+            severity="HIGH",
+            recommended_action="PATCH_RESOURCES",
+            evidence=["OOMKilled", "exit_code=137"],
+            source="llm",
+        )
+        oom_anomaly = Anomaly(
+            issue_type="OOM_KILLED",
+            severity="HIGH",
+            namespace="amael-ia",
+            resource_name="backend-ia-abc",
+            resource_type="pod",
+            owner_name="backend-ia-deployment",
+            owner_kind="Deployment",
+            details="OOMKilled exit_code=137",
+            dedup_key="amael-ia:backend-ia-abc:OOM",
+        )
+        with patch("main.adjust_confidence_with_history", return_value=oom_diag):
+            plan = decide_action(oom_anomaly, oom_diag)
+        assert plan.action == "PATCH_RESOURCES"
+        assert plan.target_name == "backend-ia-deployment"
+
+    def test_execute_patch_resources_calls_patch_fn(self, oom_anomaly):
+        """execute_sre_action PATCH_RESOURCES llama a patch_deployment_memory_limit."""
+        from main import execute_sre_action
+        plan = ActionPlan(
+            action="PATCH_RESOURCES",
+            target_name="backend-ia-deployment",
+            target_namespace="amael-ia",
+            reason="OOM patch",
+            auto_execute=True,
+        )
+        with patch("main.patch_deployment_memory_limit",
+                   return_value="✅ Memory patch: 'backend-ia-deployment' límite aumentado de 512Mi a 768Mi.") as mock_patch:
+            with patch("main._send_sre_notification"):
+                result = execute_sre_action(plan, oom_anomaly)
+        mock_patch.assert_called_once_with("backend-ia-deployment", "amael-ia")
+        assert "✅" in result
+
+    def test_execute_patch_resources_increments_counter(self, oom_anomaly):
+        """execute_sre_action PATCH_RESOURCES incrementa SRE_PATCH_RESOURCES_TOTAL."""
+        from main import execute_sre_action
+        plan = ActionPlan(
+            action="PATCH_RESOURCES",
+            target_name="backend-ia-deployment",
+            target_namespace="amael-ia",
+            reason="OOM patch",
+            auto_execute=True,
+        )
+        with patch("main.patch_deployment_memory_limit",
+                   return_value="✅ Memory patch: ok"):
+            with patch("main._send_sre_notification"):
+                with patch("main.SRE_PATCH_RESOURCES_TOTAL") as mock_counter:
+                    with patch("main.SRE_ACTIONS_TAKEN") as mock_actions:
+                        execute_sre_action(plan, oom_anomaly)
+        mock_counter.inc.assert_called_once()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# P#4 — AUTO SCALE-DOWN AFTER HIGH_CPU RESOLVES
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestAutoScaleDown:
+    """Valida el ciclo auto scale-down 30min después de SCALE_UP (Priority #4)."""
+
+    def test_scale_down_executes_when_cpu_normalized(self):
+        """CPU ya no supera el threshold → escala de vuelta a réplicas originales."""
+        from main import _run_scale_down_check
+
+        deploy_after = MagicMock()
+        deploy_after.spec.replicas = 3  # actualmente 3 (fue escalado)
+        deploy_after.spec.template.spec.containers = []  # sin info de limits (skip ratio check)
+
+        prom_resp = MagicMock()
+        prom_resp.json.return_value = {
+            "status": "success",
+            "data": {"result": [{"value": ["ts", "0.1"]}]},  # CPU muy bajo
+        }
+
+        with patch("main.requests.get", return_value=prom_resp):
+            with patch("main.apps_v1") as mock_apps:
+                mock_apps.read_namespaced_deployment.return_value = deploy_after
+                with patch("main.SRE_SCALE_DOWN_TOTAL") as mock_total:
+                    with patch("main.SRE_ACTIONS_TAKEN") as mock_actions:
+                        with patch("main._send_sre_notification"):
+                            _run_scale_down_check("backend-ia-deployment", "amael-ia", 1)
+        mock_apps.patch_namespaced_deployment_scale.assert_called_once_with(
+            "backend-ia-deployment", "amael-ia", {"spec": {"replicas": 1}}
+        )
+
+    def test_scale_down_skipped_when_cpu_still_high(self):
+        """CPU sigue sobre el threshold → NO escalar, solo notificar."""
+        from main import _run_scale_down_check
+
+        deploy = MagicMock()
+        deploy.spec.replicas = 3
+        container = MagicMock()
+        container.resources.limits = {"cpu": "1000m"}
+        deploy.spec.template.spec.containers = [container]
+
+        prom_resp = MagicMock()
+        prom_resp.json.return_value = {
+            "status": "success",
+            # cpu_val=3.0 / total_limit=3.0×1.0=3.0 → ratio=1.0 > threshold=0.85
+            "data": {"result": [{"value": ["ts", "3.0"]}]},
+        }
+
+        with patch("main.requests.get", return_value=prom_resp):
+            with patch("main.apps_v1") as mock_apps:
+                mock_apps.read_namespaced_deployment.return_value = deploy
+                with patch("main.SRE_SCALE_DOWN_TOTAL") as mock_total:
+                    with patch("main._send_sre_notification") as mock_notify:
+                        with patch("main.SRE_CPU_THRESHOLD", 0.85):
+                            _run_scale_down_check("backend-ia-deployment", "amael-ia", 1)
+        mock_apps.patch_namespaced_deployment_scale.assert_not_called()
+        mock_notify.assert_called_once()
+        assert "cancelado" in mock_notify.call_args[0][0]
+
+    def test_scale_down_skipped_if_already_at_original(self):
+        """Si el deployment ya está en réplicas originales (alguien lo bajó manualmente) no hace nada."""
+        from main import _run_scale_down_check
+
+        deploy = MagicMock()
+        deploy.spec.replicas = 1  # ya en el original
+        deploy.spec.template.spec.containers = []
+
+        prom_resp = MagicMock()
+        prom_resp.json.return_value = {
+            "status": "success",
+            "data": {"result": [{"value": ["ts", "0.05"]}]},
+        }
+
+        with patch("main.requests.get", return_value=prom_resp):
+            with patch("main.apps_v1") as mock_apps:
+                mock_apps.read_namespaced_deployment.return_value = deploy
+                with patch("main.SRE_SCALE_DOWN_TOTAL"):
+                    _run_scale_down_check("backend-ia-deployment", "amael-ia", 1)
+        mock_apps.patch_namespaced_deployment_scale.assert_not_called()
+
+    def test_schedule_scale_down_adds_apscheduler_job(self):
+        """_schedule_scale_down() registra un job APScheduler con el ID correcto."""
+        from main import _schedule_scale_down
+        mock_scheduler = MagicMock()
+        with patch("main._sre_scheduler", mock_scheduler):
+            _schedule_scale_down("backend-ia-deployment", "amael-ia", 2, delay_s=1800)
+        mock_scheduler.add_job.assert_called_once()
+        call_kwargs = mock_scheduler.add_job.call_args[1]
+        assert call_kwargs["id"] == "scaledown:amael-ia:backend-ia-deployment"
+        assert call_kwargs["replace_existing"] is True
+
+    def test_schedule_scale_down_noop_when_no_scheduler(self):
+        """Si el scheduler no está inicializado, no hay error."""
+        from main import _schedule_scale_down
+        with patch("main._sre_scheduler", None):
+            _schedule_scale_down("backend-ia-deployment", "amael-ia", 2)  # no exception
+
+    def test_execute_scale_up_captures_original_replicas(self):
+        """execute_sre_action SCALE_UP lee las réplicas actuales antes de escalar."""
+        from main import execute_sre_action
+        plan = ActionPlan(
+            action="SCALE_UP",
+            target_name="backend-ia-deployment",
+            target_namespace="amael-ia",
+            reason="HIGH_CPU",
+            auto_execute=True,
+        )
+        anomaly = Anomaly(
+            issue_type="HIGH_CPU", severity="HIGH",
+            namespace="amael-ia", resource_name="backend-ia-deployment",
+            resource_type="deployment", owner_name="backend-ia-deployment",
+            owner_kind="Deployment", details="CPU 90%",
+            dedup_key="amael-ia:backend-ia-deployment:HIGH_CPU",
+        )
+        mock_deploy = MagicMock()
+        mock_deploy.spec.replicas = 2
+
+        with patch("main.apps_v1") as mock_apps:
+            mock_apps.read_namespaced_deployment.return_value = mock_deploy
+            with patch("main.scale_deployment_replicas",
+                       return_value="✅ Scale-up: 'backend-ia-deployment' escalado de 2 a 3 réplicas."):
+                with patch("main._schedule_scale_down") as mock_sched:
+                    with patch("main._send_sre_notification"):
+                        with patch("main.SRE_ACTIONS_TAKEN"):
+                            execute_sre_action(plan, anomaly)
+        # Verify original replicas (2) were passed to _schedule_scale_down
+        mock_sched.assert_called_once_with("backend-ia-deployment", "amael-ia", 2)
+
+    def test_execute_scale_up_no_scale_down_on_failure(self):
+        """Si scale_deployment_replicas falla, NO se agenda scale-down."""
+        from main import execute_sre_action
+        plan = ActionPlan(
+            action="SCALE_UP",
+            target_name="backend-ia-deployment",
+            target_namespace="amael-ia",
+            reason="HIGH_CPU",
+            auto_execute=True,
+        )
+        anomaly = Anomaly(
+            issue_type="HIGH_CPU", severity="HIGH",
+            namespace="amael-ia", resource_name="backend-ia-deployment",
+            resource_type="deployment", owner_name="backend-ia-deployment",
+            owner_kind="Deployment", details="CPU 90%",
+            dedup_key="amael-ia:backend-ia-deployment:HIGH_CPU",
+        )
+        with patch("main.apps_v1") as mock_apps:
+            mock_apps.read_namespaced_deployment.return_value = MagicMock(spec=["spec"])
+            mock_apps.read_namespaced_deployment.return_value.spec.replicas = 1
+            with patch("main.scale_deployment_replicas",
+                       return_value="Error: api error"):
+                with patch("main._schedule_scale_down") as mock_sched:
+                    with patch("main.SRE_ACTIONS_TAKEN"):
+                        execute_sre_action(plan, anomaly)
+        mock_sched.assert_not_called()

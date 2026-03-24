@@ -121,6 +121,8 @@ from main import (
     _was_recently_deployed,
     search_runbooks,
     _maybe_save_runbook_entry,
+    patch_deployment_memory_limit,
+    _run_scale_down_check, _schedule_scale_down,
 )
 
 
