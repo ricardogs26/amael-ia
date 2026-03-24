@@ -157,7 +157,8 @@ SRE_MEMORY_THRESHOLD = float(os.environ.get("SRE_MEMORY_THRESHOLD", "0.85"))
 _MAINTENANCE_KEY     = "sre:maintenance:active"
 
 # P5 — Predictive alerting & SLO
-SRE_MEMORY_LEAK_RATE_BYTES = int(os.environ.get("SRE_MEMORY_LEAK_RATE_BYTES", str(1024 * 1024)))  # 1 MB/s
+SRE_MEMORY_LEAK_RATE_BYTES = int(os.environ.get("SRE_MEMORY_LEAK_RATE_BYTES", str(5 * 1024 * 1024)))  # 5 MB/s
+_MEMORY_LEAK_EXCLUDED = set(os.environ.get("SRE_MEMORY_LEAK_EXCLUDED_CONTAINERS", "ollama,prometheus").split(","))
 _SLO_TARGETS: List[dict] = []  # loaded at startup from SLO_TARGETS_JSON env var
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -216,9 +217,9 @@ def _is_duplicate_incident(key: str) -> bool:
     return False
 
 
-def _mark_incident(key: str):
+def _mark_incident(key: str, ttl: int = _DEDUP_TTL):
     if _redis:
-        _redis.set(f"sre:incident:{key}", "1", ex=_DEDUP_TTL)
+        _redis.set(f"sre:incident:{key}", "1", ex=ttl)
     else:
         _dedup_cache[key] = time.time()
 
@@ -831,9 +832,9 @@ def observe_slo() -> List[Anomaly]:
             continue
 
         err_q = (
-            f'sum(rate(http_requests_total{{namespace="amael-ia",'
-            f'handler=~"{handler}",status=~"5.."}}[{window_h}h]))'
-            f' / sum(rate(http_requests_total{{namespace="amael-ia",'
+            f'sum(rate(amael_http_requests_total{{namespace="amael-ia",'
+            f'handler=~"{handler}",status_code=~"5.."}}[{window_h}h]))'
+            f' / sum(rate(amael_http_requests_total{{namespace="amael-ia",'
             f'handler=~"{handler}"}}[{window_h}h]))'
         )
         try:
@@ -932,6 +933,8 @@ def observe_trends() -> List[Anomaly]:
                 val       = float(r["value"][1])
                 if not pod or not ns:
                     continue
+                if container in _MEMORY_LEAK_EXCLUDED:
+                    continue
                 anomalies.append(Anomaly(
                     issue_type="MEMORY_LEAK_PREDICTED",
                     severity="MEDIUM",
@@ -950,7 +953,7 @@ def observe_trends() -> List[Anomaly]:
 
     # ── Error rate escalation: rising 5xx trend ───────────────────────────────
     err_trend_q = (
-        'deriv(sum(rate(http_requests_total{namespace="amael-ia",status=~"5.."}[5m]))[15m:1m])'
+        'deriv(sum(rate(amael_http_requests_total{namespace="amael-ia",status_code=~"5.."}[5m]))[15m:1m])'
         ' > 0.001'
     )
     try:
@@ -1809,6 +1812,31 @@ def rollout_restart_deployment(input_str: str) -> str:
         return f"Error al reiniciar '{deployment_name}': {e}"
 
 
+def scale_deployment_replicas(deployment_name: str, namespace: str, delta: int = 1,
+                               max_replicas: int = 4) -> str:
+    """
+    Escala un deployment en +delta réplicas (máx max_replicas).
+    Usado por el SRE autónomo para responder a HIGH_CPU en lugar de solo notificar.
+    """
+    if deployment_name in PROTECTED_DEPLOYMENTS:
+        return f"Error: '{deployment_name}' está protegido."
+    try:
+        deploy  = apps_v1.read_namespaced_deployment(deployment_name, namespace)
+        current = deploy.spec.replicas or 1
+        desired = min(current + delta, max_replicas)
+        if desired <= current:
+            return f"'{deployment_name}' ya tiene {current} réplicas (máx {max_replicas})."
+        apps_v1.patch_namespaced_deployment_scale(
+            deployment_name, namespace,
+            {"spec": {"replicas": desired}},
+        )
+        logging.info(f"[AUDIT] scale_up deployment={deployment_name!r} ns={namespace!r} "
+                     f"{current}→{desired}")
+        return f"✅ Scale-up: '{deployment_name}' escalado de {current} a {desired} réplicas."
+    except Exception as e:
+        return f"Error al escalar '{deployment_name}': {e}"
+
+
 def delete_k8s_pod(input_str: str) -> str:
     pod_name, namespace = _parse_two(input_str)
     try:
@@ -2129,56 +2157,141 @@ def _deterministic_diagnosis(anomaly: Anomaly) -> Diagnosis:
     )
 
 
+def _collect_pod_evidence(pod_name: str, namespace: str, issue_type: str) -> list[str]:
+    """
+    Recopila evidencia real del pod: logs, logs del container anterior (crash),
+    container statuses (exit code, restart count, OOMKilled) y events K8s.
+    Retorna lista de strings listos para incluir en el prompt.
+    """
+    parts = []
+    is_crash = issue_type in ("CRASH_LOOP", "HIGH_RESTARTS", "OOM_KILLED", "POD_FAILED")
+
+    # ── Container statuses (exit code, restart count, OOMKilled) ─────────────
+    try:
+        pod = v1.read_namespaced_pod(name=pod_name, namespace=namespace)
+        status_lines = []
+        for cs in (pod.status.container_statuses or []):
+            line = f"container={cs.name} restarts={cs.restart_count}"
+            if cs.last_state and cs.last_state.terminated:
+                t = cs.last_state.terminated
+                line += (f" | último_exit=code={t.exit_code}"
+                         f" reason={t.reason or '?'}"
+                         f" finished={t.finished_at}")
+            if cs.state and cs.state.waiting:
+                line += f" | estado=waiting reason={cs.state.waiting.reason}"
+            status_lines.append(line)
+        if status_lines:
+            parts.append("CONTAINER STATUS:\n" + "\n".join(status_lines))
+    except Exception as e:
+        logging.debug(f"[DIAGNOSIS] container_status error pod={pod_name}: {e}")
+
+    # ── Logs del container anterior (crash loop / OOM) ────────────────────────
+    if is_crash:
+        try:
+            prev_logs = v1.read_namespaced_pod_log(
+                name=pod_name, namespace=namespace,
+                tail_lines=50, previous=True,
+            )
+            if prev_logs:
+                # Filtrar líneas relevantes: ERROR, Exception, Traceback, FATAL, panic
+                relevant = [
+                    ln for ln in prev_logs.splitlines()
+                    if any(kw in ln for kw in
+                           ("ERROR", "Error", "Exception", "Traceback", "FATAL",
+                            "fatal", "panic", "OOM", "Killed", "signal"))
+                ]
+                excerpt = "\n".join(relevant[-30:]) if relevant else prev_logs[-1500:]
+                parts.append(f"LOGS CONTAINER ANTERIOR (crash):\n{excerpt}")
+        except Exception as e:
+            logging.debug(f"[DIAGNOSIS] prev_logs error pod={pod_name}: {e}")
+
+    # ── Logs actuales del container (para no-crash: memory leak, high CPU) ───
+    if not is_crash:
+        try:
+            logs = v1.read_namespaced_pod_log(
+                name=pod_name, namespace=namespace, tail_lines=40,
+            )
+            if logs:
+                relevant = [
+                    ln for ln in logs.splitlines()
+                    if any(kw in ln for kw in
+                           ("ERROR", "Error", "WARN", "Exception", "Traceback",
+                            "FATAL", "timeout", "refused", "OOM"))
+                ]
+                excerpt = "\n".join(relevant[-20:]) if relevant else logs[-1000:]
+                parts.append(f"LOGS RECIENTES:\n{excerpt}")
+        except Exception as e:
+            logging.debug(f"[DIAGNOSIS] logs error pod={pod_name}: {e}")
+
+    # ── Events K8s del pod ────────────────────────────────────────────────────
+    try:
+        evs = v1.list_namespaced_event(
+            namespace,
+            field_selector=f"involvedObject.name={pod_name}",
+        )
+        sorted_evs = sorted(
+            evs.items,
+            key=lambda e: (e.last_timestamp or e.metadata.creation_timestamp),
+            reverse=True,
+        )
+        ev_lines = "\n".join(
+            f"[{ev.type}] {ev.reason}: {ev.message}"
+            for ev in sorted_evs[:6]
+        )
+        if ev_lines:
+            parts.append(f"EVENTS K8S:\n{ev_lines}")
+    except Exception as e:
+        logging.debug(f"[DIAGNOSIS] events error pod={pod_name}: {e}")
+
+    return parts
+
+
+def _find_pods_for_owner(owner_name: str, namespace: str) -> list[str]:
+    """Devuelve los nombres de pods activos que pertenecen a un deployment/owner."""
+    try:
+        pods = v1.list_namespaced_pod(namespace=namespace)
+        matching = [
+            p.metadata.name for p in pods.items
+            if p.metadata.name.startswith(owner_name + "-")
+            and p.status.phase in ("Running", "CrashLoopBackOff", "Error", None)
+        ]
+        return matching[:3]  # máximo 3 pods
+    except Exception:
+        return []
+
+
 def _diagnose_llm_sync(anomaly: Anomaly) -> Optional[Diagnosis]:
     """
-    Diagnóstico asistido por LLM. Recopila evidencia (logs, events, runbook)
-    y pide a qwen2.5:14b un JSON estructurado. Fallback a None en cualquier error.
+    Diagnóstico asistido por LLM. Recopila evidencia real (logs, container status,
+    events K8s, runbook) y pide a qwen2.5:14b un JSON estructurado.
+    Fallback a None en cualquier error.
     """
     evidence_parts = []
 
-    # 1. Pod logs (últimas 30 líneas)
+    # ── 1. Evidencia del pod ──────────────────────────────────────────────────
     if anomaly.resource_type == "pod":
-        try:
-            logs = v1.read_namespaced_pod_log(
-                name=anomaly.resource_name,
-                namespace=anomaly.namespace,
-                tail_lines=30,
+        evidence_parts.extend(
+            _collect_pod_evidence(anomaly.resource_name, anomaly.namespace, anomaly.issue_type)
+        )
+    elif anomaly.resource_type in ("deployment", "daemonset", "statefulset"):
+        # Para recursos de nivel superior: buscar sus pods activos
+        pod_names = _find_pods_for_owner(anomaly.owner_name or anomaly.resource_name,
+                                          anomaly.namespace)
+        if pod_names:
+            evidence_parts.extend(
+                _collect_pod_evidence(pod_names[0], anomaly.namespace, anomaly.issue_type)
             )
-            if logs:
-                evidence_parts.append(f"LOGS (últimas 30 líneas):\n{logs[-1500:]}")
-        except Exception:
-            pass
 
-        # 2. Events del pod
-        try:
-            evs = v1.list_namespaced_event(
-                anomaly.namespace,
-                field_selector=f"involvedObject.name={anomaly.resource_name}",
-            )
-            sorted_evs = sorted(
-                evs.items,
-                key=lambda e: (e.last_timestamp or e.metadata.creation_timestamp),
-                reverse=True,
-            )
-            ev_lines = "\n".join(
-                f"[{ev.type}] {ev.reason}: {ev.message}"
-                for ev in sorted_evs[:5]
-            )
-            if ev_lines:
-                evidence_parts.append(f"EVENTS K8S:\n{ev_lines}")
-        except Exception:
-            pass
-
-    # 3. Runbook local (máximo relevante)
-    runbook = search_runbooks(
-        f"{anomaly.issue_type} {anomaly.details[:100]}"
-    )
+    # ── 2. Runbook relevante de Qdrant ────────────────────────────────────────
+    runbook = search_runbooks(f"{anomaly.issue_type} {anomaly.details[:100]}")
     if runbook:
         evidence_parts.append(f"RUNBOOK RELEVANTE:\n{runbook[:600]}")
 
     evidence_text = "\n\n".join(evidence_parts) or "Sin evidencia adicional disponible."
 
     prompt = f"""Eres un SRE experto. Analiza el siguiente incidente de Kubernetes y genera un diagnóstico estructurado.
+Tienes evidencia REAL del pod: logs del container anterior (si crasheó), status del container y events K8s.
+Usa esta evidencia para determinar la causa raíz EXACTA, no suposiciones genéricas.
 
 INCIDENTE:
 - Tipo: {anomaly.issue_type}
@@ -2186,18 +2299,18 @@ INCIDENTE:
 - Recurso: {anomaly.resource_name} (namespace: {anomaly.namespace})
 - Descripción: {anomaly.details}
 
-EVIDENCIA:
+EVIDENCIA REAL:
 {evidence_text}
 
 Responde ÚNICAMENTE con un objeto JSON válido, sin texto adicional antes ni después:
 {{
   "issue_type": "{anomaly.issue_type}",
-  "root_cause": "descripción concisa de la causa raíz en una oración",
+  "root_cause": "causa raíz ESPECÍFICA basada en la evidencia (no genérica)",
   "root_cause_category": "uno de: DB_ERROR, OOM, CONFIG_ERROR, DEPENDENCY, NETWORK, IMAGE_ERROR, RESOURCE_LIMIT, UNKNOWN",
   "confidence": 0.85,
   "severity": "{anomaly.severity}",
   "recommended_action": "uno de: ROLLOUT_RESTART, NOTIFY_HUMAN, SCALE_UP, FIX_IMAGE",
-  "evidence_summary": ["hecho clave 1", "hecho clave 2"]
+  "evidence_summary": ["hecho clave de los logs/status", "otro hecho clave"]
 }}
 
 JSON:"""
@@ -2358,8 +2471,8 @@ def observe_metrics() -> List[Anomaly]:
 
     # ── HTTP 5xx error rate > 1% ──────────────────────────────────────────────
     err_q = (
-        'sum by (handler) (rate(http_requests_total{namespace="amael-ia",status=~"5.."}[5m]))'
-        ' / sum by (handler) (rate(http_requests_total{namespace="amael-ia"}[5m]))'
+        'sum by (handler) (rate(amael_http_requests_total{namespace="amael-ia",status_code=~"5.."}[5m]))'
+        ' / sum by (handler) (rate(amael_http_requests_total{namespace="amael-ia"}[5m]))'
         ' > 0.01'
     )
     try:
@@ -2633,34 +2746,38 @@ def detect_anomalies(snapshot: ClusterSnapshot) -> List[Anomaly]:
 
 def decide_action(anomaly: Anomaly, diagnosis: Optional[Diagnosis] = None) -> ActionPlan:
     """
-    Política de decisión con guardrails P2 + aprendizaje histórico P3-B:
-    1. Usa diagnosis.confidence si está disponible (LLM o determinístico).
-    2. Ajusta confianza con historial de incidentes (P3-B).
-    3. Chequea restart limit antes de ROLLOUT_RESTART.
-    4. Solo actúa en namespaces autorizados y deployments no protegidos.
+    Política de decisión agentica: el LLM elige la acción cuando tiene evidencia real
+    (source='llm'). Las reglas determinísticas son el fallback de seguridad.
+
+    Guardrails siempre activos (hard constraints):
+    - Namespaces de heal: solo DEFAULT_NAMESPACE
+    - Deployments protegidos: nunca auto-heal
+    - Restart limit: máx MAX_RESTARTS_PER_RESOURCE en RESTART_WINDOW_MINUTES
+    - Tipos estructuralmente no-healables: IMAGE_PULL_ERROR, nodos, endpoints
     """
     diag = diagnosis or _deterministic_diagnosis(anomaly)
-    # P3-B: blend with historical success rate
     diag = adjust_confidence_with_history(diag, anomaly)
 
-    min_rank = _SEVERITY_RANK.get(AUTO_HEAL_MIN_SEVERITY, 2)
-    sev_rank = _SEVERITY_RANK.get(anomaly.severity, 0)
-    in_heal_ns     = anomaly.namespace == DEFAULT_NAMESPACE
-    has_deployment = (anomaly.owner_kind == "Deployment" and
-                      anomaly.owner_name and
-                      anomaly.owner_name not in PROTECTED_DEPLOYMENTS)
-    is_node        = anomaly.resource_type == "node"
-    meets_severity = sev_rank >= min_rank
+    min_rank         = _SEVERITY_RANK.get(AUTO_HEAL_MIN_SEVERITY, 2)
+    sev_rank         = _SEVERITY_RANK.get(anomaly.severity, 0)
+    in_heal_ns       = anomaly.namespace == DEFAULT_NAMESPACE
+    has_deployment   = (anomaly.owner_kind == "Deployment" and
+                        anomaly.owner_name and
+                        anomaly.owner_name not in PROTECTED_DEPLOYMENTS)
+    is_node          = anomaly.resource_type == "node"
+    meets_severity   = sev_rank >= min_rank
     meets_confidence = diag.confidence >= CONFIDENCE_THRESHOLD
 
-    # Nodos, endpoints, y tipos específicos → siempre notificar (sin auto-heal)
-    _notify_only_types = {
-        "IMAGE_PULL_ERROR", "HIGH_CPU",
-        # P5: predictive and SLO anomalies always need human judgment
-        "DISK_EXHAUSTION_PREDICTED", "ERROR_RATE_ESCALATING", "SLO_BUDGET_BURNING",
+    # ── Hard constraints: estos tipos nunca se auto-healean ───────────────────
+    _hard_notify_types = {
+        "IMAGE_PULL_ERROR",           # requiere fix de imagen, restart no ayuda
+        "DISK_EXHAUSTION_PREDICTED",  # requiere limpieza manual
+        "SLO_BUDGET_BURNING",         # requiere análisis humano
+        "VAULT_SEALED", "POSTGRES_UNAVAILABLE", "REDIS_UNAVAILABLE",
+        "QDRANT_UNAVAILABLE", "OLLAMA_UNAVAILABLE", "BACKEND_COMPONENT_UNHEALTHY",
     }
-
-    if is_node or anomaly.issue_type in _notify_only_types or anomaly.resource_type in ("endpoint", "namespace", "node"):
+    if is_node or anomaly.issue_type in _hard_notify_types or \
+            anomaly.resource_type in ("endpoint", "namespace", "node"):
         return ActionPlan(
             action="NOTIFY_HUMAN", target_name=anomaly.resource_name,
             target_namespace=anomaly.namespace,
@@ -2676,35 +2793,79 @@ def decide_action(anomaly: Anomaly, diagnosis: Optional[Diagnosis] = None) -> Ac
             auto_execute=True,
         )
 
-    # Auto-heal si cumple todos los criterios
-    if has_deployment and in_heal_ns and meets_severity and meets_confidence:
-        # P2: Guardrail de restart limit
-        if _check_restart_limit(anomaly.owner_name, anomaly.namespace):
-            SRE_RESTART_LIMIT_HIT.inc()
+    # ── Guardrail: restart limit ──────────────────────────────────────────────
+    def _restart_limit_plan():
+        SRE_RESTART_LIMIT_HIT.inc()
+        return ActionPlan(
+            action="NOTIFY_HUMAN", target_name=anomaly.owner_name,
+            target_namespace=anomaly.namespace,
+            reason=(f"Límite de {MAX_RESTARTS_PER_RESOURCE} reinicios automáticos alcanzado "
+                    f"en {RESTART_WINDOW_MINUTES}min para '{anomaly.owner_name}'. "
+                    "Intervención manual requerida."),
+            auto_execute=True,
+        )
+
+    # ── Ruta agentica: LLM elige la acción cuando tiene evidencia real ────────
+    if (diag.source == "llm" and meets_confidence and meets_severity
+            and has_deployment and in_heal_ns):
+
+        llm_action = diag.recommended_action
+        reason_base = (f"Acción elegida por LLM | causa={diag.root_cause} | "
+                       f"categoría={diag.root_cause_category} | "
+                       f"confianza={diag.confidence:.0%}")
+
+        if llm_action == "ROLLOUT_RESTART":
+            if _check_restart_limit(anomaly.owner_name, anomaly.namespace):
+                return _restart_limit_plan()
             return ActionPlan(
-                action="NOTIFY_HUMAN", target_name=anomaly.owner_name,
+                action="ROLLOUT_RESTART", target_name=anomaly.owner_name,
                 target_namespace=anomaly.namespace,
-                reason=(f"Límite de {MAX_RESTARTS_PER_RESOURCE} reinicios automáticos alcanzado "
-                        f"en {RESTART_WINDOW_MINUTES}min para '{anomaly.owner_name}'. "
-                        "Intervención manual requerida."),
+                reason=reason_base, auto_execute=True,
+            )
+
+        if llm_action == "SCALE_UP":
+            return ActionPlan(
+                action="SCALE_UP", target_name=anomaly.owner_name,
+                target_namespace=anomaly.namespace,
+                reason=reason_base, auto_execute=True,
+            )
+
+        # FIX_IMAGE u otros → notificar con el diagnóstico específico del LLM
+        return ActionPlan(
+            action="NOTIFY_HUMAN", target_name=anomaly.resource_name,
+            target_namespace=anomaly.namespace,
+            reason=f"LLM recomienda {llm_action}: {diag.root_cause}",
+            auto_execute=True,
+        )
+
+    # ── Fallback determinístico: reglas por tipo de anomalía ─────────────────
+    if has_deployment and in_heal_ns and meets_severity and meets_confidence:
+        if _check_restart_limit(anomaly.owner_name, anomaly.namespace):
+            return _restart_limit_plan()
+        # HIGH_CPU sin LLM → escalar en lugar de solo notificar
+        if anomaly.issue_type == "HIGH_CPU":
+            return ActionPlan(
+                action="SCALE_UP", target_name=anomaly.owner_name,
+                target_namespace=anomaly.namespace,
+                reason=(f"HIGH_CPU determinístico: {anomaly.details} | "
+                        f"confianza={diag.confidence:.0%}"),
                 auto_execute=True,
             )
         return ActionPlan(
             action="ROLLOUT_RESTART", target_name=anomaly.owner_name,
             target_namespace=anomaly.namespace,
-            reason=(f"Auto-remediación: {anomaly.issue_type} | "
+            reason=(f"Auto-remediación determinística: {anomaly.issue_type} | "
                     f"causa={diag.root_cause_category} | "
-                    f"confianza={diag.confidence:.0%} | "
-                    f"fuente={diag.source}"),
+                    f"confianza={diag.confidence:.0%}"),
             auto_execute=True,
         )
 
-    # No cumple umbrales → notificar con contexto de diagnóstico
+    # ── No cumple umbrales → notificar con contexto ───────────────────────────
     reason_parts = []
     if not in_heal_ns:
-        reason_parts.append(f"namespace '{anomaly.namespace}' no es heal namespace")
+        reason_parts.append(f"namespace '{anomaly.namespace}' fuera del perimetro de heal")
     if not has_deployment:
-        reason_parts.append(f"sin deployment owner o deployment protegido")
+        reason_parts.append("sin deployment owner o deployment protegido")
     if not meets_severity:
         reason_parts.append(f"severidad {anomaly.severity} < {AUTO_HEAL_MIN_SEVERITY}")
     if not meets_confidence:
@@ -2739,6 +2900,19 @@ def execute_sre_action(plan: ActionPlan, anomaly: Anomaly,
                     incident_key, plan.target_name,
                     plan.target_namespace, anomaly.issue_type,
                 )
+        return result
+
+    if plan.action == "SCALE_UP":
+        result = scale_deployment_replicas(plan.target_name, plan.target_namespace)
+        ok = "✅" in result
+        SRE_ACTIONS_TAKEN.labels(action="scale_up", result="ok" if ok else "error").inc()
+        if ok:
+            confidence_str = f" (confianza: {diagnosis.confidence:.0%})" if diagnosis else ""
+            _send_sre_notification(
+                f"📈 Auto-escalado: {anomaly.issue_type} en "
+                f"'{plan.target_name}' ({plan.target_namespace}){confidence_str}.\n{result}",
+                severity="INFO",
+            )
         return result
 
     if plan.action == "NOTIFY_HUMAN":
@@ -2857,7 +3031,15 @@ def _run_loop_iteration():
                 continue
             if _is_duplicate_incident(anomaly.dedup_key):
                 continue
-            _mark_incident(anomaly.dedup_key)
+            # Infra-external issues are persistent; use longer dedup window to avoid spam
+            _INFRA_ISSUE_TYPES = {
+                "VAULT_SEALED", "POSTGRES_UNAVAILABLE", "REDIS_UNAVAILABLE",
+                "QDRANT_UNAVAILABLE", "OLLAMA_UNAVAILABLE", "BACKEND_COMPONENT_UNHEALTHY",
+            }
+            _mark_incident(
+                anomaly.dedup_key,
+                ttl=3600 if anomaly.issue_type in _INFRA_ISSUE_TYPES else _DEDUP_TTL,
+            )
             SRE_ANOMALIES_DETECTED.labels(
                 severity=anomaly.severity, issue_type=anomaly.issue_type
             ).inc()
@@ -3178,9 +3360,9 @@ async def get_slo_status():
         }
         if error_budget > 0:
             err_q = (
-                f'sum(rate(http_requests_total{{namespace="amael-ia",'
-                f'handler=~"{handler}",status=~"5.."}}[{window_h}h]))'
-                f' / sum(rate(http_requests_total{{namespace="amael-ia",'
+                f'sum(rate(amael_http_requests_total{{namespace="amael-ia",'
+                f'handler=~"{handler}",status_code=~"5.."}}[{window_h}h]))'
+                f' / sum(rate(amael_http_requests_total{{namespace="amael-ia",'
                 f'handler=~"{handler}"}}[{window_h}h]))'
             )
             try:

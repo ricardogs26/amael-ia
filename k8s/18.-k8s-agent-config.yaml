@@ -40,7 +40,8 @@ data:
   SRE_MEMORY_THRESHOLD: "0.85"
 
   # P5 — Predictive alerting
-  SRE_MEMORY_LEAK_RATE_BYTES: "1048576"  # 1 MB/s
+  SRE_MEMORY_LEAK_RATE_BYTES: "5242880"  # 5 MB/s (subido para reducir falsos positivos)
+  SRE_MEMORY_LEAK_EXCLUDED_CONTAINERS: "ollama,prometheus"  # crecimiento esperado de RAM
 
   # P1-007 — Lease leader election timeouts
   # leaseDurationSeconds: cuánto tiempo el líder puede ausentarse antes de que

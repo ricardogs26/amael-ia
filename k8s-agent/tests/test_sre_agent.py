@@ -731,6 +731,112 @@ class TestDecideAction:
             plan = decide_action(anomaly)
         assert plan.action == "NOTIFY_HUMAN"
 
+    def test_llm_scale_up_recommendation_is_honored(self):
+        """LLM que recomienda SCALE_UP para HIGH_CPU debe producir acción SCALE_UP."""
+        anomaly = Anomaly(
+            issue_type="HIGH_CPU", severity="HIGH", namespace="amael-ia",
+            resource_name="backend-abc-xyz", resource_type="pod",
+            owner_name="backend-ia-deployment", owner_kind="Deployment",
+            details="CPU al 92%.", dedup_key="amael-ia:backend-abc-xyz:HIGH_CPU",
+        )
+        diag = Diagnosis(
+            issue_type="HIGH_CPU", root_cause="CPU saturado por pico de tráfico",
+            root_cause_category="RESOURCE_LIMIT", confidence=0.88,
+            severity="HIGH", recommended_action="SCALE_UP", source="llm",
+        )
+        with (
+            patch("main.get_historical_success_rate", return_value=None),
+            patch("main._check_restart_limit", return_value=False),
+        ):
+            plan = decide_action(anomaly, diag)
+        assert plan.action == "SCALE_UP"
+        assert "LLM" in plan.reason
+
+    def test_llm_restart_overrides_deterministic_notify(self):
+        """LLM con alta confianza que recomienda ROLLOUT_RESTART supera regla determinística."""
+        anomaly = Anomaly(
+            issue_type="HIGH_RESTARTS", severity="HIGH", namespace="amael-ia",
+            resource_name="backend-abc-xyz", resource_type="pod",
+            owner_name="backend-ia-deployment", owner_kind="Deployment",
+            details="10 reinicios en 15min.", dedup_key="amael-ia:backend-abc-xyz:HIGH_RESTARTS",
+        )
+        diag = Diagnosis(
+            issue_type="HIGH_RESTARTS",
+            root_cause="OOMKilled: exit code 137, límite de memoria insuficiente",
+            root_cause_category="RESOURCE_LIMIT", confidence=0.92,
+            severity="HIGH", recommended_action="ROLLOUT_RESTART", source="llm",
+        )
+        with (
+            patch("main.get_historical_success_rate", return_value=None),
+            patch("main._check_restart_limit", return_value=False),
+        ):
+            plan = decide_action(anomaly, diag)
+        assert plan.action == "ROLLOUT_RESTART"
+        assert "LLM" in plan.reason
+
+    def test_llm_action_blocked_by_restart_limit(self):
+        """Guardrail de restart limit aplica incluso cuando el LLM recomienda restart."""
+        anomaly = Anomaly(
+            issue_type="CRASH_LOOP", severity="CRITICAL", namespace="amael-ia",
+            resource_name="backend-abc-xyz", resource_type="pod",
+            owner_name="backend-ia-deployment", owner_kind="Deployment",
+            details="Crash loop.", dedup_key="amael-ia:backend-abc-xyz:CRASH_LOOP",
+        )
+        diag = Diagnosis(
+            issue_type="CRASH_LOOP", root_cause="DB connection refused",
+            root_cause_category="DB_ERROR", confidence=0.95,
+            severity="CRITICAL", recommended_action="ROLLOUT_RESTART", source="llm",
+        )
+        with (
+            patch("main.get_historical_success_rate", return_value=None),
+            patch("main._check_restart_limit", return_value=True),  # límite alcanzado
+        ):
+            plan = decide_action(anomaly, diag)
+        assert plan.action == "NOTIFY_HUMAN"
+        assert "Límite" in plan.reason
+
+    def test_deterministic_high_cpu_produces_scale_up(self):
+        """Sin LLM, HIGH_CPU + criterios de heal → SCALE_UP (no solo NOTIFY_HUMAN)."""
+        anomaly = Anomaly(
+            issue_type="HIGH_CPU", severity="HIGH", namespace="amael-ia",
+            resource_name="backend-abc-xyz", resource_type="pod",
+            owner_name="backend-ia-deployment", owner_kind="Deployment",
+            details="CPU al 90%.", dedup_key="amael-ia:backend-abc-xyz:HIGH_CPU",
+        )
+        det_diag = Diagnosis(
+            issue_type="HIGH_CPU", root_cause="CPU alto",
+            root_cause_category="RESOURCE_LIMIT", confidence=0.90,
+            severity="HIGH", recommended_action="NOTIFY_HUMAN", source="deterministic",
+        )
+        with (
+            patch("main.get_historical_success_rate", return_value=None),
+            patch("main._check_restart_limit", return_value=False),
+        ):
+            plan = decide_action(anomaly, det_diag)
+        assert plan.action == "SCALE_UP"
+
+    def test_llm_fix_image_produces_notify_with_specific_cause(self):
+        """LLM que recomienda FIX_IMAGE → NOTIFY_HUMAN con causa específica del LLM."""
+        anomaly = Anomaly(
+            issue_type="CRASH_LOOP", severity="HIGH", namespace="amael-ia",
+            resource_name="svc-abc-xyz", resource_type="pod",
+            owner_name="svc-deployment", owner_kind="Deployment",
+            details="CrashLoopBackOff.", dedup_key="amael-ia:svc-abc-xyz:CRASH_LOOP",
+        )
+        diag = Diagnosis(
+            issue_type="CRASH_LOOP",
+            root_cause="Entrypoint no encontrado: /app/start.sh no existe en la imagen",
+            root_cause_category="IMAGE_ERROR", confidence=0.91,
+            severity="HIGH", recommended_action="FIX_IMAGE", source="llm",
+        )
+        with (
+            patch("main.get_historical_success_rate", return_value=None),
+            patch("main._check_restart_limit", return_value=False),
+        ):
+            plan = decide_action(anomaly, diag)
+        assert plan.action == "NOTIFY_HUMAN"
+        assert "FIX_IMAGE" in plan.reason or "start.sh" in plan.reason
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # P1 — DEDUPLICACIÓN (Redis / fallback en memoria)
@@ -844,9 +950,9 @@ class TestMaintenanceWindow:
         mock_r = MagicMock()
         with patch("main._redis", mock_r):
             from main import _activate_maintenance
-            result = _activate_maintenance("999")
-        # 480 min max = 28800 seconds
-        mock_r.set.assert_called_once_with("sre:maintenance:active", "1", ex=28800)
+            result = _activate_maintenance("99999")
+        # 10080 min max (7 días) = 604800 seconds
+        mock_r.set.assert_called_once_with("sre:maintenance:active", "1", ex=604800)
 
     def test_activate_maintenance_defaults_to_60_minutes(self):
         mock_r = MagicMock()
@@ -923,7 +1029,7 @@ class TestObserveMetrics:
         def side_effect(url, params, timeout):
             resp = MagicMock()
             resp.status_code = 200
-            if "status=~" in params.get("query", "") and "5.." in params.get("query", ""):
+            if "status_code=~" in params.get("query", "") and "5.." in params.get("query", ""):
                 resp.json.return_value = {
                     "status": "success",
                     "data": {"result": [{"metric": {"handler": "/api/chat"}, "value": ["ts", "0.05"]}]},
@@ -1504,3 +1610,231 @@ class TestIntegration:
         response = client.get("/metrics")
         # 404 es esperado en tests (instrumentator mockeado), nunca 500
         assert response.status_code in (200, 404)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DIAGNÓSTICO — Evidencia real (logs, container status, pod owner lookup)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestCollectPodEvidence:
+    """Valida _collect_pod_evidence: lee logs anteriores en crash, filtra ruido,
+    incluye container status y events."""
+
+    def _make_pod(self, exit_code=1, reason="Error", restarts=5, waiting_reason="CrashLoopBackOff"):
+        pod = MagicMock()
+        cs = MagicMock()
+        cs.name = "app"
+        cs.restart_count = restarts
+        cs.last_state.terminated.exit_code = exit_code
+        cs.last_state.terminated.reason = reason
+        cs.last_state.terminated.finished_at = "2026-03-24T03:00:00Z"
+        cs.state.waiting.reason = waiting_reason
+        pod.status.container_statuses = [cs]
+        return pod
+
+    def test_crash_loop_reads_previous_logs(self):
+        """Para CRASH_LOOP debe leer logs del container anterior (previous=True)."""
+        from main import _collect_pod_evidence
+        mock_v1 = MagicMock()
+        mock_v1.read_namespaced_pod.return_value = self._make_pod()
+        mock_v1.read_namespaced_pod_log.return_value = "ERROR: connection refused\nstartup failed"
+        mock_v1.list_namespaced_event.return_value.items = []
+
+        with patch("main.v1", mock_v1):
+            parts = _collect_pod_evidence("myapp-abc-xyz", "amael-ia", "CRASH_LOOP")
+
+        # Debe haber llamado con previous=True
+        calls = mock_v1.read_namespaced_pod_log.call_args_list
+        prev_calls = [c for c in calls if c.kwargs.get("previous") is True]
+        assert len(prev_calls) == 1, "Debe leer logs del container anterior para CRASH_LOOP"
+
+    def test_crash_loop_does_not_read_current_logs(self):
+        """Para CRASH_LOOP NO debe intentar leer logs actuales (container crasheando = vacío)."""
+        from main import _collect_pod_evidence
+        mock_v1 = MagicMock()
+        mock_v1.read_namespaced_pod.return_value = self._make_pod()
+        mock_v1.read_namespaced_pod_log.return_value = "ERROR: oom"
+        mock_v1.list_namespaced_event.return_value.items = []
+
+        with patch("main.v1", mock_v1):
+            _collect_pod_evidence("myapp-abc-xyz", "amael-ia", "CRASH_LOOP")
+
+        calls = mock_v1.read_namespaced_pod_log.call_args_list
+        current_calls = [c for c in calls if c.kwargs.get("previous") is not True]
+        assert len(current_calls) == 0, "No debe leer logs actuales para CRASH_LOOP"
+
+    def test_non_crash_reads_current_logs(self):
+        """Para HIGH_CPU/MEMORY_LEAK debe leer logs actuales, no previos."""
+        from main import _collect_pod_evidence
+        mock_v1 = MagicMock()
+        mock_v1.read_namespaced_pod.return_value = self._make_pod(restarts=0)
+        mock_v1.read_namespaced_pod_log.return_value = "WARN: memory usage high\nERROR: oom"
+        mock_v1.list_namespaced_event.return_value.items = []
+
+        with patch("main.v1", mock_v1):
+            parts = _collect_pod_evidence("myapp-abc-xyz", "amael-ia", "HIGH_MEMORY")
+
+        calls = mock_v1.read_namespaced_pod_log.call_args_list
+        current_calls = [c for c in calls if c.kwargs.get("previous") is not True]
+        assert len(current_calls) == 1
+
+    def test_includes_container_status_in_output(self):
+        """El container status (exit code, restart count) debe aparecer en la evidencia."""
+        from main import _collect_pod_evidence
+        mock_v1 = MagicMock()
+        mock_v1.read_namespaced_pod.return_value = self._make_pod(exit_code=137, reason="OOMKilled", restarts=8)
+        mock_v1.read_namespaced_pod_log.return_value = ""
+        mock_v1.list_namespaced_event.return_value.items = []
+
+        with patch("main.v1", mock_v1):
+            parts = _collect_pod_evidence("myapp-abc-xyz", "amael-ia", "OOM_KILLED")
+
+        status_part = next((p for p in parts if "CONTAINER STATUS" in p), None)
+        assert status_part is not None, "Debe incluir CONTAINER STATUS"
+        assert "137" in status_part or "OOMKilled" in status_part
+
+    def test_filters_noise_from_logs(self):
+        """Solo deben quedar líneas con ERROR/Exception/Traceback/FATAL, no INFO noise."""
+        from main import _collect_pod_evidence
+        mock_v1 = MagicMock()
+        mock_v1.read_namespaced_pod.return_value = self._make_pod()
+        noisy_logs = "\n".join([
+            "INFO: server started",
+            "DEBUG: processing request",
+            "ERROR: connection refused to postgres",
+            "INFO: health check ok",
+            "Traceback (most recent call last):",
+            "Exception: db timeout",
+        ])
+        mock_v1.read_namespaced_pod_log.return_value = noisy_logs
+        mock_v1.list_namespaced_event.return_value.items = []
+
+        with patch("main.v1", mock_v1):
+            parts = _collect_pod_evidence("myapp-abc-xyz", "amael-ia", "CRASH_LOOP")
+
+        log_part = next((p for p in parts if "LOGS" in p), "")
+        assert "ERROR: connection refused" in log_part
+        assert "Traceback" in log_part
+        assert "Exception: db timeout" in log_part
+        assert "INFO: server started" not in log_part
+        assert "DEBUG: processing request" not in log_part
+
+    def test_includes_k8s_events(self):
+        """Los events K8s del pod deben aparecer en la evidencia."""
+        from main import _collect_pod_evidence
+        mock_v1 = MagicMock()
+        mock_v1.read_namespaced_pod.return_value = self._make_pod()
+        mock_v1.read_namespaced_pod_log.return_value = ""
+
+        ev = MagicMock()
+        ev.type = "Warning"
+        ev.reason = "BackOff"
+        ev.message = "Back-off restarting failed container"
+        ev.last_timestamp = "2026-03-24T03:00:00Z"
+        ev.metadata.creation_timestamp = "2026-03-24T03:00:00Z"
+        mock_v1.list_namespaced_event.return_value.items = [ev]
+
+        with patch("main.v1", mock_v1):
+            parts = _collect_pod_evidence("myapp-abc-xyz", "amael-ia", "CRASH_LOOP")
+
+        events_part = next((p for p in parts if "EVENTS" in p), None)
+        assert events_part is not None
+        assert "BackOff" in events_part
+
+    def test_gracefully_handles_missing_pod(self):
+        """Si el pod no existe (404), debe retornar lista vacía sin lanzar excepción."""
+        from main import _collect_pod_evidence
+        mock_v1 = MagicMock()
+        mock_v1.read_namespaced_pod.side_effect = Exception("404 Not Found")
+        mock_v1.read_namespaced_pod_log.side_effect = Exception("404 Not Found")
+        mock_v1.list_namespaced_event.side_effect = Exception("503 unavailable")
+
+        with patch("main.v1", mock_v1):
+            parts = _collect_pod_evidence("ghost-pod", "amael-ia", "CRASH_LOOP")
+
+        assert isinstance(parts, list)  # nunca lanza excepción
+
+
+class TestFindPodsForOwner:
+    """Valida _find_pods_for_owner: búsqueda de pods por nombre de deployment."""
+
+    def test_returns_pods_matching_owner_prefix(self):
+        from main import _find_pods_for_owner
+        mock_v1 = MagicMock()
+        pod1 = MagicMock(); pod1.metadata.name = "backend-ia-abc-111"; pod1.status.phase = "Running"
+        pod2 = MagicMock(); pod2.metadata.name = "backend-ia-abc-222"; pod2.status.phase = "Running"
+        pod3 = MagicMock(); pod3.metadata.name = "frontend-xyz-333";   pod3.status.phase = "Running"
+        mock_v1.list_namespaced_pod.return_value.items = [pod1, pod2, pod3]
+
+        with patch("main.v1", mock_v1):
+            result = _find_pods_for_owner("backend-ia", "amael-ia")
+
+        assert "backend-ia-abc-111" in result
+        assert "backend-ia-abc-222" in result
+        assert "frontend-xyz-333" not in result
+
+    def test_limits_to_three_pods(self):
+        from main import _find_pods_for_owner
+        mock_v1 = MagicMock()
+        pods = []
+        for i in range(10):
+            p = MagicMock()
+            p.metadata.name = f"myapp-rs-{i:03d}"
+            p.status.phase = "Running"
+            pods.append(p)
+        mock_v1.list_namespaced_pod.return_value.items = pods
+
+        with patch("main.v1", mock_v1):
+            result = _find_pods_for_owner("myapp", "amael-ia")
+
+        assert len(result) <= 3
+
+    def test_returns_empty_on_k8s_error(self):
+        from main import _find_pods_for_owner
+        mock_v1 = MagicMock()
+        mock_v1.list_namespaced_pod.side_effect = Exception("API server unavailable")
+
+        with patch("main.v1", mock_v1):
+            result = _find_pods_for_owner("myapp", "amael-ia")
+
+        assert result == []
+
+
+class TestMemoryLeakExclusions:
+    """Valida que contenedores excluidos no generen alertas de memory leak."""
+
+    def test_excluded_container_skipped(self):
+        """ollama y prometheus no deben generar MEMORY_LEAK_PREDICTED."""
+        from main import observe_trends
+
+        def side_effect(url, params, timeout):
+            resp = MagicMock()
+            resp.status_code = 200
+            query = params.get("query", "")
+            if "deriv" in query and "container_memory" in query:
+                # Simula que ollama y prometheus disparan el threshold
+                resp.json.return_value = {
+                    "status": "success",
+                    "data": {"result": [
+                        {"metric": {"pod": "ollama-abc-123", "container": "ollama",
+                                    "namespace": "amael-ia"}, "value": ["ts", "9000000"]},
+                        {"metric": {"pod": "prometheus-0", "container": "prometheus",
+                                    "namespace": "observability"}, "value": ["ts", "6000000"]},
+                        {"metric": {"pod": "whatsapp-bridge-abc", "container": "whatsapp-bridge",
+                                    "namespace": "amael-ia"}, "value": ["ts", "15000000"]},
+                    ]},
+                }
+            else:
+                resp.json.return_value = {"status": "success", "data": {"result": []}}
+            return resp
+
+        with patch("main.requests.get", side_effect=side_effect):
+            with patch("main._MEMORY_LEAK_EXCLUDED", {"ollama", "prometheus"}):
+                anomalies = observe_trends()
+
+        leak_anomalies = [a for a in anomalies if a.issue_type == "MEMORY_LEAK_PREDICTED"]
+        containers_alerted = {a.resource_name for a in leak_anomalies}
+
+        assert "ollama-abc-123" not in containers_alerted, "ollama debe estar excluido"
+        assert "prometheus-0" not in containers_alerted, "prometheus debe estar excluido"
+        assert "whatsapp-bridge-abc" in containers_alerted, "whatsapp-bridge sí debe alertar"

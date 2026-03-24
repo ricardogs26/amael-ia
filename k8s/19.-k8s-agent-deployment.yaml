@@ -79,6 +79,62 @@ roleRef:
   name: sre-agent-healer
   apiGroup: rbac.authorization.k8s.io
 ---
+# ─── RBAC: Healer en observability ───────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sre-agent-healer
+  namespace: observability
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments", "daemonsets"]
+  verbs: ["patch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sre-agent-healer-binding
+  namespace: observability
+subjects:
+- kind: ServiceAccount
+  name: k8s-agent-sa
+  namespace: amael-ia
+roleRef:
+  kind: Role
+  name: sre-agent-healer
+  apiGroup: rbac.authorization.k8s.io
+---
+# ─── RBAC: Healer en kong ─────────────────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sre-agent-healer
+  namespace: kong
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["patch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sre-agent-healer-binding
+  namespace: kong
+subjects:
+- kind: ServiceAccount
+  name: k8s-agent-sa
+  namespace: amael-ia
+roleRef:
+  kind: Role
+  name: sre-agent-healer
+  apiGroup: rbac.authorization.k8s.io
+---
 # ─── Deployment ───────────────────────────────────────────────────────────────
 apiVersion: apps/v1
 kind: Deployment
@@ -98,7 +154,7 @@ spec:
       serviceAccountName: k8s-agent-sa
       containers:
       - name: k8s-agent
-        image: registry.richardx.dev/k8s-agent:5.0.7
+        image: registry.richardx.dev/k8s-agent:5.0.8
         imagePullPolicy: Always
         ports:
         - containerPort: 8002

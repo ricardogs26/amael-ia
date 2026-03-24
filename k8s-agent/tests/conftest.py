@@ -33,6 +33,8 @@ def _stub_heavy_modules():
         "langchain", "langchain.agents", "langchain.callbacks",
         "langchain.callbacks.base", "langchain_ollama",
         "langchain_core", "langchain_core.messages",
+        "langchain_core.tools", "langchain_core.callbacks",
+        "langchain_core.callbacks.base",
         "langgraph", "langgraph.prebuilt",
     ]:
         sys.modules.setdefault(mod, MagicMock())
