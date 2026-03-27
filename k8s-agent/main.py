@@ -88,9 +88,10 @@ SRE_ROLLBACK_TOTAL          = Counter('amael_sre_rollback_total',             'A
 SRE_POSTMORTEM_TOTAL        = Counter('amael_sre_postmortem_total',           'Auto-generated postmortems')
 SRE_WA_COMMANDS_TOTAL       = Counter('amael_sre_wa_commands_total',          'WhatsApp SRE commands received', ['command'])
 
-# P6 — Agentic actions: resource patching, auto scale-down
+# P6 — Agentic actions: resource patching, auto scale-down, vault unseal
 SRE_PATCH_RESOURCES_TOTAL   = Counter('amael_sre_patch_resources_total',      'Memory limit patches applied')
 SRE_SCALE_DOWN_TOTAL        = Counter('amael_sre_scale_down_total',           'Auto scale-down after HIGH_CPU resolved', ['result'])
+SRE_VAULT_UNSEAL_TOTAL      = Counter('amael_sre_vault_unseal_total',         'Vault auto-unseal attempts', ['result'])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODELOS
@@ -2934,9 +2935,20 @@ def decide_action(anomaly: Anomaly, diagnosis: Optional[Diagnosis] = None) -> Ac
         "IMAGE_PULL_ERROR",           # requiere fix de imagen, restart no ayuda
         "DISK_EXHAUSTION_PREDICTED",  # requiere limpieza manual
         "SLO_BUDGET_BURNING",         # requiere análisis humano
-        "VAULT_SEALED", "POSTGRES_UNAVAILABLE", "REDIS_UNAVAILABLE",
+        "POSTGRES_UNAVAILABLE", "REDIS_UNAVAILABLE",
         "QDRANT_UNAVAILABLE", "OLLAMA_UNAVAILABLE", "BACKEND_COMPONENT_UNHEALTHY",
+        # VAULT_SEALED: auto-healeable via _auto_unseal_vault() — no está aquí
     }
+
+    # ── VAULT_SEALED: auto-unseal via API HTTP + Secret K8s ──────────────────
+    if anomaly.issue_type == "VAULT_SEALED":
+        return ActionPlan(
+            action="VAULT_UNSEAL",
+            target_name="vault-0",
+            target_namespace="vault",
+            reason="Vault sellado detectado — auto-unseal con llaves Shamir del Secret K8s.",
+            auto_execute=True,
+        )
     if is_node or anomaly.issue_type in _hard_notify_types or \
             anomaly.resource_type in ("endpoint", "namespace", "node"):
         return ActionPlan(
@@ -3070,6 +3082,23 @@ def execute_sre_action(plan: ActionPlan, anomaly: Anomaly,
                 )
         return result
 
+    if plan.action == "VAULT_UNSEAL":
+        result = _auto_unseal_vault()
+        ok = "✅" in result
+        SRE_ACTIONS_TAKEN.labels(action="vault_unseal", result="ok" if ok else "error").inc()
+        SRE_VAULT_UNSEAL_TOTAL.labels(result="ok" if ok else "error").inc()
+        if ok:
+            _send_sre_notification(
+                f"🔓 Vault auto-deselado por el agente SRE.\n{result}",
+                severity="INFO",
+            )
+        else:
+            _send_sre_notification(
+                f"⚠️ VAULT_SEALED: auto-unseal falló — intervención manual requerida.\n{result}",
+                severity="HIGH",
+            )
+        return result
+
     if plan.action == "SCALE_UP":
         # P#4: Capture original replicas before scaling to schedule auto scale-down
         _original_replicas = 1
@@ -3122,6 +3151,45 @@ def execute_sre_action(plan: ActionPlan, anomaly: Anomaly,
 
 
 # P6 — Backend health check (Vault sealed, skill/tool failures)
+def _auto_unseal_vault() -> str:
+    """
+    Lee las llaves Shamir del Secret 'vault-unseal-keys' (namespace vault)
+    y llama al API HTTP de Vault para desellar automáticamente.
+    Requiere RBAC: Role sre-agent-vault-unseal con get sobre secrets/vault-unseal-keys.
+    """
+    vault_url = os.environ.get("VAULT_ADDR", "http://vault.vault.svc.cluster.local:8200")
+    try:
+        # Leer las 3 llaves desde el K8s Secret
+        secret = v1.read_namespaced_secret("vault-unseal-keys", "vault")
+        import base64 as _b64
+        keys = []
+        for k in ("key1", "key2", "key3"):
+            raw = secret.data.get(k, "")
+            keys.append(_b64.b64decode(raw).decode() if raw else "")
+        if not all(keys):
+            return "Error: vault-unseal-keys secret incompleto (faltan key1/key2/key3)."
+
+        # Aplicar las 3 llaves vía API HTTP
+        for i, key in enumerate(keys, 1):
+            resp = requests.put(
+                f"{vault_url}/v1/sys/unseal",
+                json={"key": key},
+                timeout=10,
+            )
+            if resp.status_code not in (200, 204):
+                return f"Error al aplicar key{i}: HTTP {resp.status_code} — {resp.text[:100]}"
+            data = resp.json()
+            if not data.get("sealed", True) is False and i < 3:
+                continue  # aún sellado, continuar
+            if not data.get("sealed", True):
+                logging.info(f"[AUDIT] vault_auto_unseal — completado con {i} llaves")
+                return f"✅ Vault deselado automáticamente con {i} llaves."
+
+        return "✅ Vault deselado automáticamente."
+    except Exception as e:
+        return f"Error en auto-unseal: {e}"
+
+
 def observe_backend_health() -> List[Anomaly]:
     """
     Consulta /ready del backend y genera anomalías para componentes unhealthy.

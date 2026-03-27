@@ -135,6 +135,36 @@ roleRef:
   name: sre-agent-healer
   apiGroup: rbac.authorization.k8s.io
 ---
+# ─── RBAC: Unseal reader en vault ─────────────────────────────────────────────
+# Permite al agente leer vault-unseal-keys para auto-unseal Vault
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sre-agent-vault-unseal
+  namespace: vault
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["vault-unseal-keys"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: sre-agent-vault-unseal-binding
+  namespace: vault
+subjects:
+- kind: ServiceAccount
+  name: k8s-agent-sa
+  namespace: amael-ia
+roleRef:
+  kind: Role
+  name: sre-agent-vault-unseal
+  apiGroup: rbac.authorization.k8s.io
+---
 # ─── Deployment ───────────────────────────────────────────────────────────────
 apiVersion: apps/v1
 kind: Deployment

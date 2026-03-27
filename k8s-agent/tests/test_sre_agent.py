@@ -50,6 +50,7 @@ from main import (
     search_runbooks, _maybe_save_runbook_entry,
     patch_deployment_memory_limit,
     _run_scale_down_check, _schedule_scale_down,
+    _auto_unseal_vault,
     _SEVERITY_RANK, CONFIDENCE_THRESHOLD,
 )
 
@@ -2158,3 +2159,141 @@ class TestAutoScaleDown:
                     with patch("main.SRE_ACTIONS_TAKEN"):
                         execute_sre_action(plan, anomaly)
         mock_sched.assert_not_called()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# VAULT AUTO-UNSEAL
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestVaultAutoUnseal:
+    """Valida _auto_unseal_vault() y el pipeline decide→execute para VAULT_SEALED."""
+
+    def _vault_secret(self, keys=("KEY1", "KEY2", "KEY3")):
+        import base64
+        secret = MagicMock()
+        secret.data = {
+            "key1": base64.b64encode(keys[0].encode()).decode(),
+            "key2": base64.b64encode(keys[1].encode()).decode(),
+            "key3": base64.b64encode(keys[2].encode()).decode(),
+        }
+        return secret
+
+    def _unseal_resp(self, sealed_after=False):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"sealed": sealed_after, "progress": 1}
+        return resp
+
+    def test_unseals_successfully(self):
+        """Con las 3 llaves y Vault respondiendo correctamente devuelve ✅."""
+        with patch("main.v1") as mock_v1:
+            mock_v1.read_namespaced_secret.return_value = self._vault_secret()
+            with patch("main.requests.put", return_value=self._unseal_resp(sealed_after=False)):
+                result = _auto_unseal_vault()
+        assert "✅" in result
+        assert "deselado" in result
+
+    def test_missing_key_returns_error(self):
+        """Si falta una llave en el secret, retorna error sin llamar a Vault."""
+        import base64
+        secret = MagicMock()
+        secret.data = {
+            "key1": base64.b64encode(b"KEY1").decode(),
+            "key2": "",  # vacío
+            "key3": base64.b64encode(b"KEY3").decode(),
+        }
+        with patch("main.v1") as mock_v1:
+            mock_v1.read_namespaced_secret.return_value = secret
+            with patch("main.requests.put") as mock_put:
+                result = _auto_unseal_vault()
+        assert "Error" in result
+        mock_put.assert_not_called()
+
+    def test_vault_api_http_error(self):
+        """Si Vault responde 500, devuelve error."""
+        resp = MagicMock()
+        resp.status_code = 500
+        resp.text = "internal error"
+        with patch("main.v1") as mock_v1:
+            mock_v1.read_namespaced_secret.return_value = self._vault_secret()
+            with patch("main.requests.put", return_value=resp):
+                result = _auto_unseal_vault()
+        assert "Error" in result
+
+    def test_k8s_secret_read_fails_gracefully(self):
+        """Si no puede leer el secret (RBAC), retorna error sin propagar excepción."""
+        with patch("main.v1") as mock_v1:
+            mock_v1.read_namespaced_secret.side_effect = Exception("forbidden")
+            result = _auto_unseal_vault()
+        assert "Error" in result
+        assert "✅" not in result
+
+    def test_decide_action_vault_sealed_returns_vault_unseal(self):
+        """decide_action para VAULT_SEALED devuelve ActionPlan VAULT_UNSEAL."""
+        vault_anomaly = Anomaly(
+            issue_type="VAULT_SEALED",
+            severity="HIGH",
+            namespace="amael-ia",
+            resource_name="amael-agentic-backend:skill.vault",
+            resource_type="BackendComponent",
+            owner_name="amael-agentic-deployment",
+            owner_kind="Deployment",
+            details="Vault está sealed",
+            dedup_key="backend_health:skill.vault",
+        )
+        plan = decide_action(vault_anomaly)
+        assert plan.action == "VAULT_UNSEAL"
+        assert plan.target_namespace == "vault"
+
+    def test_execute_vault_unseal_sends_whatsapp_on_success(self):
+        """execute_sre_action VAULT_UNSEAL notifica por WhatsApp al desellar."""
+        from main import execute_sre_action
+        vault_anomaly = Anomaly(
+            issue_type="VAULT_SEALED",
+            severity="HIGH",
+            namespace="amael-ia",
+            resource_name="amael-agentic-backend:skill.vault",
+            resource_type="BackendComponent",
+            owner_name="amael-agentic-deployment",
+            owner_kind="Deployment",
+            details="Vault está sealed",
+            dedup_key="backend_health:skill.vault",
+        )
+        plan = ActionPlan(
+            action="VAULT_UNSEAL",
+            target_name="vault-0",
+            target_namespace="vault",
+            reason="Vault sellado",
+            auto_execute=True,
+        )
+        with patch("main._auto_unseal_vault", return_value="✅ Vault deselado automáticamente."):
+            with patch("main._send_sre_notification") as mock_notify:
+                with patch("main.SRE_ACTIONS_TAKEN"):
+                    with patch("main.SRE_VAULT_UNSEAL_TOTAL"):
+                        result = execute_sre_action(plan, vault_anomaly)
+        assert "✅" in result
+        msg = mock_notify.call_args[0][0]
+        assert "deselado" in msg.lower()
+
+    def test_execute_vault_unseal_notifies_failure(self):
+        """Si auto-unseal falla, notifica con severidad HIGH."""
+        from main import execute_sre_action
+        vault_anomaly = Anomaly(
+            issue_type="VAULT_SEALED", severity="HIGH",
+            namespace="amael-ia", resource_name="vault",
+            resource_type="BackendComponent", owner_name="amael-agentic-deployment",
+            owner_kind="Deployment", details="Vault sealed",
+            dedup_key="backend_health:vault",
+        )
+        plan = ActionPlan(
+            action="VAULT_UNSEAL", target_name="vault-0",
+            target_namespace="vault", reason="sealed", auto_execute=True,
+        )
+        with patch("main._auto_unseal_vault", return_value="Error: forbidden"):
+            with patch("main._send_sre_notification") as mock_notify:
+                with patch("main.SRE_ACTIONS_TAKEN"):
+                    with patch("main.SRE_VAULT_UNSEAL_TOTAL"):
+                        result = execute_sre_action(plan, vault_anomaly)
+        assert "Error" in result
+        call_kwargs = mock_notify.call_args[1]
+        assert call_kwargs.get("severity") == "HIGH"
