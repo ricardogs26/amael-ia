@@ -956,9 +956,10 @@ def observe_trends() -> List[Anomaly]:
     except Exception as e:
         logging.debug(f"[TRENDS] Memory leak error: {e}")
 
-    # ── Error rate escalation: rising 5xx trend ───────────────────────────────
+    # ── Error rate escalation: rising 5xx trend (excluir endpoints internos SRE) ─
     err_trend_q = (
-        'deriv(sum(rate(amael_http_requests_total{namespace="amael-ia",status_code=~"5.."}[5m]))[15m:1m])'
+        'deriv(sum(rate(amael_http_requests_total{namespace="amael-ia",status_code=~"5..",'
+        'handler!~"/api/sre/.*|/health|/metrics|/ready|/docs|/openapi.json"}[5m]))[15m:1m])'
         ' > 0.001'
     )
     try:
@@ -971,13 +972,13 @@ def observe_trends() -> List[Anomaly]:
                     issue_type="ERROR_RATE_ESCALATING",
                     severity="HIGH",
                     namespace="amael-ia",
-                    resource_name="backend-ia",
-                    resource_type="endpoint",
-                    owner_name="backend-ia-deployment",
+                    resource_name="amael-agentic-backend",
+                    resource_type="service",   # "service" no "endpoint" → agentic path activo
+                    owner_name="amael-agentic-deployment",
                     owner_kind="Deployment",
                     details=(f"Tasa de errores 5xx en escalada sostenida "
                              f"(deriv={val:.4f} req/s²). Posible degradación progresiva."),
-                    dedup_key="amael-ia:backend-ia:ERROR_RATE_ESCALATING",
+                    dedup_key="amael-ia:amael-agentic-backend:ERROR_RATE_ESCALATING",
                 ))
                 SRE_TREND_ANOMALIES_TOTAL.labels(issue_type="ERROR_RATE_ESCALATING").inc()
     except Exception as e:
@@ -2294,7 +2295,7 @@ def _deterministic_diagnosis(anomaly: Anomaly) -> Diagnosis:
         # P5-A — predictive / trend anomalies
         "DISK_EXHAUSTION_PREDICTED": ("RESOURCE_LIMIT", "NOTIFY_HUMAN", 0.85),
         "MEMORY_LEAK_PREDICTED":     ("RESOURCE_LIMIT", "ROLLOUT_RESTART", 0.70),
-        "ERROR_RATE_ESCALATING":     ("DEPENDENCY",     "NOTIFY_HUMAN", 0.70),
+        "ERROR_RATE_ESCALATING":     ("DEPENDENCY",     "ROLLOUT_RESTART", 0.72),
         # P5-C — SLO violations
         "SLO_BUDGET_BURNING":        ("DEPENDENCY",     "NOTIFY_HUMAN", 0.90),
     }
@@ -2631,24 +2632,38 @@ def observe_metrics() -> List[Anomaly]:
     except Exception as e:
         logging.debug(f"[METRICS] Memory query error: {e}")
 
-    # ── HTTP 5xx error rate > 1% ──────────────────────────────────────────────
+    # ── HTTP 5xx error rate > 1% (excluir endpoints internos SRE y health) ─────
+    # Los endpoints /api/sre/* y /health son infraestructura interna — sus errores
+    # durante reinicios del pod generan falsos positivos que spamean WhatsApp.
+    _SRE_INTERNAL_PATHS = (
+        "/api/sre/.*", "/health", "/metrics", "/ready", "/docs", "/openapi.json"
+    )
+    _exclude_pattern = "|".join(_SRE_INTERNAL_PATHS)
     err_q = (
-        'sum by (handler) (rate(amael_http_requests_total{namespace="amael-ia",status_code=~"5.."}[5m]))'
-        ' / sum by (handler) (rate(amael_http_requests_total{namespace="amael-ia"}[5m]))'
-        ' > 0.01'
+        f'sum by (handler) (rate(amael_http_requests_total{{namespace="amael-ia",'
+        f'status_code=~"5..",handler!~"{_exclude_pattern}"}}[5m]))'
+        f' / sum by (handler) (rate(amael_http_requests_total{{namespace="amael-ia",'
+        f'handler!~"{_exclude_pattern}"}}[5m]))'
+        f' > 0.01'
     )
     try:
         resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query",
                             params={"query": err_q}, timeout=8)
         if resp.status_code == 200 and resp.json()["status"] == "success":
             for r in resp.json()["data"]["result"]:
-                handler = r["metric"].get("handler", "unknown")
-                val     = float(r["value"][1])
+                handler  = r["metric"].get("handler", "unknown")
+                val      = float(r["value"][1])
                 severity = "CRITICAL" if val > 0.10 else "HIGH"
+                # Mapear handler al deployment correcto
+                owner = (
+                    "k8s-agent-deployment"
+                    if handler.startswith("/api/k8s-agent") or handler.startswith("/api/sre")
+                    else "amael-agentic-deployment"
+                )
                 anomalies.append(Anomaly(
                     issue_type="HIGH_ERROR_RATE", severity=severity,
                     namespace="amael-ia", resource_name=handler,
-                    resource_type="endpoint", owner_name="backend-ia-deployment",
+                    resource_type="endpoint", owner_name=owner,
                     owner_kind="Deployment",
                     details=(f"Endpoint '{handler}' tiene {val:.1%} de errores 5xx "
                              f"(umbral: 1%)."),
@@ -3566,8 +3581,12 @@ async def get_loop_status():
 @app.get("/api/sre/learning/stats")
 async def get_learning_stats_endpoint():
     """P3-B: 7-day aggregate stats per (issue_type, action): success rate, avg confidence."""
-    stats = get_learning_stats()
-    return {"stats": stats, "window_days": 7}
+    try:
+        stats = get_learning_stats()
+        return {"stats": stats, "window_days": 7}
+    except Exception as e:
+        logging.error(f"[LEARNING_STATS] Error inesperado: {e}")
+        return {"stats": [], "window_days": 7, "error": str(e)}
 
 
 # ─── P4-C: Maintenance window endpoints ──────────────────────────────────────

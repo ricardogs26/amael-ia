@@ -487,7 +487,7 @@ class TestDeterministicDiagnosis:
         ("HIGH_ERROR_RATE",          "NOTIFY_HUMAN",    "DEPENDENCY"),
         ("DISK_EXHAUSTION_PREDICTED","NOTIFY_HUMAN",    "RESOURCE_LIMIT"),
         ("MEMORY_LEAK_PREDICTED",    "ROLLOUT_RESTART", "RESOURCE_LIMIT"),
-        ("ERROR_RATE_ESCALATING",    "NOTIFY_HUMAN",    "DEPENDENCY"),
+        ("ERROR_RATE_ESCALATING",    "ROLLOUT_RESTART", "DEPENDENCY"),
         ("SLO_BUDGET_BURNING",       "NOTIFY_HUMAN",    "DEPENDENCY"),
     ])
     def test_known_issue_type(self, issue_type, expected_action, expected_category):
