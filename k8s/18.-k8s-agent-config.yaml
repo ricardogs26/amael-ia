@@ -43,6 +43,13 @@ data:
   SRE_MEMORY_LEAK_RATE_BYTES: "5242880"  # 5 MB/s (subido para reducir falsos positivos)
   SRE_MEMORY_LEAK_EXCLUDED_CONTAINERS: "ollama,prometheus"  # crecimiento esperado de RAM
 
+  # P8-B — Bootstrap gradual: modo inicial de autonomía
+  # observe: solo detecta y notifica, sin acciones automáticas
+  # conservative: actúa solo con confianza >90% y solo ROLLOUT_RESTART
+  # standard: actúa con confianza >75% — default para producción establecida
+  # full: operación completa (ROLLOUT_RESTART, SCALE_UP, PATCH_RESOURCES)
+  SRE_INITIAL_MODE: "standard"
+
   # P1-007 — Lease leader election timeouts
   # leaseDurationSeconds: cuánto tiempo el líder puede ausentarse antes de que
   # otro pod tome el liderazgo (30s = failover rápido si el líder muere)

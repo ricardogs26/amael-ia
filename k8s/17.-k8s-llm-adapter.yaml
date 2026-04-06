@@ -16,7 +16,7 @@ spec:
       serviceAccountName: llm-adapter-sa
       containers:
       - name: adapter
-        image: registry.richardx.dev/llm-adapter:1.0.7
+        image: registry.richardx.dev/llm-adapter:1.0.8
         ports:
         - containerPort: 8000
         resources:

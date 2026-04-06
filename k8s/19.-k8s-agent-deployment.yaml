@@ -184,7 +184,7 @@ spec:
       serviceAccountName: k8s-agent-sa
       containers:
       - name: k8s-agent
-        image: registry.richardx.dev/k8s-agent:5.0.8
+        image: registry.richardx.dev/k8s-agent:5.2.0
         imagePullPolicy: Always
         ports:
         - containerPort: 8002

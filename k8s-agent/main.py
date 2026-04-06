@@ -93,6 +93,10 @@ SRE_PATCH_RESOURCES_TOTAL   = Counter('amael_sre_patch_resources_total',      'M
 SRE_SCALE_DOWN_TOTAL        = Counter('amael_sre_scale_down_total',           'Auto scale-down after HIGH_CPU resolved', ['result'])
 SRE_VAULT_UNSEAL_TOTAL      = Counter('amael_sre_vault_unseal_total',         'Vault auto-unseal attempts', ['result'])
 
+# P7 — Human-in-the-Loop approvals
+SRE_APPROVAL_REQUESTED_TOTAL = Counter('amael_sre_approval_requested_total',  'SCALE_UP/PATCH approvals requested via WhatsApp')
+SRE_APPROVAL_RESULT_TOTAL    = Counter('amael_sre_approval_result_total',     'Approval results', ['result'])  # approved, rejected, rollout
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MODELOS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -248,6 +252,76 @@ def _record_restart(resource_name: str, namespace: str):
     pipe.incr(key)
     pipe.expire(key, RESTART_WINDOW_MINUTES * 60)
     pipe.execute()
+
+
+# P7 — Human-in-the-Loop: aprobación vía WhatsApp
+_APPROVAL_TTL = 900  # 15 minutos para que el usuario responda
+
+
+def _save_pending_approval(incident_key: str, action: str, resource: str, namespace: str,
+                            issue_type: str, diagnosis=None) -> None:
+    """Guarda una acción pendiente de aprobación en Redis (TTL 15min)."""
+    if not _redis:
+        return
+    data = {
+        "incident_key": incident_key,
+        "action":       action,
+        "resource":     resource,
+        "namespace":    namespace,
+        "issue_type":   issue_type,
+        "root_cause":   diagnosis.root_cause if diagnosis else "",
+        "confidence":   diagnosis.confidence if diagnosis else 0.0,
+        "created_at":   datetime.now(timezone.utc).isoformat(),
+    }
+    _redis.setex(f"sre:approval:{incident_key}", _APPROVAL_TTL, json.dumps(data))
+
+
+def _get_pending_approval(approval_id: Optional[str] = None) -> Optional[dict]:
+    """Devuelve la aprobación pendiente más reciente (o la indicada por approval_id)."""
+    if not _redis:
+        return None
+    try:
+        if approval_id:
+            raw = _redis.get(f"sre:approval:{approval_id}")
+            return json.loads(raw) if raw else None
+        keys = _redis.keys("sre:approval:*")
+        if not keys:
+            return None
+        best, best_ts = None, ""
+        for key in keys:
+            raw = _redis.get(key)
+            if not raw:
+                continue
+            data = json.loads(raw)
+            ts = data.get("created_at", "")
+            if ts > best_ts:
+                best, best_ts = data, ts
+        return best
+    except Exception as e:
+        logging.debug(f"[APPROVAL] Error: {e}")
+        return None
+
+
+def _list_pending_approvals() -> List[dict]:
+    """Lista todas las aprobaciones pendientes."""
+    if not _redis:
+        return []
+    try:
+        keys = _redis.keys("sre:approval:*")
+        results = []
+        for key in keys:
+            raw = _redis.get(key)
+            if raw:
+                results.append(json.loads(raw))
+        return sorted(results, key=lambda x: x.get("created_at", ""), reverse=True)
+    except Exception:
+        return []
+
+
+def _remove_approval(incident_key: str) -> None:
+    """Elimina una aprobación pendiente."""
+    if _redis:
+        _redis.delete(f"sre:approval:{incident_key}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -595,6 +669,294 @@ def send_daily_report_whatsapp():
     return _send_sre_notification(report, "DAILY_REPORT")
 
 
+# P7 — Morning Briefing (7am proactivo)
+def generate_morning_briefing() -> str:
+    """
+    Genera un briefing matutino con: SLO vivo, salud del cluster, top consumo de memoria,
+    predicciones de disco y resumen de incidentes nocturnos.
+    """
+    now = datetime.now(timezone.utc)
+    lines = [f"☀️ *Amael SRE — Morning Briefing* ({now.strftime('%d %b %Y')})"]
+
+    # 1. SLO en vivo desde Prometheus
+    slo_lines = []
+    for slo in _SLO_TARGETS:
+        handler = slo.get("handler", slo.get("service", "?"))
+        target  = slo.get("availability", 0)
+        window_h = slo.get("window_hours", 24)
+        try:
+            q = (f'1 - sum(rate(amael_http_requests_total{{handler=~"{handler}",'
+                 f'status_code=~"5..",namespace="amael-ia"}}[{window_h}h])) '
+                 f'/ sum(rate(amael_http_requests_total{{handler=~"{handler}",'
+                 f'namespace="amael-ia"}}[{window_h}h]))')
+            resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": q}, timeout=8)
+            if resp.status_code == 200 and resp.json()["status"] == "success":
+                results = resp.json()["data"]["result"]
+                if results:
+                    avail = float(results[0]["value"][1])
+                    icon  = "✅" if avail >= target else "🔴"
+                    slo_lines.append(f"  {icon} {handler}: {avail:.2%} (target {target:.1%})")
+                else:
+                    slo_lines.append(f"  ⚪ {handler}: sin datos")
+        except Exception:
+            slo_lines.append(f"  ⚪ {handler}: error")
+    if slo_lines:
+        lines.append("\n📊 *SLO (últimas 24h):*")
+        lines.extend(slo_lines)
+
+    # 2. Salud del cluster (pods)
+    total_pods, healthy_pods, problem_list = 0, 0, []
+    for ns in OBSERVE_NAMESPACES:
+        try:
+            pods = v1.list_namespaced_pod(ns)
+            for pod in pods.items:
+                total_pods += 1
+                phase = pod.status.phase or "Unknown"
+                if phase in ("Running", "Succeeded"):
+                    healthy_pods += 1
+                else:
+                    short = "-".join(pod.metadata.name.split("-")[:-2]) or pod.metadata.name
+                    problem_list.append(f"{ns}/{short}")
+        except Exception:
+            pass
+    lines.append(f"\n🖥️ *Cluster:* {healthy_pods}/{total_pods} pods ✅")
+    if problem_list:
+        lines.append(f"  ⚠️ Problemas: {', '.join(problem_list[:4])}")
+
+    # 3. Top 3 pods por % de memoria vs. límite
+    ns_regex = "|".join(OBSERVE_NAMESPACES)
+    try:
+        q = (f'topk(3, sum by (pod, namespace) ('
+             f'container_memory_working_set_bytes{{container!="",namespace=~"{ns_regex}"}}'
+             f') / sum by (pod, namespace) ('
+             f'kube_pod_container_resource_limits{{resource="memory",container!="",namespace=~"{ns_regex}"}}'
+             f'))')
+        resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": q}, timeout=8)
+        if resp.status_code == 200 and resp.json()["status"] == "success":
+            results = resp.json()["data"]["result"]
+            if results:
+                lines.append("\n💾 *Top memoria (% del límite):*")
+                for r in results:
+                    pod = r["metric"].get("pod", "?")
+                    val = float(r["value"][1]) * 100
+                    icon = "⚠️" if val > 80 else ("📢" if val > 65 else "✅")
+                    short = "-".join(pod.split("-")[:-2]) or pod
+                    lines.append(f"  {icon} {short}: {val:.0f}%")
+    except Exception:
+        pass
+
+    # 4. Predicciones de disco (multi-nivel)
+    pred_lines = []
+    for days, severity_icon in [(1, "🚨"), (3, "⚠️"), (7, "📢")]:
+        hours = days * 24
+        disk_q = (f'predict_linear(node_filesystem_avail_bytes{{mountpoint="/"}}[6h], '
+                  f'{hours} * 3600) < 0')
+        try:
+            resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": disk_q}, timeout=8)
+            if resp.status_code == 200 and resp.json()["status"] == "success":
+                for r in resp.json()["data"]["result"]:
+                    instance = r["metric"].get("instance", "nodo")
+                    pred_lines.append(f"  {severity_icon} Disco {instance}: agota en <{days}d")
+        except Exception:
+            pass
+
+    if pred_lines:
+        lines.append("\n🔮 *Predicciones:*")
+        lines.extend(pred_lines)
+    else:
+        lines.append("\n🔮 *Predicciones:* Sin alertas ✅")
+
+    # 5. Incidentes nocturnos (últimas 8h)
+    pool = get_postgres_pool()
+    if pool:
+        conn = pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COUNT(*) AS total,
+                           COUNT(*) FILTER (WHERE action_taken='ROLLOUT_RESTART') AS healed
+                    FROM sre_incidents
+                    WHERE created_at > now() - INTERVAL '8 hours'
+                """)
+                row = cur.fetchone()
+                total_night, healed_night = (row[0] or 0, row[1] or 0) if row else (0, 0)
+        except Exception:
+            total_night, healed_night = 0, 0
+        finally:
+            pool.putconn(conn)
+        icon_n = "✅" if total_night == 0 else "⚠️"
+        lines.append(f"\n🌙 *Noche (8h):* {icon_n} {total_night} incidentes, "
+                     f"{healed_night} auto-resueltos")
+
+    # 6. Circuit breaker y aprobaciones pendientes
+    cb = _circuit_breaker.state
+    if cb.upper() != "CLOSED":
+        lines.append(f"\n⚡ *Circuit Breaker:* {cb} ⚠️ — revisa el loop")
+    pending = _list_pending_approvals()
+    if pending:
+        lines.append(f"\n⏳ *Aprobaciones pendientes:* {len(pending)}")
+        for ap in pending[:2]:
+            lines.append(f"  • {ap['action']} en `{ap['resource']}` — responde *sre si* / *sre no*")
+
+    return "\n".join(lines)
+
+
+def send_morning_briefing():
+    """Envía el briefing matutino proactivo (llamado a las 7am por el scheduler)."""
+    briefing = generate_morning_briefing()
+    _send_sre_notification(briefing, "MORNING_BRIEFING")
+
+
+# P7 — Weekly Retrospective (lunes 8am)
+def generate_weekly_retrospective() -> str:
+    """
+    Genera la retrospectiva semanal: incidentes, tasa de auto-heal, top patrones,
+    SLO de la semana y recomendaciones generadas por LLM.
+    Se envía cada lunes a las 8am.
+    """
+    pool = get_postgres_pool()
+    if not pool:
+        return "📭 Retrospectiva no disponible: sin base de datos."
+
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            # ── Totales de la semana ──────────────────────────────────────────
+            cur.execute("""
+                SELECT
+                    COUNT(*)                                                        AS total,
+                    COUNT(*) FILTER (WHERE action_taken = 'ROLLOUT_RESTART'
+                                       AND action_result LIKE '%%✅%%')             AS healed,
+                    COUNT(*) FILTER (WHERE action_taken = 'NOTIFY_HUMAN')          AS notified,
+                    COUNT(*) FILTER (WHERE action_taken = 'SCALE_UP')              AS scaled,
+                    COUNT(*) FILTER (WHERE action_taken = 'PATCH_RESOURCES')       AS patched,
+                    ROUND(AVG(confidence)::numeric, 2)                             AS avg_confidence
+                FROM sre_incidents
+                WHERE created_at > now() - INTERVAL '7 days';
+            """)
+            row = cur.fetchone() or (0, 0, 0, 0, 0, 0)
+            total, healed, notified, scaled, patched, avg_conf = row
+
+            # ── Top 5 tipos de anomalía ───────────────────────────────────────
+            cur.execute("""
+                SELECT issue_type,
+                       COUNT(*)                                     AS cnt,
+                       MAX(severity)                                AS max_sev,
+                       COUNT(*) FILTER (WHERE action_taken='ROLLOUT_RESTART'
+                                          AND action_result LIKE '%%✅%%') AS auto_fixed,
+                       (SELECT resource_name FROM sre_incidents i2
+                         WHERE i2.issue_type = i.issue_type
+                           AND i2.created_at > now() - INTERVAL '7 days'
+                         ORDER BY i2.created_at DESC LIMIT 1)       AS last_resource
+                FROM sre_incidents i
+                WHERE created_at > now() - INTERVAL '7 days'
+                GROUP BY issue_type
+                ORDER BY cnt DESC
+                LIMIT 5;
+            """)
+            top5 = cur.fetchall()
+
+            # ── Servicio con más incidentes ───────────────────────────────────
+            cur.execute("""
+                SELECT resource_name, COUNT(*) AS cnt
+                FROM sre_incidents
+                WHERE created_at > now() - INTERVAL '7 days'
+                GROUP BY resource_name
+                ORDER BY cnt DESC
+                LIMIT 3;
+            """)
+            top_resources = cur.fetchall()
+
+            # ── Incidentes por día (patrón temporal) ─────────────────────────
+            cur.execute("""
+                SELECT TO_CHAR(created_at AT TIME ZONE 'America/Mexico_City', 'Dy') AS dow,
+                       COUNT(*) AS cnt
+                FROM sre_incidents
+                WHERE created_at > now() - INTERVAL '7 days'
+                GROUP BY dow
+                ORDER BY cnt DESC
+                LIMIT 3;
+            """)
+            busy_days = cur.fetchall()
+
+    except Exception as e:
+        return f"Error generando retrospectiva: {e}"
+    finally:
+        pool.putconn(conn)
+
+    if total == 0:
+        return ("📊 *[SRE WEEKLY_RETRO]*\n"
+                "Semana sin incidentes detectados. Sistema estable. ✅")
+
+    heal_rate = (healed / total * 100) if total else 0
+    _SEV = {"CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"}
+
+    lines = [
+        f"📊 *[SRE Weekly Retro]* — Semana {datetime.now(timezone.utc).strftime('%d %b %Y')}",
+        "",
+        f"*Resumen ({total} incidentes):*",
+        f"  ✅ Auto-resueltos:   {healed} ({heal_rate:.0f}%)",
+        f"  👤 Requirieron humano: {notified}",
+        f"  📈 Escalados:         {scaled}",
+        f"  🔧 Parcheos memoria:  {patched}",
+        f"  🎯 Confianza promedio: {float(avg_conf or 0):.0%}",
+    ]
+
+    if top5:
+        lines.append("\n*Top anomalías:*")
+        for issue_type, cnt, max_sev, auto_fixed, last_res in top5:
+            icon  = _SEV.get(max_sev, "⚪")
+            ratio = f"{auto_fixed}/{cnt}" if auto_fixed else f"0/{cnt} ⚠️"
+            short = (last_res or "").split("/")[-1]
+            short = "-".join(short.split("-")[:-2]) or short
+            lines.append(f"  {icon} *{issue_type}* ×{cnt} — auto-fix: {ratio}")
+            if short:
+                lines.append(f"     └ Último: {short}")
+
+    if top_resources:
+        lines.append("\n*Servicios más afectados:*")
+        for res, cnt in top_resources:
+            short = "-".join(res.split("-")[:-2]) or res
+            lines.append(f"  • {short}: {cnt} incidentes")
+
+    if busy_days:
+        days_str = ", ".join(f"{d}({c})" for d, c in busy_days)
+        lines.append(f"\n*Días más activos:* {days_str}")
+
+    # ── Recomendaciones LLM ────────────────────────────────────────────────
+    if top5:
+        top_issues_txt = ", ".join(f"{r[0]}×{r[1]}" for r in top5)
+        top_res_txt    = ", ".join(r[0].split("/")[-1] for r in (top_resources or []))
+        prompt = (
+            f"Eres un SRE senior. Esta semana el cluster tuvo {total} incidentes.\n"
+            f"Top anomalías: {top_issues_txt}.\n"
+            f"Servicios más afectados: {top_res_txt}.\n"
+            f"Tasa de auto-heal: {heal_rate:.0f}%.\n\n"
+            f"Da exactamente 2-3 recomendaciones concretas y accionables para la próxima semana. "
+            f"Sé específico y breve. Responde en español. Sin introducción."
+        )
+        try:
+            recs = llm.invoke(prompt)
+            # Limpiar respuesta
+            recs = recs.strip()
+            if recs:
+                lines.append("\n🤖 *Recomendaciones IA:*")
+                for line in recs.splitlines()[:6]:
+                    if line.strip():
+                        lines.append(f"  {line.strip()}")
+        except Exception as e:
+            logging.debug(f"[WEEKLY_RETRO] LLM error: {e}")
+
+    lines.append("\n_Próxima retrospectiva: lunes 8am_")
+    return "\n".join(lines)
+
+
+def send_weekly_retrospective():
+    """Envía la retrospectiva semanal cada lunes a las 8am."""
+    retro = generate_weekly_retrospective()
+    _send_sre_notification(retro, "WEEKLY_RETRO")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # QDRANT — runbooks locales (P2 #12)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -746,6 +1108,52 @@ def _was_recently_deployed(deployment_name: str, namespace: str,
     except Exception:
         pass
     return False
+
+
+_DEPLOY_CTX_STOPWORDS = {"deployment", "service", "backend", "ia", "agent", "agentic"}
+
+
+def _get_deploy_context(owner_name: str, namespace: str) -> Optional[str]:
+    """
+    P7-S2: Busca si hubo un deploy reciente (últimas 2h) para el recurso afectado.
+    Correlaciona owner_name del pod con service keys guardados en deploy_hook.
+    Ej: 'amael-agentic-deployment' ↔ 'amael-agentic-backend'.
+    """
+    if not _redis:
+        return None
+    try:
+        keys = _redis.keys("sre:deploy_detail:*")
+        if not keys:
+            return None
+        owner_parts = {p for p in owner_name.replace("-", " ").split()
+                       if p not in _DEPLOY_CTX_STOPWORDS and len(p) > 2}
+        for key in keys:
+            raw = _redis.get(key)
+            if not raw:
+                continue
+            info = json.loads(raw)
+            service = info.get("service", "")
+            service_parts = {p for p in service.replace("-", " ").split()
+                             if p not in _DEPLOY_CTX_STOPWORDS and len(p) > 2}
+            if not service_parts or not (service_parts & owner_parts):
+                continue
+            # Match encontrado
+            try:
+                dt = datetime.fromisoformat(info.get("deployed_at", ""))
+                delta_min = int((datetime.now(timezone.utc) - dt).total_seconds() / 60)
+                time_ago = f"hace {delta_min}min"
+            except Exception:
+                time_ago = "recientemente"
+            short_sha = info.get("short_sha", info.get("commit", "?")[:8])
+            msg       = info.get("message", "")[:100]
+            author    = info.get("author", "?")
+            version   = info.get("version", "?")
+            return (f"Deploy reciente: {service}:{version} ({time_ago})\n"
+                    f"Commit: {short_sha} — {msg}\n"
+                    f"Autor: {author}")
+    except Exception as e:
+        logging.debug(f"[DEPLOY_CTX] Error: {e}")
+    return None
 
 
 def rollout_undo_deployment(input_str: str) -> str:
@@ -2444,6 +2852,13 @@ def _diagnose_llm_sync(anomaly: Anomaly) -> Optional[Diagnosis]:
     if runbook:
         evidence_parts.append(f"RUNBOOK RELEVANTE:\n{runbook[:600]}")
 
+    # ── 3. Deploy context (P7-S2): correlacionar con deploys recientes ────────
+    deploy_ctx = _get_deploy_context(anomaly.owner_name or anomaly.resource_name,
+                                     anomaly.namespace)
+    if deploy_ctx:
+        evidence_parts.append(f"DEPLOY RECIENTE (posible causa de la regresión):\n{deploy_ctx}")
+        logging.info(f"[DIAGNOSIS] Deploy context inyectado: {deploy_ctx[:80]}")
+
     evidence_text = "\n\n".join(evidence_parts) or "Sin evidencia adicional disponible."
 
     prompt = f"""Eres un SRE experto. Analiza el siguiente incidente de Kubernetes y genera un diagnóstico estructurado.
@@ -2901,10 +3316,16 @@ def detect_anomalies(snapshot: ClusterSnapshot) -> List[Anomaly]:
                     f"Pod '{pod.name}' lleva {int(age/60)}min en Pending.",
                     f"{kp}:PENDING"))
         elif pod.restart_count >= 5 and not pod.waiting_reason:
-            anomalies.append(Anomaly("HIGH_RESTARTS", "MEDIUM", pod.namespace, pod.name,
+            # Usar owner_name como base del dedup_key para que reinicios del pod
+            # (nuevo hash) no generen incidentes duplicados por deployment.
+            # Severidad HIGH si ≥10 reinicios (diagnóstico LLM + posible auto-heal).
+            _hr_sev    = "HIGH" if pod.restart_count >= 10 else "MEDIUM"
+            _hr_owner  = pod.owner_name or pod.name
+            _hr_dedup  = f"{pod.namespace}:{_hr_owner}:HIGH_RESTARTS"
+            anomalies.append(Anomaly("HIGH_RESTARTS", _hr_sev, pod.namespace, pod.name,
                 "pod", pod.owner_name, pod.owner_kind,
                 f"Pod '{pod.name}' tiene {pod.restart_count} reinicios (actualmente Running).",
-                f"{kp}:HIGH_RESTARTS"))
+                _hr_dedup))
 
     for node in snapshot.nodes:
         kn = f"node:{node.name}"
@@ -3077,6 +3498,26 @@ def decide_action(anomaly: Anomaly, diagnosis: Optional[Diagnosis] = None) -> Ac
 def execute_sre_action(plan: ActionPlan, anomaly: Anomaly,
                        diagnosis: Optional[Diagnosis] = None,
                        incident_key: str = "") -> str:
+    # P8-B: Apply bootstrap gradual mode — may downgrade action
+    effective_action = _apply_mode_to_action(
+        plan.action,
+        diagnosis.confidence if diagnosis else 0.0,
+        plan.target_namespace,
+    )
+    if effective_action != plan.action:
+        mode = get_agent_mode()
+        msg = (
+            f"👁️ *[MODO {mode.upper()}]* Anomalía detectada en `{plan.target_name}` "
+            f"({plan.target_namespace}): {anomaly.issue_type}\n"
+            f"Acción propuesta: {plan.action} — *no ejecutada* (modo {mode})\n"
+            f"Diagnóstico: {diagnosis.root_cause[:100] if diagnosis else anomaly.details[:100]}"
+        )
+        _send_sre_notification(msg, severity="INFO")
+        SRE_ACTIONS_TAKEN.labels(action="observe_only", result="ok").inc()
+        return f"[OBSERVE_ONLY] Anomalía registrada, sin acción ejecutada (modo {mode})"
+    plan = ActionPlan(action=effective_action, target_name=plan.target_name,
+                      target_namespace=plan.target_namespace, reason=plan.reason)
+
     if plan.action == "ROLLOUT_RESTART":
         result = rollout_restart_deployment(f"{plan.target_name}, {plan.target_namespace}")
         ok = "✅" in result
@@ -3115,40 +3556,48 @@ def execute_sre_action(plan: ActionPlan, anomaly: Anomaly,
         return result
 
     if plan.action == "SCALE_UP":
-        # P#4: Capture original replicas before scaling to schedule auto scale-down
-        _original_replicas = 1
-        try:
-            _d = apps_v1.read_namespaced_deployment(plan.target_name, plan.target_namespace)
-            _original_replicas = _d.spec.replicas or 1
-        except Exception:
-            pass
-        result = scale_deployment_replicas(plan.target_name, plan.target_namespace)
-        ok = "✅" in result
-        SRE_ACTIONS_TAKEN.labels(action="scale_up", result="ok" if ok else "error").inc()
-        if ok:
-            confidence_str = f" (confianza: {diagnosis.confidence:.0%})" if diagnosis else ""
-            _send_sre_notification(
-                f"📈 Auto-escalado: {anomaly.issue_type} en "
-                f"'{plan.target_name}' ({plan.target_namespace}){confidence_str}.\n{result}",
-                severity="INFO",
-            )
-            # P#4: Schedule scale-down check in 30min
-            _schedule_scale_down(plan.target_name, plan.target_namespace, _original_replicas)
-        return result
+        # P7-S3: Pedir aprobación humana vía WhatsApp antes de escalar
+        _save_pending_approval(incident_key, "SCALE_UP",
+                               plan.target_name, plan.target_namespace,
+                               anomaly.issue_type, diagnosis)
+        conf_str   = f"{diagnosis.confidence:.0%}" if diagnosis else "?"
+        cause_str  = (diagnosis.root_cause[:80] if diagnosis else anomaly.details[:80])
+        msg = (
+            f"📊 *SRE solicita aprobación — SCALE_UP*\n"
+            f"Recurso: `{plan.target_name}` ({plan.target_namespace})\n"
+            f"Problema: {anomaly.issue_type} | Confianza: {conf_str}\n"
+            f"Causa: {cause_str}\n"
+            f"Propuesta: +1 réplica (max 4)\n\n"
+            f"Responde:\n• *sre si* — ejecutar\n"
+            f"• *sre no* — cancelar\n"
+            f"• *sre rollout* — solo reiniciar (opción conservadora)"
+        )
+        _send_sre_notification(msg, severity="HIGH")
+        SRE_APPROVAL_REQUESTED_TOTAL.inc()
+        SRE_ACTIONS_TAKEN.labels(action="scale_up", result="pending_approval").inc()
+        return f"Aprobación solicitada vía WhatsApp para SCALE_UP en '{plan.target_name}'"
 
     if plan.action == "PATCH_RESOURCES":
-        result = patch_deployment_memory_limit(plan.target_name, plan.target_namespace)
-        ok = "✅" in result
-        SRE_ACTIONS_TAKEN.labels(action="patch_resources", result="ok" if ok else "error").inc()
-        if ok:
-            SRE_PATCH_RESOURCES_TOTAL.inc()
-            confidence_str = f" (confianza: {diagnosis.confidence:.0%})" if diagnosis else ""
-            _send_sre_notification(
-                f"🔧 Auto-patch OOM: memory limit aumentado en "
-                f"'{plan.target_name}' ({plan.target_namespace}){confidence_str}.\n{result}",
-                severity="INFO",
-            )
-        return result
+        # P7-S3: Pedir aprobación humana vía WhatsApp antes de parchear memoria
+        _save_pending_approval(incident_key, "PATCH_RESOURCES",
+                               plan.target_name, plan.target_namespace,
+                               anomaly.issue_type, diagnosis)
+        conf_str  = f"{diagnosis.confidence:.0%}" if diagnosis else "?"
+        cause_str = (diagnosis.root_cause[:80] if diagnosis else anomaly.details[:80])
+        msg = (
+            f"🔧 *SRE solicita aprobación — PATCH_RESOURCES*\n"
+            f"Recurso: `{plan.target_name}` ({plan.target_namespace})\n"
+            f"Problema: {anomaly.issue_type} | Confianza: {conf_str}\n"
+            f"Causa: {cause_str}\n"
+            f"Propuesta: aumentar memory limit +50% (mín +256Mi)\n\n"
+            f"Responde:\n• *sre si* — ejecutar\n"
+            f"• *sre no* — cancelar\n"
+            f"• *sre rollout* — solo reiniciar (opción conservadora)"
+        )
+        _send_sre_notification(msg, severity="HIGH")
+        SRE_APPROVAL_REQUESTED_TOTAL.inc()
+        SRE_ACTIONS_TAKEN.labels(action="patch_resources", result="pending_approval").inc()
+        return f"Aprobación solicitada vía WhatsApp para PATCH_RESOURCES en '{plan.target_name}'"
 
     if plan.action == "NOTIFY_HUMAN":
         diag = diagnosis
@@ -3310,10 +3759,14 @@ def _run_loop_iteration():
                 "VAULT_SEALED", "POSTGRES_UNAVAILABLE", "REDIS_UNAVAILABLE",
                 "QDRANT_UNAVAILABLE", "OLLAMA_UNAVAILABLE", "BACKEND_COMPONENT_UNHEALTHY",
             }
-            _mark_incident(
-                anomaly.dedup_key,
-                ttl=3600 if anomaly.issue_type in _INFRA_ISSUE_TYPES else _DEDUP_TTL,
+            # HIGH_RESTARTS en pod Running: TTL 4h para evitar spam
+            # (el pod está estable, solo tiene historial de reinicios acumulados)
+            _dedup_ttl = (
+                3600 if anomaly.issue_type in _INFRA_ISSUE_TYPES
+                else 14400 if anomaly.issue_type == "HIGH_RESTARTS"
+                else _DEDUP_TTL
             )
+            _mark_incident(anomaly.dedup_key, ttl=_dedup_ttl)
             SRE_ANOMALIES_DETECTED.labels(
                 severity=anomaly.severity, issue_type=anomaly.issue_type
             ).inc()
@@ -3444,6 +3897,25 @@ async def startup():
             minute=0,
             timezone="America/Mexico_City",
             id="daily_report",
+        )
+        # P7-S1: Morning briefing a las 7:00am hora México (todos los días)
+        scheduler.add_job(
+            send_morning_briefing,
+            trigger="cron",
+            hour=7,
+            minute=0,
+            timezone="America/Mexico_City",
+            id="morning_briefing",
+        )
+        # P7: Retrospectiva semanal los lunes a las 8:00am hora México
+        scheduler.add_job(
+            send_weekly_retrospective,
+            trigger="cron",
+            day_of_week="mon",
+            hour=8,
+            minute=0,
+            timezone="America/Mexico_City",
+            id="weekly_retrospective",
         )
         scheduler.start()
         app.state.sre_scheduler = scheduler
@@ -3662,6 +4134,200 @@ async def get_slo_status():
     return {"slo_targets": results, "count": len(results)}
 
 
+# ─── P8-A: Audit Log — human-readable narrative of agent decisions ───────────
+
+_ISSUE_LABELS = {
+    "CRASH_LOOP":               "CrashLoopBackOff",
+    "OOM_KILLED":               "OOMKilled (memoria agotada)",
+    "HIGH_CPU":                 "CPU elevada",
+    "HIGH_MEMORY":              "Memoria elevada",
+    "HIGH_ERROR_RATE":          "Alta tasa de errores HTTP",
+    "IMAGE_PULL_ERROR":         "Error al descargar imagen",
+    "POD_FAILED":               "Pod en estado fallido",
+    "POD_PENDING_STUCK":        "Pod bloqueado en Pending",
+    "NODE_NOT_READY":           "Nodo no disponible",
+    "MEMORY_LEAK_PREDICTED":    "Memory leak predicho (tendencia)",
+    "DISK_EXHAUSTION_PREDICTED":"Agotamiento de disco predicho",
+    "ERROR_RATE_ESCALATING":    "Tasa de errores escalando",
+    "SLO_BUDGET_BURNING":       "SLO en riesgo (error budget)",
+}
+
+_ACTION_LABELS = {
+    "ROLLOUT_RESTART":   "reinicio automático ejecutado",
+    "NOTIFY_HUMAN":      "notificación enviada al equipo on-call (acción humana requerida)",
+    "ROLLBACK":          "rollback automático ejecutado",
+    "SCALE_UP":          "escalado solicitado (pendiente aprobación humana)",
+    "PATCH_RESOURCES":   "incremento de límite de memoria solicitado",
+    "VAULT_UNSEAL":      "Vault auto-deselado",
+    "NO_ACTION":         "sin acción — modo OBSERVE activo",
+    "OBSERVE_ONLY":      "sin acción — modo OBSERVE activo",
+}
+
+def _format_incident_narrative(row: dict) -> str:
+    """Converts a raw sre_incidents row into a Spanish natural language narrative."""
+    ts         = row.get("created_at")
+    time_str   = ts.strftime("%d/%m/%Y %H:%M") if hasattr(ts, "strftime") else str(ts)
+    ns         = row.get("namespace", "?")
+    resource   = row.get("resource_name", "?")
+    issue_type = row.get("issue_type", "UNKNOWN")
+    root_cause = row.get("root_cause") or ""
+    confidence = row.get("confidence")
+    action     = row.get("action_taken", "")
+    result     = row.get("action_result") or ""
+    severity   = row.get("severity", "")
+
+    issue_label  = _ISSUE_LABELS.get(issue_type, issue_type)
+    action_label = _ACTION_LABELS.get(action, action)
+    conf_str     = f"{confidence*100:.0f}%" if confidence is not None else "N/A"
+    result_icon  = "✓ resuelto" if result and ("✅" in result or "healthy" in result.lower()) else ("⚠ pendiente" if result else "")
+
+    lines = [f"[{time_str}] *{issue_label}* detectado en `{resource}` (namespace: {ns})"]
+    if root_cause:
+        lines.append(f"  Diagnóstico: {root_cause[:200]} — confianza {conf_str}")
+    lines.append(f"  Acción: {action_label}")
+    if result_icon:
+        lines.append(f"  Resultado: {result_icon}")
+    return "\n".join(lines)
+
+
+@app.get("/api/sre/audit")
+async def sre_audit_log(limit: int = 20, days: int = 7):
+    """
+    P8-A: Human-readable audit log of all SRE agent decisions.
+    Returns each incident as a Spanish natural language narrative.
+    """
+    pool = get_postgres_pool()
+    if not pool:
+        raise HTTPException(status_code=503, detail="PostgreSQL no disponible")
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT created_at, namespace, resource_name, issue_type, severity,
+                       root_cause, confidence, action_taken, action_result
+                FROM sre_incidents
+                WHERE created_at > now() - interval '%s days'
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, (days, min(limit, 100)))
+            cols = ["created_at","namespace","resource_name","issue_type","severity",
+                    "root_cause","confidence","action_taken","action_result"]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        pool.putconn(conn)
+
+    entries = []
+    for row in rows:
+        entries.append({
+            "timestamp":  row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else str(row["created_at"]),
+            "narrative":  _format_incident_narrative(row),
+            "issue_type": row["issue_type"],
+            "severity":   row["severity"],
+            "resource":   row["resource_name"],
+            "namespace":  row["namespace"],
+            "confidence": row["confidence"],
+            "action":     row["action_taken"],
+            "result":     row["action_result"],
+        })
+
+    # Summary stats
+    auto_resolved = sum(1 for e in entries if e["action"] == "ROLLOUT_RESTART" and e["result"] and "✅" in (e["result"] or ""))
+    notified      = sum(1 for e in entries if e["action"] == "NOTIFY_HUMAN")
+    observe_only  = sum(1 for e in entries if e["action"] in ("NO_ACTION", "OBSERVE_ONLY"))
+
+    return {
+        "success": True,
+        "period_days": days,
+        "total": len(entries),
+        "summary": {
+            "auto_resolved": auto_resolved,
+            "notified_human": notified,
+            "observe_only": observe_only,
+            "autonomy_rate": f"{(auto_resolved / len(entries) * 100):.0f}%" if entries else "0%",
+        },
+        "entries": entries,
+    }
+
+
+# ─── P8-B: Bootstrap Gradual — progressive autonomy mode ─────────────────────
+
+_AGENT_MODE_KEY    = "sre:agent_mode"
+_VALID_MODES       = {"observe", "conservative", "standard", "full"}
+_MODE_DESCRIPTIONS = {
+    "observe":      "OBSERVE — Solo detecta y notifica. No ejecuta ninguna acción autónoma.",
+    "conservative": "CONSERVATIVE — Actúa solo con confianza >90% y solo ROLLOUT_RESTART. Ideal para las primeras semanas.",
+    "standard":     "STANDARD — Actúa con confianza >75% con ROLLOUT_RESTART. Modo recomendado post-validación.",
+    "full":         "FULL — Operación completa: ROLLOUT_RESTART, SCALE_UP, PATCH_RESOURCES con umbrales normales.",
+}
+
+def get_agent_mode() -> str:
+    """Returns current agent mode from Redis. Defaults to env var or 'standard'."""
+    try:
+        mode = _redis.get(_AGENT_MODE_KEY)
+        if mode in _VALID_MODES:
+            return mode
+    except Exception:
+        pass
+    return os.environ.get("SRE_INITIAL_MODE", "standard")
+
+def set_agent_mode(mode: str) -> bool:
+    """Persists agent mode to Redis."""
+    if mode not in _VALID_MODES:
+        return False
+    try:
+        _redis.set(_AGENT_MODE_KEY, mode)
+        logging.info(f"[BOOTSTRAP] Agent mode changed to: {mode}")
+        return True
+    except Exception as e:
+        logging.error(f"[BOOTSTRAP] Failed to set mode: {e}")
+        return False
+
+def _apply_mode_to_action(action: str, confidence: float, namespace: str) -> str:
+    """
+    Applies the current agent mode policy to a proposed action.
+    Returns the (possibly downgraded) action.
+    """
+    mode = get_agent_mode()
+    if mode == "observe":
+        return "OBSERVE_ONLY"
+    if mode == "conservative":
+        # Only ROLLOUT_RESTART with confidence >0.90
+        if action != "ROLLOUT_RESTART" or confidence < 0.90:
+            return "OBSERVE_ONLY"
+    if mode == "standard":
+        # Only ROLLOUT_RESTART, confidence >0.75 (default threshold)
+        if action not in ("ROLLOUT_RESTART", "NOTIFY_HUMAN", "VAULT_UNSEAL"):
+            return "NOTIFY_HUMAN"
+    # FULL: no restrictions
+    return action
+
+
+@app.get("/api/sre/mode")
+async def get_mode():
+    """P8-B: Returns current agent autonomy mode."""
+    mode = get_agent_mode()
+    return {
+        "mode": mode,
+        "description": _MODE_DESCRIPTIONS.get(mode, mode),
+        "valid_modes": list(_VALID_MODES),
+    }
+
+@app.post("/api/sre/mode")
+async def set_mode(body: dict):
+    """P8-B: Sets the agent autonomy mode. Body: {\"mode\": \"observe|conservative|standard|full\"}"""
+    mode = (body.get("mode") or "").lower().strip()
+    if mode not in _VALID_MODES:
+        raise HTTPException(400, f"Modo inválido '{mode}'. Válidos: {', '.join(_VALID_MODES)}")
+    ok = set_agent_mode(mode)
+    if not ok:
+        raise HTTPException(500, "No se pudo guardar el modo en Redis")
+    _send_sre_notification(
+        f"🔧 *Modo del agente SRE cambiado a: {mode.upper()}*\n{_MODE_DESCRIPTIONS[mode]}",
+        severity="INFO",
+    )
+    return {"success": True, "mode": mode, "description": _MODE_DESCRIPTIONS[mode]}
+
+
 # ─── P5-E: WhatsApp SRE command endpoint ─────────────────────────────────────
 @app.post("/api/sre/command")
 async def sre_command(body: SRECommandRequest):
@@ -3673,18 +4339,122 @@ async def sre_command(body: SRECommandRequest):
     SRE_WA_COMMANDS_TOTAL.labels(command=cmd.split()[0] if cmd else "empty").inc()
 
     if not cmd or cmd == "ayuda":
+        current_mode = get_agent_mode()
         return {"reply": (
             "📋 *Comandos SRE disponibles:*\n"
             "• `estado` — estado de pods en todos los namespaces\n"
+            "• `briefing` — morning briefing ahora (salud + SLO + predicciones)\n"
+            "• `retro` — retrospectiva semanal ahora\n"
             "• `grafana` — listar dashboards de Grafana\n"
             "• `status` — estado del loop y circuit breaker\n"
             "• `incidents` — últimos 5 incidentes\n"
             "• `postmortems` — últimos 3 postmortems\n"
             "• `report` — resumen de las últimas 24h\n"
+            "• `reporte` — audit log legible de decisiones del agente\n"
             "• `slo` — estado de SLOs\n"
+            "• `modo` — ver modo de autonomía actual\n"
+            "• `modo observe|conservative|standard|full` — cambiar modo\n"
+            "• `pendiente` — ver aprobaciones pendientes\n"
+            "• `si` — aprobar la acción pendiente\n"
+            "• `no` — cancelar la acción pendiente\n"
+            "• `rollout` — ejecutar solo ROLLOUT_RESTART (conservador)\n"
             "• `maintenance on <min>` — activar mantenimiento\n"
-            "• `maintenance off` — desactivar mantenimiento"
+            "• `maintenance off` — desactivar mantenimiento\n"
+            f"\n🔧 Modo actual: *{current_mode.upper()}*"
         )}
+
+    # P7-S1: Morning briefing on demand
+    if cmd == "briefing":
+        return {"reply": generate_morning_briefing()}
+
+    # P7: Retrospectiva semanal on demand
+    if cmd in ("retro", "retrospectiva", "weekly"):
+        return {"reply": generate_weekly_retrospective()}
+
+    # P7-S3: Human-in-the-Loop approval handlers
+    if cmd in ("si", "yes", "approve", "aprobar"):
+        approval = _get_pending_approval()
+        if not approval:
+            return {"reply": "✅ Sin aprobaciones pendientes."}
+        action    = approval["action"]
+        resource  = approval["resource"]
+        namespace = approval["namespace"]
+        inc_key   = approval["incident_key"]
+        _remove_approval(inc_key)
+        SRE_WA_COMMANDS_TOTAL.labels(command="si").inc()
+
+        if action == "SCALE_UP":
+            _original = 1
+            try:
+                _d = apps_v1.read_namespaced_deployment(resource, namespace)
+                _original = _d.spec.replicas or 1
+            except Exception:
+                pass
+            result = scale_deployment_replicas(resource, namespace)
+            ok = "✅" in result
+            SRE_ACTIONS_TAKEN.labels(action="scale_up", result="ok" if ok else "error").inc()
+            SRE_APPROVAL_RESULT_TOTAL.labels(result="approved").inc()
+            if ok:
+                _schedule_scale_down(resource, namespace, _original)
+            return {"reply": f"✅ *SCALE_UP aprobado y ejecutado:*\n{result}"}
+
+        if action == "PATCH_RESOURCES":
+            result = patch_deployment_memory_limit(resource, namespace)
+            ok = "✅" in result
+            SRE_ACTIONS_TAKEN.labels(action="patch_resources", result="ok" if ok else "error").inc()
+            SRE_APPROVAL_RESULT_TOTAL.labels(result="approved").inc()
+            if ok:
+                SRE_PATCH_RESOURCES_TOTAL.inc()
+            return {"reply": f"✅ *PATCH_RESOURCES aprobado y ejecutado:*\n{result}"}
+
+        SRE_APPROVAL_RESULT_TOTAL.labels(result="approved").inc()
+        return {"reply": f"✅ Acción {action} en `{resource}` ejecutada."}
+
+    if cmd in ("no", "cancel", "cancelar"):
+        approval = _get_pending_approval()
+        if not approval:
+            return {"reply": "Sin aprobaciones pendientes."}
+        _remove_approval(approval["incident_key"])
+        SRE_APPROVAL_RESULT_TOTAL.labels(result="rejected").inc()
+        SRE_WA_COMMANDS_TOTAL.labels(command="no").inc()
+        return {"reply": (f"❌ *Acción cancelada:* {approval['action']} en "
+                          f"`{approval['resource']}` ({approval['namespace']}).")}
+
+    if cmd in ("rollout", "restart", "reiniciar"):
+        approval = _get_pending_approval()
+        if approval:
+            resource  = approval["resource"]
+            namespace = approval["namespace"]
+            _remove_approval(approval["incident_key"])
+            result = rollout_restart_deployment(f"{resource}, {namespace}")
+            ok = "✅" in result
+            SRE_ACTIONS_TAKEN.labels(action="rollout_restart", result="ok" if ok else "error").inc()
+            SRE_APPROVAL_RESULT_TOTAL.labels(result="rollout").inc()
+            SRE_WA_COMMANDS_TOTAL.labels(command="rollout").inc()
+            if ok:
+                _record_restart(resource, namespace)
+            return {"reply": f"🔄 *ROLLOUT_RESTART (conservador):*\n{result}"}
+        # Si no hay aprobación, permitir reinicio por nombre
+        parts = cmd.split(None, 1)
+        if len(parts) > 1:
+            target = parts[1].strip()
+            result = rollout_restart_deployment(f"{target}, {DEFAULT_NAMESPACE}")
+            return {"reply": f"🔄 {result}"}
+        return {"reply": "Sin aprobación pendiente. Usa: `sre rollout <deployment>`"}
+
+    if cmd in ("pendiente", "pending", "approvals"):
+        approvals = _list_pending_approvals()
+        if not approvals:
+            return {"reply": "✅ Sin aprobaciones pendientes."}
+        lines = [f"⏳ *Aprobaciones pendientes ({len(approvals)}):*"]
+        for ap in approvals:
+            ts = ap.get("created_at", "")[:16].replace("T", " ")
+            conf = f" ({ap['confidence']:.0%})" if ap.get("confidence") else ""
+            lines.append(f"• [{ts}] *{ap['action']}* en `{ap['resource']}`{conf}")
+            if ap.get("root_cause"):
+                lines.append(f"  └ {ap['root_cause'][:70]}")
+        lines.append("\n*Responde:* `sre si` | `sre no` | `sre rollout`")
+        return {"reply": "\n".join(lines)}
 
     if cmd == "status":
         cb    = _circuit_breaker.state
@@ -3833,6 +4603,51 @@ async def sre_command(body: SRECommandRequest):
             lines = [f"❌ Error listando dashboards: {e}"]
         return {"reply": "\n".join(lines)}
 
+    # P8-A: Audit log en lenguaje natural
+    if cmd in ("reporte", "audit", "log"):
+        try:
+            pool = get_postgres_pool()
+            if not pool:
+                return {"reply": "❌ Base de datos no disponible."}
+            conn = pool.getconn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT created_at, namespace, resource_name, issue_type, severity,
+                               root_cause, confidence, action_taken, action_result
+                        FROM sre_incidents ORDER BY created_at DESC LIMIT 5
+                    """)
+                    cols = ["created_at","namespace","resource_name","issue_type","severity",
+                            "root_cause","confidence","action_taken","action_result"]
+                    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+            finally:
+                pool.putconn(conn)
+            if not rows:
+                return {"reply": "📋 No hay incidentes registrados aún."}
+            lines = ["📋 *Últimas decisiones del agente SRE:*\n"]
+            for row in rows:
+                lines.append(_format_incident_narrative(row))
+                lines.append("")
+            auto = sum(1 for r in rows if r["action_taken"] == "ROLLOUT_RESTART" and r["action_result"] and "✅" in (r["action_result"] or ""))
+            lines.append(f"✅ Auto-resueltos: {auto}/{len(rows)} en los últimos registros")
+            return {"reply": "\n".join(lines)}
+        except Exception as e:
+            return {"reply": f"❌ Error leyendo audit log: {e}"}
+
+    # P8-B: Bootstrap gradual — modo de autonomía
+    if cmd == "modo" or cmd.startswith("modo "):
+        parts = cmd.split(maxsplit=1)
+        if len(parts) == 1:
+            mode = get_agent_mode()
+            return {"reply": f"🔧 *Modo actual del agente SRE:*\n{_MODE_DESCRIPTIONS.get(mode, mode)}\n\nModos disponibles: observe | conservative | standard | full"}
+        new_mode = parts[1].strip().lower()
+        if new_mode not in _VALID_MODES:
+            return {"reply": f"❌ Modo inválido '{new_mode}'.\nVálidos: observe | conservative | standard | full"}
+        ok = set_agent_mode(new_mode)
+        if ok:
+            return {"reply": f"✅ *Modo cambiado a: {new_mode.upper()}*\n{_MODE_DESCRIPTIONS[new_mode]}"}
+        return {"reply": "❌ Error al cambiar el modo. Verifica Redis."}
+
     return {"reply": f"❓ Comando desconocido: '{cmd}'. Escribe `ayuda` para ver opciones."}
 
 
@@ -3858,6 +4673,17 @@ async def deploy_hook(body: DeployHookRequest, request: Request):
     if _redis:
         key = f"sre:deploy_watch:{body.service}"
         _redis.setex(key, 600, body.version)  # 600s = 10 min
+        # P7-S2: guardar detalle completo del deploy para correlación en diagnosis (2h TTL)
+        detail_key = f"sre:deploy_detail:{body.service}"
+        _redis.setex(detail_key, 7200, json.dumps({
+            "service":     body.service,
+            "version":     body.version,
+            "commit":      body.commit,
+            "short_sha":   body.commit[:8] if body.commit else "",
+            "author":      body.author,
+            "message":     body.message[:120],
+            "deployed_at": datetime.now(timezone.utc).isoformat(),
+        }))
         logging.info(f"[Raphael] Monitoreo intensificado activado para '{body.service}' (10 min)")
 
     # Notificar por WhatsApp

@@ -98,6 +98,8 @@ class ChatCompletionRequest(BaseModel):
     user: Optional[str] = None
     # Support for legacy 'images' field if present (Ollama specific extension)
     images: Optional[List[str]] = None
+    # OpenAI response_format — {"type": "json_object"} forces JSON output in Ollama
+    response_format: Optional[Dict] = None
 
 class EmbeddingRequest(BaseModel):
     model: str
@@ -249,6 +251,10 @@ async def create_chat_completion(request: ChatCompletionRequest, req_raw: Reques
 
     if request.images:
         ollama_payload["images"] = request.images
+
+    # Pasar JSON mode a Ollama cuando el cliente pide response_format: {"type": "json_object"}
+    if getattr(request, "response_format", None) and request.response_format.get("type") == "json_object":
+        ollama_payload["format"] = "json"
 
     ollama_url = f"{OLLAMA_BASE_URL}/api/chat"
 
