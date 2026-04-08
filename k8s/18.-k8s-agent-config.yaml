@@ -6,7 +6,7 @@ metadata:
 data:
   # LLM
   OLLAMA_BASE_URL: "http://ollama-service:11434"
-  MODEL_NAME: "qwen2.5:14b"
+  MODEL_NAME: "qwen3:14b"
 
   # K8s defaults
   DEFAULT_NAMESPACE: "amael-ia"

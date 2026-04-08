@@ -1,5 +1,5 @@
-// index.js — v1.5.3
-// P5-E: Bidirectional /sre command routing to k8s-agent
+// index.js — v1.5.5
+// SN-2: /devops sn command — ServiceNow RFC status from WhatsApp
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const express = require('express');
 const axios = require('axios');
@@ -47,14 +47,24 @@ const AYUDA_MSG = `*Comandos disponibles:*
 /objetivos — Objetivos activos
 /sre <cmd> — Agente SRE autónomo:
   • estado — pods en todos los namespaces
+  • briefing — salud + SLO + predicciones ahora
   • grafana — dashboards de Grafana
   • status — loop y circuit breaker
   • incidents — últimos incidentes
   • slo — estado de SLOs
+  • pendiente — ver aprobaciones pendientes
+  • si / no / rollout — responder a propuestas del SRE
   • maintenance on/off — ventana de mantenimiento
+/devops <cmd> — Agente DevOps (Camael):
+  • estado — últimos pipelines en Bitbucket
+  • pr — ver PR pendiente de aprobación
+  • aprobar — mergea el PR pendiente
+  • rechazar — declina el PR pendiente
+  • sn — RFC activo en ServiceNow
+  • sn CHG000X — buscar RFC específico
 /ayuda — Esta lista de comandos
 
-También puedes escribir cualquier pregunta y te respondo normalmente. 🤖`;
+También puedes escribir cualquier pregunta y te respondo normalmente.`;
 
 // --- PUPPETEER ---
 const CHROMIUM_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium';
@@ -290,6 +300,26 @@ client.on('message', async message => {
         return;
     }
 
+    // ── Comando /devops — rutar al amael-agentic-backend ─────────────────────────
+    if (body.startsWith('/devops')) {
+        const devCmd = body.replace(/^\/devops\s*/i, '').trim() || 'ayuda';
+        console.log(`[DEVOPS] Comando de ${phoneNumber}: "${devCmd}"`);
+        try {
+            const res = await axios.post(`${AMAEL_BASE_URL}/api/devops/command`, {
+                command: devCmd,
+                phone:   phoneNumber,
+            }, {
+                headers: { Authorization: `Bearer ${AMAEL_INTERNAL_SECRET}` },
+                timeout: 30000,
+            });
+            await message.reply(res.data.reply || '(sin respuesta)');
+        } catch (err) {
+            console.error(`[DEVOPS] Error: ${err.message}`);
+            await message.reply('❌ El agente DevOps no está disponible. Intenta más tarde.');
+        }
+        return;
+    }
+
     // ── Expandir comandos rápidos ────────────────────────────────────────────────
     let prompt = QUICK_COMMANDS[body] || body;
     if (QUICK_COMMANDS[body]) {
@@ -501,7 +531,7 @@ app.get('/health', (req, res) => {
 // --- START ──────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`[BRIDGE v1.5.2] Servidor en puerto ${PORT}`);
+    console.log(`[BRIDGE v1.5.5] Servidor en puerto ${PORT}`);
 });
 
 const initializeClient = () => {
