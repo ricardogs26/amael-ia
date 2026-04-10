@@ -9,4 +9,4 @@ data:
   MODEL_NAME: "glm4"
   # IMPORTANTE: Esta URI debe ser pública y estar configurada en Google Cloud Console
   REDIRECT_URI: "https://amael-ia.richardx.dev/api/auth/callback"
-  GOOGLE_CLIENT_ID: "206335935766-lrlpm2tckn55lluujp2b2q8lbk28uhlp.apps.googleusercontent.com"
+  GOOGLE_CLIENT_ID: "TU_GOOGLE_CLIENT_ID.apps.googleusercontent.com"

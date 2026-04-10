@@ -54,7 +54,7 @@ spec:
               name: amael-secrets
               key: jwt-token
         - name: OWNER_USER_ID
-          value: "ricardogs26@gmail.com"
+          value: "admin@example.com"
         resources:
           requests:
             memory: "768Mi"

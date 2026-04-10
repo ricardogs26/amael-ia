@@ -16,7 +16,7 @@ data:
 
   # WhatsApp (alertas proactivas)
   WHATSAPP_BRIDGE_URL: "http://whatsapp-bridge-service:3000"
-  OWNER_PHONE: "5219993437008"
+  OWNER_PHONE: "521XXXXXXXXXX"
 
   # Self-healing guardrails
   SRE_PROTECTED_DEPLOYMENTS: "postgres-deployment,ollama-deployment,vault-0"
