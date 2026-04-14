@@ -4,4 +4,4 @@ resources:
 - ../../27.-frontend-next-deployment.yaml
 images:
 - name: registry.richardx.dev/frontend-next
-  newTag: 1.4.4
+  newTag: 1.4.5
