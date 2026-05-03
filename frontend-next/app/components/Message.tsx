@@ -4,6 +4,8 @@ import { useState } from 'react'
 interface Props {
   role: 'user' | 'assistant'
   content: string
+  agentId?: string
+  agentColor?: string
   ts?: string
   isStreaming?: boolean
   feedback?: 'positive' | 'negative' | null
@@ -306,7 +308,7 @@ function MarkdownContent({ text }: { text: string }) {
 }
 
 // ── Main Message component ────────────────────────────────────────────────────
-export default function Message({ role, content, ts, isStreaming, feedback, onFeedback, onImageClick }: Props) {
+export default function Message({ role, content, ts, isStreaming, feedback, onFeedback, onImageClick, agentId = 'amael', agentColor }: Props) {
   const [copied, setCopied] = useState(false)
   const [hovered, setHovered] = useState(false)
   const isUser = role === 'user'
@@ -375,10 +377,10 @@ export default function Message({ role, content, ts, isStreaming, feedback, onFe
         {!isUser && (
           <div style={{
             width: '28px', height: '28px', minWidth: '28px', borderRadius: '7px',
-            background: 'var(--primary)', display: 'flex', alignItems: 'center',
+            background: agentColor || 'var(--primary)', display: 'flex', alignItems: 'center',
             justifyContent: 'center', fontSize: '12px', fontWeight: 700, color: '#fff',
             marginTop: '2px', flexShrink: 0,
-          }}>A</div>
+          }}>{agentId[0].toUpperCase()}</div>
         )}
 
         {/* Bubble / content */}

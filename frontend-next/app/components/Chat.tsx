@@ -27,7 +27,7 @@ interface Props {
 }
 
 // ── Status banner shown while agent runs ─────────────────────────────────────
-function StatusBanner({ msg }: { msg: string }) {
+function StatusBanner({ msg, agentId = 'amael', agentColor }: { msg: string; agentId?: string; agentColor?: string }) {
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: '10px',
@@ -35,9 +35,9 @@ function StatusBanner({ msg }: { msg: string }) {
     }}>
       <div style={{
         width: '28px', height: '28px', minWidth: '28px', borderRadius: '7px',
-        background: 'var(--primary)', display: 'flex', alignItems: 'center',
+        background: agentColor || 'var(--primary)', display: 'flex', alignItems: 'center',
         justifyContent: 'center', fontSize: '12px', fontWeight: 700, color: '#fff',
-      }}>A</div>
+      }}>{agentId[0].toUpperCase()}</div>
       <div style={{ display: 'flex', gap: '3px', alignItems: 'center' }}>
         {[0,1,2].map(i => (
           <span key={i} className={`dot-${i+1}`} style={{
@@ -107,31 +107,48 @@ function ImageModal({ src, onClose }: { src: string; onClose: () => void }) {
   )
 }
 
-function EmptyState({ name }: { name: string }) {
-  const chips = [
-    '🔍 Consultas sobre Kubernetes',
-    '📅 Organizar mi agenda',
-    '📄 Analizar documentos',
-    '📊 Generar gráficos',
-  ]
+const AGENT_META: Record<string, { label: string; color: string; desc: string; chips: string[] }> = {
+  amael: {
+    label: 'Amael',
+    color: '#6366f1',
+    desc: '¿En qué puedo ayudarte hoy?',
+    chips: ['🔍 Consultas sobre Kubernetes', '📅 Organizar mi agenda', '📄 Analizar documentos', '📊 Generar gráficos'],
+  },
+  raphael: {
+    label: 'Raphael',
+    color: '#10b981',
+    desc: 'Agente SRE autónomo. Pregúntame sobre el estado del cluster, incidentes o predicciones.',
+    chips: ['⚡ Estado del cluster', '🚨 Últimos incidentes', '📈 SLOs activos', '🔍 Diagnóstico de anomalía'],
+  },
+  camael: {
+    label: 'Camael',
+    color: '#f59e0b',
+    desc: 'Agente DevOps. Puedo gestionar pipelines, PRs, deploys y RFCs en ServiceNow.',
+    chips: ['🚀 Estado de pipelines', '🔀 PR pendiente', '📋 RFC en ServiceNow', '🔧 Deploy a producción'],
+  },
+}
+
+function EmptyState({ name, agent = 'amael' }: { name: string; agent?: string }) {
+  const meta = AGENT_META[agent] || AGENT_META.amael
   return (
     <div className="fade-up" style={{
       display: 'flex', flexDirection: 'column', alignItems: 'center',
       justifyContent: 'center', height: '100%', textAlign: 'center', padding: '0 20px',
     }}>
       <div style={{
-        width: '56px', height: '56px', background: 'var(--primary-subtle)',
-        borderRadius: '14px', display: 'flex', alignItems: 'center',
-        justifyContent: 'center', marginBottom: '20px', fontSize: '26px',
-      }}>◆</div>
+        width: '56px', height: '56px', borderRadius: '14px', display: 'flex', alignItems: 'center',
+        justifyContent: 'center', marginBottom: '20px', fontSize: '22px', fontWeight: 700,
+        color: '#fff', background: meta.color,
+        boxShadow: `0 4px 20px ${meta.color}40`,
+      }}>{meta.label[0]}</div>
       <h2 style={{ fontSize: '22px', fontWeight: 600, color: 'var(--text-primary)', marginBottom: '8px', letterSpacing: '-0.3px' }}>
-        Hola{name ? `, ${name}` : ''}
+        {agent === 'amael' ? `Hola${name ? `, ${name}` : ''}` : meta.label}
       </h2>
       <p style={{ fontSize: '15px', color: 'var(--text-secondary)', maxWidth: '340px', lineHeight: 1.6, marginBottom: '28px' }}>
-        ¿En qué puedo ayudarte hoy?
+        {meta.desc}
       </p>
       <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'center' }}>
-        {chips.map(c => (
+        {meta.chips.map(c => (
           <span key={c} style={{
             background: 'var(--bg-elevated)', border: '1px solid var(--border)',
             borderRadius: '20px', padding: '7px 14px', fontSize: '13px',
@@ -1044,6 +1061,7 @@ export default function Chat({ token, userName, userPicture, onLogout, calendarN
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [uploadStatus, setUploadStatus] = useState<'idle' | 'uploading' | 'done' | 'error'>('idle')
   const [expandedImage, setExpandedImage] = useState<string | null>(null)
+  const [selectedAgent, setSelectedAgent] = useState<string>('amael')
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   const bottomRef  = useRef<HTMLDivElement>(null)
@@ -1136,6 +1154,12 @@ export default function Chat({ token, userName, userPicture, onLogout, calendarN
       headers: { ...headers(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ title }),
     }).catch(() => {})
+  }
+
+  const handleAgentChange = (agent: string) => {
+    if (agent === selectedAgent) return
+    setSelectedAgent(agent)
+    createConversation()
   }
 
   const deleteConversation = (id: number) => {
@@ -1236,7 +1260,7 @@ export default function Chat({ token, userName, userPicture, onLogout, calendarN
       const res = await fetch(`${BACKEND}/chat/stream`, {
         method:  'POST',
         headers: { ...headers(), 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ prompt: effectivePrompt, history: currentMessages, conversation_id: convId }),
+        body:    JSON.stringify({ prompt: effectivePrompt, history: currentMessages, conversation_id: convId, agent: selectedAgent !== 'amael' ? selectedAgent : undefined }),
         signal:  abort.signal,
       })
 
@@ -1345,6 +1369,8 @@ export default function Chat({ token, userName, userPicture, onLogout, calendarN
         onAdmin={() => setShowAdmin(true)}
         onAgents={() => router.push('/admin/agents')}
         isAdmin={userRole === 'admin'}
+        activeAgent={selectedAgent}
+        onAgentChange={handleAgentChange}
       />
 
       {/* Profile modal */}
@@ -1381,9 +1407,20 @@ export default function Chat({ token, userName, userPicture, onLogout, calendarN
           >
             <IcoHamburger />
           </button>
-          <span style={{ fontSize: '16px', fontWeight: 700, color: 'var(--text-primary)', letterSpacing: '-0.3px' }}>
-            Amael
-          </span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <span style={{ fontSize: '16px', fontWeight: 700, color: 'var(--text-primary)', letterSpacing: '-0.3px' }}>
+              Amael
+            </span>
+            {selectedAgent !== 'amael' && (
+              <span style={{
+                fontSize: '11px', fontWeight: 700, padding: '2px 8px', borderRadius: '20px',
+                background: AGENT_META[selectedAgent]?.color || '#6366f1',
+                color: '#fff', letterSpacing: '0.02em',
+              }}>
+                {AGENT_META[selectedAgent]?.label || selectedAgent}
+              </span>
+            )}
+          </div>
         </div>
 
         {/* Calendar OAuth toast */}
@@ -1411,13 +1448,15 @@ export default function Chat({ token, userName, userPicture, onLogout, calendarN
           <div style={{ maxWidth: '720px', margin: '0 auto', padding: isMobile ? '0 16px' : '0 24px' }}>
 
             {messages.length === 0 && !loading && !streamingContent
-              ? <EmptyState name={firstName} />
+              ? <EmptyState name={firstName} agent={selectedAgent} />
               : <>
                   {messages.map((m, i) => (
                     <Message
                       key={i}
                       role={m.role}
                       content={m.content}
+                      agentId={selectedAgent}
+                      agentColor={AGENT_META[selectedAgent]?.color}
                       ts={m.ts}
                       feedback={m.role === 'assistant' ? (feedback[i] ?? null) : undefined}
                       onFeedback={m.role === 'assistant' ? s => sendFeedback(i, s) : undefined}
@@ -1429,13 +1468,15 @@ export default function Chat({ token, userName, userPicture, onLogout, calendarN
                     <Message
                       role="assistant"
                       content={streamingContent}
+                      agentId={selectedAgent}
+                      agentColor={AGENT_META[selectedAgent]?.color}
                       isStreaming
                       onImageClick={setExpandedImage}
                     />
                   )}
 
                   {loading && !streamingContent && (
-                    <StatusBanner msg={statusMsg} />
+                    <StatusBanner msg={statusMsg} agentId={selectedAgent} agentColor={AGENT_META[selectedAgent]?.color} />
                   )}
                 </>
             }

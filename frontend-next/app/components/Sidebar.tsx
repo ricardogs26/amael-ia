@@ -24,7 +24,16 @@ interface Props {
   onAdmin?: () => void
   onAgents?: () => void
   isAdmin?: boolean
+  activeAgent?: string
+  onAgentChange?: (agent: string) => void
 }
+
+// ── Agent definitions ─────────────────────────────────────────────────────────
+const AGENTS = [
+  { id: 'amael',   label: 'Amael',   short: 'A', color: '#6366f1', desc: 'Orquestador' },
+  { id: 'raphael', label: 'Raphael', short: 'R', color: '#10b981', desc: 'SRE' },
+  { id: 'camael',  label: 'Camael',  short: 'C', color: '#f59e0b', desc: 'DevOps' },
+]
 
 // ── Minimal icon set ──────────────────────────────────────────────────────────
 const Ico = ({ d, size = 16 }: { d: string; size?: number }) => (
@@ -104,6 +113,7 @@ function IconBtn({
 export default function Sidebar({
   user, conversations, activeId, collapsed, isMobile = false, onToggle,
   onSelect, onNew, onRename, onDelete, onLogout, onProfile, onAdmin, onAgents, isAdmin,
+  activeAgent = 'amael', onAgentChange,
 }: Props) {
   const { theme, toggle } = useTheme()
   const [menuOpenId,  setMenuOpenId]  = useState<number | null>(null)
@@ -225,6 +235,85 @@ export default function Sidebar({
           {(isMobile || !collapsed) && <span>Nueva conversación</span>}
         </button>
       </div>
+
+      {/* ── Agent selector ────────────────────────────────────────────────── */}
+      {onAgentChange && (
+        <div style={{
+          padding: (!isMobile && collapsed) ? '8px 6px' : '10px 10px 0',
+          flexShrink: 0,
+        }}>
+          {(!isMobile && collapsed) ? (
+            // Collapsed: show only dot/letter for active agent
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', alignItems: 'center' }}>
+              {AGENTS.map(a => (
+                <button
+                  key={a.id}
+                  title={`${a.label} — ${a.desc}`}
+                  onClick={() => onAgentChange(a.id)}
+                  style={{
+                    width: '36px', height: '36px', borderRadius: '8px', border: 'none',
+                    cursor: 'pointer', fontSize: '12px', fontWeight: 700, color: '#fff',
+                    background: activeAgent === a.id ? a.color : 'var(--bg-elevated)',
+                    transition: 'background .15s',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  }}
+                  onMouseEnter={e => {
+                    if (activeAgent !== a.id) e.currentTarget.style.background = 'var(--border)'
+                  }}
+                  onMouseLeave={e => {
+                    if (activeAgent !== a.id) e.currentTarget.style.background = 'var(--bg-elevated)'
+                  }}
+                >
+                  <span style={{ color: activeAgent === a.id ? '#fff' : 'var(--text-secondary)' }}>
+                    {a.short}
+                  </span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            // Expanded: full agent tabs
+            <div>
+              <div style={{
+                fontSize: '11px', fontWeight: 600, color: 'var(--text-disabled)',
+                textTransform: 'uppercase', letterSpacing: '0.06em',
+                padding: '4px 2px 8px',
+              }}>Agente</div>
+              <div style={{ display: 'flex', gap: '6px' }}>
+                {AGENTS.map(a => (
+                  <button
+                    key={a.id}
+                    onClick={() => onAgentChange(a.id)}
+                    title={a.desc}
+                    style={{
+                      flex: 1, padding: '7px 4px', borderRadius: '8px', border: 'none',
+                      cursor: 'pointer', fontSize: '12px', fontWeight: 600,
+                      background: activeAgent === a.id ? a.color : 'var(--bg-elevated)',
+                      color: activeAgent === a.id ? '#fff' : 'var(--text-secondary)',
+                      transition: 'background .15s, color .15s',
+                      display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '2px',
+                    }}
+                    onMouseEnter={e => {
+                      if (activeAgent !== a.id) {
+                        e.currentTarget.style.background = 'var(--border)'
+                        e.currentTarget.style.color = 'var(--text-primary)'
+                      }
+                    }}
+                    onMouseLeave={e => {
+                      if (activeAgent !== a.id) {
+                        e.currentTarget.style.background = 'var(--bg-elevated)'
+                        e.currentTarget.style.color = 'var(--text-secondary)'
+                      }
+                    }}
+                  >
+                    <span style={{ fontSize: '14px', fontWeight: 700 }}>{a.short}</span>
+                    <span style={{ fontSize: '10px', opacity: 0.9 }}>{a.label}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* ── Conversations list ─────────────────────────────────────────────── */}
       {(isMobile || !collapsed) && (
