@@ -47,6 +47,18 @@ spec:
               key: internal_api_secret
         - name: K8S_AGENT_URL
           value: "http://k8s-agent-service:8002"
+        - name: GRAFANA_URL
+          value: "http://kube-prometheus-stack-grafana.observability.svc.cluster.local:80"
+        - name: GRAFANA_USER
+          valueFrom:
+            secretKeyRef:
+              name: kube-prometheus-stack-grafana
+              key: admin-user
+        - name: GRAFANA_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: kube-prometheus-stack-grafana
+              key: admin-password
         resources:
           requests:
             memory: "768Mi"

@@ -1,4 +1,5 @@
-// index.js — v1.5.5
+// index.js — v1.5.8
+// v1.5.8: /grafana — screenshot + análisis vision model (qwen2.5vl)
 // SN-2: /devops sn command — ServiceNow RFC status from WhatsApp
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const express = require('express');
@@ -15,6 +16,9 @@ const AMAEL_API_URL         = process.env.AMAEL_API_URL         || `${AMAEL_BASE
 const AMAEL_JWT_TOKEN       = process.env.AMAEL_JWT_TOKEN;
 const AMAEL_INTERNAL_SECRET = process.env.AMAEL_INTERNAL_SECRET || '';
 const K8S_AGENT_URL         = process.env.K8S_AGENT_URL         || 'http://k8s-agent-service:8002';
+const GRAFANA_URL           = process.env.GRAFANA_URL           || 'http://kube-prometheus-stack-grafana.observability.svc.cluster.local:80';
+const GRAFANA_USER          = process.env.GRAFANA_USER          || 'amael-agent';
+const GRAFANA_PASSWORD      = process.env.GRAFANA_PASSWORD      || 'admin';
 
 if (!AMAEL_JWT_TOKEN) {
     console.error("ERROR: La variable de entorno AMAEL_JWT_TOKEN no está configurada.");
@@ -62,6 +66,9 @@ const AYUDA_MSG = `*Comandos disponibles:*
   • rechazar — declina el PR pendiente
   • sn — RFC activo en ServiceNow
   • sn CHG000X — buscar RFC específico
+/grafana [dashboard] — Screenshot + análisis visual del dashboard:
+  • sre, llm, agente, rag, infra, supervisor, seguridad, backend, poc
+  • Sin argumento → dashboard SRE (por defecto)
 /ayuda — Esta lista de comandos
 
 También puedes escribir cualquier pregunta y te respondo normalmente.`;
@@ -177,6 +184,66 @@ async function requestAccess(phoneNumber, name) {
     } catch (e) {
         console.warn(`[ACCESS] Error enviando solicitud: ${e.message}`);
     }
+}
+
+// ── Mapa de dashboards Grafana ────────────────────────────────────────────────
+const GRAFANA_DASHBOARD_MAP = {
+    'sre':        'amael-sre-agent',
+    'llm':        'amael-llm',
+    'agente':     'amael-agent',
+    'pipeline':   'amael-agent',
+    'rag':        'amael-rag',
+    'infra':      'amael-infra',
+    'recursos':   'amael-infra',
+    'supervisor': 'amael-supervisor',
+    'seguridad':  'amael-security',
+    'backend':    'amael-backend',
+    'poc':        'amael-poc-overview',
+    'comms':      'amael-agent-comm',
+    'agentes':    'amael-agent-comm',
+};
+
+/** Toma un screenshot de un dashboard de Grafana y devuelve base64. */
+async function takeGrafanaScreenshot(uid) {
+    const url = `${GRAFANA_URL}/d/${uid}?orgId=1&kiosk`;
+    console.log(`[GRAFANA] Capturando ${url}`);
+    let browser;
+    try {
+        browser = await puppeteer.launch({
+            executablePath: CHROMIUM_PATH,
+            args: ['--no-sandbox', '--disable-setuid-sandbox'],
+        });
+        const page = await browser.newPage();
+        await page.setViewport({ width: 1280, height: 800 });
+        const authHeader = `Basic ${Buffer.from(`${GRAFANA_USER}:${GRAFANA_PASSWORD}`).toString('base64')}`;
+        await page.setExtraHTTPHeaders({ Authorization: authHeader });
+        await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+        // Esperar que los paneles carguen datos
+        await new Promise(r => setTimeout(r, 6000));
+        await page.addStyleTag({
+            content: '.sidemenu-canvas, .navbar-page-btn, .search-container { display: none !important; }',
+        });
+        const screenshot = await page.screenshot({ encoding: 'base64' });
+        console.log(`[GRAFANA] Screenshot OK (${Math.round(screenshot.length / 1024)}KB)`);
+        return screenshot;
+    } finally {
+        if (browser) await browser.close();
+    }
+}
+
+/** Analiza una imagen usando el modelo de visión vía backend. */
+async function analyzeImageWithVision(imageBase64, question, canonicalUserId) {
+    const convId = await getOrCreateConv(canonicalUserId);
+    const res = await axios.post(AMAEL_API_URL, {
+        prompt: question,
+        image: imageBase64,
+        user_id: canonicalUserId,
+        conversation_id: convId,
+    }, {
+        headers: authHeaders(),
+        timeout: 180000,
+    });
+    return res.data.response || res.data.answer || 'No pude analizar el dashboard.';
 }
 
 // --- EVENTOS DE WHATSAPP ────────────────────────────────────────────────────────
@@ -316,6 +383,31 @@ client.on('message', async message => {
         } catch (err) {
             console.error(`[DEVOPS] Error: ${err.message}`);
             await message.reply('❌ El agente DevOps no está disponible. Intenta más tarde.');
+        }
+        return;
+    }
+
+    // ── Comando /grafana — screenshot + análisis con visión ──────────────────────
+    if (body.startsWith('/grafana')) {
+        const arg = body.replace(/^\/grafana\s*/i, '').trim().toLowerCase();
+        const uid = GRAFANA_DASHBOARD_MAP[arg] || (arg || 'amael-sre-agent');
+
+        await message.reply(`📸 Capturando dashboard *${uid}*... (puede tardar ~30s)`);
+
+        try {
+            const screenshot = await takeGrafanaScreenshot(uid);
+            const analysis = await analyzeImageWithVision(
+                screenshot,
+                `Analiza este dashboard de Grafana (${uid}). Describe el estado general del sistema, identifica anomalías, picos o valores preocupantes, y da un resumen ejecutivo en 3-5 puntos clave.`,
+                canonicalUserId,
+            );
+            const media = new MessageMedia('image/png', screenshot, `grafana-${uid}.png`);
+            await client.sendMessage(message.from, media, {
+                caption: `*📊 ${uid}*\n\n${analysis}`,
+            });
+        } catch (err) {
+            console.error(`[GRAFANA] Error: ${err.message}`);
+            await message.reply(`❌ No pude capturar el dashboard *${uid}*.\nVerifica que Grafana esté disponible.`);
         }
         return;
     }
@@ -531,7 +623,7 @@ app.get('/health', (req, res) => {
 // --- START ──────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`[BRIDGE v1.5.5] Servidor en puerto ${PORT}`);
+    console.log(`[BRIDGE v1.5.8] Servidor en puerto ${PORT}`);
 });
 
 const initializeClient = () => {
